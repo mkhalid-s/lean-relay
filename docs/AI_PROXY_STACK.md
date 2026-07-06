@@ -14,6 +14,7 @@ The Gateway listens on `127.0.0.1:8787` and routes to one of these downstream pa
 
 ```text
 full              Claude -> Gateway :8787 -> Headroom :8788 -> pxpipe :47821 -> Anthropic
+pxpipe-headroom   Claude -> Gateway :8787 -> pxpipe :47821 -> Headroom :8788 -> Anthropic
 headroom          Claude -> Gateway :8787 -> Headroom :8788 -> Anthropic
 squeezr           Claude -> Gateway :8787 -> Squeezr :18780 -> Anthropic
 headroom-squeezr  Claude -> Gateway :8787 -> Headroom :8788 -> Squeezr :18780 -> Anthropic
@@ -114,7 +115,7 @@ headroom-ai[proxy]
 headroom-ai[code]
 ast-grep-cli
 Headroom helper tools: difft, scc
-pxpipe-proxy npm cache
+pxpipe-proxy@0.8.0 npm cache
 squeezr-ai npm cache
 ```
 
@@ -177,11 +178,12 @@ PXPIPE_ENABLED=0
 SQUEEZR_ENABLED=0
 
 GATEWAY_TARGET_API_URL="http://127.0.0.1:8788"
+PXPIPE_TARGET_API_URL="https://api.anthropic.com"
 HEADROOM_TARGET_API_URL="https://api.anthropic.com"
 
 GATEWAY_CMD="$HOME/.local/bin/ai-proxy-gateway"
 SQUEEZR_CMD="$HOME/.local/bin/ai-proxy-squeezr-foreground"
-PXPIPE_CMD="npx -y pxpipe-proxy"
+PXPIPE_CMD="npx -y pxpipe-proxy@0.8.0"
 PXPIPE_MODELS="claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5"
 HEADROOM_CMD="headroom proxy"
 
@@ -216,6 +218,22 @@ The stack exports `SQUEEZR_PORT=18780` and `SQUEEZR_MITM_PORT=18781` when starti
 ai-proxy-stack mode direct
 ```
 
+### pxpipe Before Headroom
+
+`pxpipe-headroom` runs the same order used by some devcontainer experiments:
+
+```bash
+ai-proxy-stack mode pxpipe-headroom
+```
+
+Expected route:
+
+```text
+Claude Code -> Gateway :8787 -> pxpipe :47821 -> Headroom :8788 -> Anthropic
+```
+
+This is separate from `full`, which keeps the older `Gateway -> Headroom -> pxpipe` order.
+
 ### pxpipe Model Scope
 
 pxpipe only converts requests to image blocks for model bases listed in `PXPIPE_MODELS`. The stack exports this value when it starts pxpipe, so it survives launchd restarts and `ai-proxy-stack mode ...` changes.
@@ -234,6 +252,7 @@ Use `PXPIPE_MODELS=off` to disable image conversion while leaving pxpipe running
 ai-proxy-stack status
 ai-proxy-stack mode current
 ai-proxy-stack mode full
+ai-proxy-stack mode pxpipe-headroom
 ai-proxy-stack mode headroom
 ai-proxy-stack mode squeezr
 ai-proxy-stack mode headroom-squeezr
@@ -397,6 +416,7 @@ Quick isolation:
 
 ```bash
 ai-proxy-stack mode direct   # Gateway -> Anthropic
+ai-proxy-stack mode pxpipe-headroom # Gateway -> pxpipe -> Headroom -> Anthropic
 ai-proxy-stack mode squeezr  # Gateway -> Squeezr -> Anthropic
 ai-proxy-stack mode pxpipe   # Gateway -> pxpipe -> Anthropic
 ai-proxy-stack mode headroom # Gateway -> Headroom -> Anthropic

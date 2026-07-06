@@ -40,13 +40,14 @@ load_config() {
   : "${HEADROOM_ENABLED:=1}"
   : "${SQUEEZR_ENABLED:=0}"
   : "${GATEWAY_CMD:=$HOME/.local/bin/ai-proxy-gateway}"
-  : "${PXPIPE_CMD:=npx -y pxpipe-proxy}"
+  : "${PXPIPE_CMD:=npx -y pxpipe-proxy@0.8.0}"
   : "${SQUEEZR_CMD:=$HOME/.local/bin/ai-proxy-squeezr-foreground}"
   if [[ "$SQUEEZR_CMD" == "npx -y --package squeezr-ai squeezr start" ]]; then
     SQUEEZR_CMD="$HOME/.local/bin/ai-proxy-squeezr-foreground"
   fi
   : "${PXPIPE_MODELS:=claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5}"
   : "${HEADROOM_CMD:=headroom proxy}"
+  : "${PXPIPE_TARGET_API_URL:=https://api.anthropic.com}"
   : "${HEADROOM_TARGET_API_URL:=http://$BIND_HOST:$PXPIPE_PORT}"
   : "${GATEWAY_TARGET_API_URL:=http://$BIND_HOST:$HEADROOM_PORT}"
   : "${HEADROOM_MODE:=token}"
@@ -218,7 +219,7 @@ start_pxpipe() {
   (
     cd "$WORKDIR"
     export_ca_bundle
-    export PORT="$PXPIPE_PORT" PXPIPE_PORT="$PXPIPE_PORT" HOST="$BIND_HOST" PXPIPE_MODELS="$PXPIPE_MODELS"
+    export PORT="$PXPIPE_PORT" PXPIPE_PORT="$PXPIPE_PORT" HOST="$BIND_HOST" PXPIPE_MODELS="$PXPIPE_MODELS" ANTHROPIC_UPSTREAM="$PXPIPE_TARGET_API_URL"
     exec bash -lc "exec $PXPIPE_CMD $PXPIPE_EXTRA_ARGS"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/pxpipe.pid"
@@ -459,6 +460,8 @@ set_config_var() {
 current_mode() {
   if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
     echo "off"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" && "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" && "$PXPIPE_TARGET_API_URL" == "http://$BIND_HOST:$HEADROOM_PORT" ]]; then
+    echo "pxpipe-headroom"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
     echo "full"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
@@ -477,6 +480,8 @@ current_mode() {
 chain_description() {
   if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
     echo "disabled (ANTHROPIC_BASE_URL removed)"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" && "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" && "$PXPIPE_TARGET_API_URL" == "http://$BIND_HOST:$HEADROOM_PORT" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> upstream"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
     echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> upstream"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
@@ -578,7 +583,7 @@ set_mode() {
     case "$1" in
       --no-restart) restart="0" ;;
       --no-claude-sync) sync_claude="0" ;;
-      *) echo "usage: $0 mode [full|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
+      *) echo "usage: $0 mode [full|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
     esac
     shift
   done
@@ -589,14 +594,25 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 1
       set_config_var PXPIPE_ENABLED 1
       set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
       set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
+      ;;
+    pxpipe-headroom|pxpipe-then-headroom)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 1
+      set_config_var PXPIPE_ENABLED 1
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
+      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
       ;;
     headroom|no-pxpipe)
       set_config_var GATEWAY_ENABLED 1
       set_config_var HEADROOM_ENABLED 1
       set_config_var PXPIPE_ENABLED 0
       set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
       ;;
@@ -605,6 +621,7 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 0
       set_config_var PXPIPE_ENABLED 1
       set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
       ;;
     squeezr|squeezr-only)
@@ -612,6 +629,7 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 0
       set_config_var PXPIPE_ENABLED 0
       set_config_var SQUEEZR_ENABLED 1
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
       ;;
     headroom-squeezr|squeezr-headroom)
@@ -619,6 +637,7 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 1
       set_config_var PXPIPE_ENABLED 0
       set_config_var SQUEEZR_ENABLED 1
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
       set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
       ;;
@@ -627,6 +646,7 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 0
       set_config_var PXPIPE_ENABLED 0
       set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
       ;;
@@ -635,6 +655,7 @@ set_mode() {
       set_config_var HEADROOM_ENABLED 0
       set_config_var PXPIPE_ENABLED 0
       set_config_var SQUEEZR_ENABLED 0
+      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
       set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
       ;;
@@ -645,7 +666,7 @@ set_mode() {
       return 0
       ;;
     *)
-      echo "usage: $0 mode [full|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
+      echo "usage: $0 mode [full|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
       return 2
       ;;
   esac
@@ -812,6 +833,7 @@ Commands:
 
 Mode options:
   full                 Claude -> Headroom -> pxpipe -> upstream
+  pxpipe-headroom     Claude -> pxpipe -> Headroom -> Anthropic
   headroom             Claude -> Headroom -> Anthropic directly
   squeezr              Claude -> Squeezr -> Anthropic directly
   headroom-squeezr     Claude -> Headroom -> Squeezr -> Anthropic

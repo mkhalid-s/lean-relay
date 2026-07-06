@@ -172,7 +172,7 @@ install_deps() {
   fi
 
   if have npm; then
-    run_step "prewarm pxpipe-proxy npm cache" npm cache add pxpipe-proxy
+    run_step "prewarm pxpipe-proxy npm cache" npm cache add pxpipe-proxy@0.8.0
     run_step "prewarm squeezr-ai npm cache" npm cache add squeezr-ai
   else
     warn "npm is not available; pxpipe-proxy and squeezr-ai will be fetched by npx on first start"

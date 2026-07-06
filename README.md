@@ -47,6 +47,7 @@ For host-only Claude sessions, `http://127.0.0.1:8787` also works.
 ```bash
 ai-proxy-stack mode current
 ai-proxy-stack mode full
+ai-proxy-stack mode pxpipe-headroom
 ai-proxy-stack mode headroom
 ai-proxy-stack mode squeezr
 ai-proxy-stack mode headroom-squeezr
@@ -57,6 +58,7 @@ ai-proxy-stack disable
 
 ```text
 full              Gateway :8787 -> Headroom :8788 -> pxpipe :47821 -> Anthropic
+pxpipe-headroom   Gateway :8787 -> pxpipe :47821 -> Headroom :8788 -> Anthropic
 headroom          Gateway :8787 -> Headroom :8788 -> Anthropic
 squeezr           Gateway :8787 -> Squeezr :18780 -> Anthropic
 headroom-squeezr  Gateway :8787 -> Headroom :8788 -> Squeezr :18780 -> Anthropic
@@ -70,6 +72,7 @@ Current useful fallbacks:
 
 ```bash
 ai-proxy-stack mode squeezr   # first Squeezr experiment, no Headroom or pxpipe
+ai-proxy-stack mode pxpipe-headroom # compare pxpipe before Headroom
 ai-proxy-stack mode pxpipe    # Headroom bypass; pxpipe only
 ai-proxy-stack mode direct    # bypass all optimizers, keep Gateway stable
 ai-proxy-stack disable        # stop everything and remove Claude base URL
