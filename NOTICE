@@ -1,0 +1,10 @@
+AI Proxy Stack
+
+This project provides installer and supervisor scripts for a local proxy chain.
+It does not vendor third-party dependencies. The installer may install or invoke
+third-party tools whose own licenses and terms apply, including but not limited
+to Homebrew, pipx, Node.js/npm/npx, headroom-ai, ast-grep-cli, pxpipe-proxy,
+squeezr-ai, difft, and scc.
+
+Users are responsible for reviewing the licenses, terms, and network behavior
+of the upstream tools they choose to install and run.

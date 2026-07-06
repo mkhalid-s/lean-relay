@@ -1,0 +1,845 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LABEL="${AI_PROXY_STACK_LABEL:-io.github.ai-proxy-stack}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$SCRIPT_DIR/../config" ]]; then
+  DEFAULT_STACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+  DEFAULT_STACK_ROOT="$HOME/.local/share/ai-proxy-stack"
+fi
+STACK_ROOT="${AI_PROXY_STACK_ROOT:-$DEFAULT_STACK_ROOT}"
+CONFIG_FILE="${AI_PROXY_STACK_CONFIG:-$HOME/.config/ai-proxy-stack/config.env}"
+STATE_DIR="${AI_PROXY_STACK_STATE:-$HOME/.local/state/ai-proxy-stack}"
+RUN_DIR="$STATE_DIR/run"
+LOG_DIR="$STATE_DIR/logs"
+PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
+CLAUDE_SETTINGS_FILE="${AI_PROXY_STACK_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+LEGACY_LABELS="${AI_PROXY_STACK_LEGACY_LABELS:-}"
+DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="${AI_PROXY_STACK_PATH:-$DEFAULT_PATH}:$PATH"
+
+mkdir -p "$RUN_DIR" "$LOG_DIR"
+
+load_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "missing config: $CONFIG_FILE" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+  : "${BIND_HOST:=127.0.0.1}"
+  : "${GATEWAY_PORT:=8787}"
+  : "${PXPIPE_PORT:=47821}"
+  : "${HEADROOM_PORT:=8788}"
+  : "${SQUEEZR_PORT:=18780}"
+  : "${SQUEEZR_MITM_PORT:=18781}"
+  : "${WORKDIR:=$PWD}"
+  : "${GATEWAY_ENABLED:=1}"
+  : "${PXPIPE_ENABLED:=1}"
+  : "${HEADROOM_ENABLED:=1}"
+  : "${SQUEEZR_ENABLED:=0}"
+  : "${GATEWAY_CMD:=$HOME/.local/bin/ai-proxy-gateway}"
+  : "${PXPIPE_CMD:=npx -y pxpipe-proxy}"
+  : "${SQUEEZR_CMD:=$HOME/.local/bin/ai-proxy-squeezr-foreground}"
+  if [[ "$SQUEEZR_CMD" == "npx -y --package squeezr-ai squeezr start" ]]; then
+    SQUEEZR_CMD="$HOME/.local/bin/ai-proxy-squeezr-foreground"
+  fi
+  : "${PXPIPE_MODELS:=claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5}"
+  : "${HEADROOM_CMD:=headroom proxy}"
+  : "${HEADROOM_TARGET_API_URL:=http://$BIND_HOST:$PXPIPE_PORT}"
+  : "${GATEWAY_TARGET_API_URL:=http://$BIND_HOST:$HEADROOM_PORT}"
+  : "${HEADROOM_MODE:=token}"
+  : "${HEADROOM_ENABLE_TOOL_SEARCH:=true}"
+  : "${HEADROOM_CODE_AWARE_ENABLED:=1}"
+  : "${HEADROOM_CODE_GRAPH:=1}"
+  : "${HEADROOM_NO_RATE_LIMIT:=1}"
+  : "${HEADROOM_NO_SUBSCRIPTION_TRACKING:=1}"
+  : "${HEADROOM_NO_TELEMETRY:=1}"
+  : "${HEADROOM_TLS_STRICT:=0}"
+  : "${CA_BUNDLE_FILE:=}"
+  : "${TIKTOKEN_CACHE_DIR:=$HOME/.cache/tiktoken}"
+  : "${HEALTH_INTERVAL_SECONDS:=10}"
+  : "${STARTUP_TIMEOUT_SECONDS:=45}"
+  : "${RESTART_BACKOFF_SECONDS:=3}"
+  : "${ADOPT_EXISTING:=1}"
+  : "${PXPIPE_EXTRA_ARGS:=}"
+  : "${HEADROOM_EXTRA_ARGS:=}"
+  : "${SQUEEZR_EXTRA_ARGS:=}"
+}
+
+now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+log() {
+  local line
+  line="[$(now)] $*"
+  printf '%s\n' "$line" >> "$LOG_DIR/supervisor.log"
+  if [[ -t 2 ]]; then
+    printf '%s\n' "$line" >&2
+  fi
+}
+
+pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+read_pid() { [[ -f "$1" ]] && tr -d '[:space:]' < "$1" || true; }
+port_pid() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR==1 {print; exit}' || true; }
+proc_cmd() { ps -p "$1" -o command= 2>/dev/null || true; }
+
+url_ok() {
+  local url="$1"
+  curl -fsS --max-time 3 -o /dev/null "$url" 2>/dev/null
+}
+
+export_ca_bundle() {
+  [[ -n "${CA_BUNDLE_FILE:-}" && -f "$CA_BUNDLE_FILE" ]] || return 0
+  export SSL_CERT_FILE="$CA_BUNDLE_FILE"
+  export REQUESTS_CA_BUNDLE="$CA_BUNDLE_FILE"
+  export CURL_CA_BUNDLE="$CA_BUNDLE_FILE"
+  export NODE_EXTRA_CA_CERTS="$CA_BUNDLE_FILE"
+}
+
+gateway_ok() { url_ok "http://$BIND_HOST:$GATEWAY_PORT/livez"; }
+pxpipe_ok() { url_ok "http://$BIND_HOST:$PXPIPE_PORT/"; }
+headroom_ok() { url_ok "http://$BIND_HOST:$HEADROOM_PORT/livez"; }
+squeezr_ok() { url_ok "http://$BIND_HOST:$SQUEEZR_PORT/squeezr/health"; }
+
+wait_until_ok() {
+  local name="$1" check_fn="$2" deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
+  until "$check_fn"; do
+    if (( SECONDS >= deadline )); then
+      log "$name did not become healthy within ${STARTUP_TIMEOUT_SECONDS}s"
+      return 1
+    fi
+    sleep 1
+  done
+  log "$name is healthy"
+}
+
+safe_kill_port_owner() {
+  local name="$1" port="$2" pattern="$3"
+  local pid cmd
+  pid="$(port_pid "$port")"
+  [[ -z "$pid" ]] && return 0
+  cmd="$(proc_cmd "$pid")"
+  if [[ "$cmd" =~ $pattern ]]; then
+    log "taking over $name on port $port from pid $pid: $cmd"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+    if pid_alive "$pid"; then
+      log "force stopping $name pid $pid"
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    return 0
+  fi
+  log "refusing to kill unknown process on $name port $port: pid $pid: $cmd"
+  return 1
+}
+
+start_gateway() {
+  local pid existing log_file
+  log_file="$LOG_DIR/gateway.log"
+  pid="$(read_pid "$RUN_DIR/gateway.pid")"
+  if pid_alive "$pid" && gateway_ok; then
+    return 0
+  fi
+  existing="$(port_pid "$GATEWAY_PORT")"
+  if [[ -n "$existing" ]]; then
+    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+      safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'ai-proxy-gateway|python.*ai-proxy-gateway' || return 1
+    elif [[ "$ADOPT_EXISTING" == "1" ]]; then
+      echo "$existing" > "$RUN_DIR/gateway.adopted.pid"
+      log "Gateway already listening on $GATEWAY_PORT; adopting external pid $existing"
+      return 0
+    else
+      log "Gateway port $GATEWAY_PORT is already in use by pid $existing"
+      return 1
+    fi
+  fi
+  log "starting Gateway on $BIND_HOST:$GATEWAY_PORT -> $GATEWAY_TARGET_API_URL"
+  (
+    cd "$WORKDIR"
+    export HOST="$BIND_HOST" GATEWAY_HOST="$BIND_HOST" GATEWAY_PORT="$GATEWAY_PORT" GATEWAY_TARGET_URL="$GATEWAY_TARGET_API_URL"
+    exec bash -lc "exec $GATEWAY_CMD"
+  ) >> "$log_file" 2>&1 &
+  echo $! > "$RUN_DIR/gateway.pid"
+  wait_until_ok Gateway gateway_ok
+}
+
+start_squeezr() {
+  local pid existing log_file
+  log_file="$LOG_DIR/squeezr.log"
+  pid="$(read_pid "$RUN_DIR/squeezr.pid")"
+  if pid_alive "$pid" && squeezr_ok; then
+    return 0
+  fi
+  existing="$(port_pid "$SQUEEZR_PORT")"
+  if [[ -n "$existing" ]]; then
+    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+      safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || return 1
+    elif [[ "$ADOPT_EXISTING" == "1" ]]; then
+      echo "$existing" > "$RUN_DIR/squeezr.adopted.pid"
+      log "Squeezr already listening on $SQUEEZR_PORT; adopting external pid $existing"
+      return 0
+    else
+      log "Squeezr port $SQUEEZR_PORT is already in use by pid $existing"
+      return 1
+    fi
+  fi
+  log "starting Squeezr on $BIND_HOST:$SQUEEZR_PORT"
+  (
+    cd "$WORKDIR"
+    export_ca_bundle
+    export SQUEEZR_PORT="$SQUEEZR_PORT" SQUEEZR_MITM_PORT="$SQUEEZR_MITM_PORT" SQUEEZR_DAEMON=1
+    exec bash -lc "exec $SQUEEZR_CMD $SQUEEZR_EXTRA_ARGS"
+  ) >> "$log_file" 2>&1 &
+  echo $! > "$RUN_DIR/squeezr.pid"
+  wait_until_ok Squeezr squeezr_ok
+}
+
+start_pxpipe() {
+  local pid existing log_file
+  log_file="$LOG_DIR/pxpipe.log"
+  pid="$(read_pid "$RUN_DIR/pxpipe.pid")"
+  if pid_alive "$pid" && pxpipe_ok; then
+    return 0
+  fi
+  existing="$(port_pid "$PXPIPE_PORT")"
+  if [[ -n "$existing" ]]; then
+    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+      safe_kill_port_owner "pxpipe" "$PXPIPE_PORT" 'pxpipe|node .*/pxpipe' || return 1
+    elif [[ "$ADOPT_EXISTING" == "1" ]]; then
+      echo "$existing" > "$RUN_DIR/pxpipe.adopted.pid"
+      log "pxpipe already listening on $PXPIPE_PORT; adopting external pid $existing"
+      return 0
+    else
+      log "pxpipe port $PXPIPE_PORT is already in use by pid $existing"
+      return 1
+    fi
+  fi
+  log "starting pxpipe on $BIND_HOST:$PXPIPE_PORT"
+  (
+    cd "$WORKDIR"
+    export_ca_bundle
+    export PORT="$PXPIPE_PORT" PXPIPE_PORT="$PXPIPE_PORT" HOST="$BIND_HOST" PXPIPE_MODELS="$PXPIPE_MODELS"
+    exec bash -lc "exec $PXPIPE_CMD $PXPIPE_EXTRA_ARGS"
+  ) >> "$log_file" 2>&1 &
+  echo $! > "$RUN_DIR/pxpipe.pid"
+  wait_until_ok pxpipe pxpipe_ok
+}
+
+headroom_args() {
+  local args="--host '$BIND_HOST' --port '$HEADROOM_PORT' --mode '$HEADROOM_MODE'"
+  [[ "$HEADROOM_NO_RATE_LIMIT" == "1" ]] && args="$args --no-rate-limit"
+  [[ "$HEADROOM_NO_SUBSCRIPTION_TRACKING" == "1" ]] && args="$args --no-subscription-tracking"
+  [[ "$HEADROOM_NO_TELEMETRY" == "1" ]] && args="$args --no-telemetry"
+  [[ "$HEADROOM_CODE_GRAPH" == "1" ]] && args="$args --code-graph"
+  printf '%s %s' "$args" "$HEADROOM_EXTRA_ARGS"
+}
+
+start_headroom() {
+  local pid existing log_file
+  log_file="$LOG_DIR/headroom.log"
+  pid="$(read_pid "$RUN_DIR/headroom.pid")"
+  if pid_alive "$pid" && headroom_ok; then
+    return 0
+  fi
+  existing="$(port_pid "$HEADROOM_PORT")"
+  if [[ -n "$existing" ]]; then
+    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+      safe_kill_port_owner "headroom" "$HEADROOM_PORT" 'headroom|Python' || return 1
+    elif [[ "$ADOPT_EXISTING" == "1" ]]; then
+      echo "$existing" > "$RUN_DIR/headroom.adopted.pid"
+      log "Headroom already listening on $HEADROOM_PORT; adopting external pid $existing"
+      return 0
+    else
+      log "Headroom port $HEADROOM_PORT is already in use by pid $existing"
+      return 1
+    fi
+  fi
+  log "starting Headroom on $BIND_HOST:$HEADROOM_PORT -> $HEADROOM_TARGET_API_URL"
+  (
+    cd "$WORKDIR"
+    export_ca_bundle
+    export TIKTOKEN_CACHE_DIR="$TIKTOKEN_CACHE_DIR"
+    export ANTHROPIC_TARGET_API_URL="$HEADROOM_TARGET_API_URL"
+    export ENABLE_TOOL_SEARCH="$HEADROOM_ENABLE_TOOL_SEARCH"
+    export HEADROOM_CODE_AWARE_ENABLED="$HEADROOM_CODE_AWARE_ENABLED"
+    export HEADROOM_TLS_STRICT="$HEADROOM_TLS_STRICT"
+    exec bash -lc "exec $HEADROOM_CMD $(headroom_args)"
+  ) >> "$log_file" 2>&1 &
+  echo $! > "$RUN_DIR/headroom.pid"
+  wait_until_ok Headroom headroom_ok
+}
+
+stop_owned_process() {
+  local name="$1" pid_file="$2" pid
+  pid="$(read_pid "$pid_file")"
+  if pid_alive "$pid"; then
+    log "stopping owned $name pid $pid"
+    kill "$pid" 2>/dev/null || true
+    sleep 2
+    pid_alive "$pid" && kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+}
+
+stop_children() {
+  stop_owned_process gateway "$RUN_DIR/gateway.pid"
+  stop_owned_process headroom "$RUN_DIR/headroom.pid"
+  stop_owned_process pxpipe "$RUN_DIR/pxpipe.pid"
+  stop_owned_process squeezr "$RUN_DIR/squeezr.pid"
+  safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || true
+  rm -f "$RUN_DIR/gateway.adopted.pid" "$RUN_DIR/pxpipe.adopted.pid" "$RUN_DIR/headroom.adopted.pid" "$RUN_DIR/squeezr.adopted.pid"
+}
+
+stop_stale_supervisors() {
+  local self pid cmd
+  self="$$"
+  while read -r pid cmd; do
+    [[ -n "${pid:-}" ]] || continue
+    [[ "$pid" == "$self" ]] && continue
+    [[ "$cmd" == *"ai-proxy-stack supervisor"* ]] || continue
+    log "stopping stale supervisor pid $pid: $cmd"
+    kill "$pid" 2>/dev/null || true
+    sleep 1
+    pid_alive "$pid" && kill -9 "$pid" 2>/dev/null || true
+  done < <(ps -axo pid=,command= 2>/dev/null)
+}
+
+supervisor() {
+  load_config
+  echo $$ > "$RUN_DIR/supervisor.pid"
+  trap 'log "supervisor stopping"; stop_children; rm -f "$RUN_DIR/supervisor.pid"; exit 0' INT TERM
+  log "supervisor starting"
+  while true; do
+    if [[ "$PXPIPE_ENABLED" == "1" ]]; then
+      start_pxpipe || log "pxpipe start/check failed"
+    else
+      stop_owned_process pxpipe "$RUN_DIR/pxpipe.pid"
+    fi
+    if [[ "$SQUEEZR_ENABLED" == "1" ]]; then
+      start_squeezr || log "Squeezr start/check failed"
+    else
+      stop_owned_process squeezr "$RUN_DIR/squeezr.pid"
+      safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || true
+    fi
+    if [[ "$HEADROOM_ENABLED" == "1" ]]; then
+      start_headroom || log "Headroom start/check failed"
+    else
+      stop_owned_process headroom "$RUN_DIR/headroom.pid"
+    fi
+    if [[ "$GATEWAY_ENABLED" == "1" ]]; then
+      start_gateway || log "Gateway start/check failed"
+    else
+      stop_owned_process gateway "$RUN_DIR/gateway.pid"
+    fi
+    sleep "$HEALTH_INTERVAL_SECONDS"
+    if [[ "$PXPIPE_ENABLED" == "1" ]] && ! pxpipe_ok; then
+      log "pxpipe health check failed; restarting owned process if any"
+      stop_owned_process pxpipe "$RUN_DIR/pxpipe.pid"
+      sleep "$RESTART_BACKOFF_SECONDS"
+    fi
+    if [[ "$SQUEEZR_ENABLED" == "1" ]] && ! squeezr_ok; then
+      log "Squeezr health check failed; restarting owned process if any"
+      stop_owned_process squeezr "$RUN_DIR/squeezr.pid"
+      sleep "$RESTART_BACKOFF_SECONDS"
+    fi
+    if [[ "$HEADROOM_ENABLED" == "1" ]] && ! headroom_ok; then
+      log "Headroom health check failed; restarting owned process if any"
+      stop_owned_process headroom "$RUN_DIR/headroom.pid"
+      sleep "$RESTART_BACKOFF_SECONDS"
+    fi
+    if [[ "$GATEWAY_ENABLED" == "1" ]] && ! gateway_ok; then
+      log "Gateway health check failed; restarting owned process if any"
+      stop_owned_process gateway "$RUN_DIR/gateway.pid"
+      sleep "$RESTART_BACKOFF_SECONDS"
+    fi
+  done
+}
+
+start_bg() {
+  load_config
+  local takeover=0
+  if [[ "${1:-}" == "--takeover" ]]; then takeover=1; fi
+  local spid
+  spid="$(read_pid "$RUN_DIR/supervisor.pid")"
+  if pid_alive "$spid"; then
+    echo "already running: supervisor pid $spid"
+    return 0
+  fi
+  AI_PROXY_STACK_TAKEOVER="$takeover" nohup "$0" supervisor >> "$LOG_DIR/supervisor.log" 2>&1 &
+  echo $! > "$RUN_DIR/supervisor.pid"
+  sleep 2
+  status
+}
+
+launchd_domain() { printf 'gui/%s' "$(id -u)"; }
+
+stop_legacy_services() {
+  local legacy legacy_plist
+  for legacy in $LEGACY_LABELS; do
+    [[ "$legacy" == "$LABEL" ]] && continue
+    legacy_plist="$HOME/Library/LaunchAgents/$legacy.plist"
+    launchctl bootout "$(launchd_domain)" "$legacy_plist" >/dev/null 2>&1 || true
+    rm -f "$legacy_plist"
+  done
+}
+
+write_plist() {
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/state/ai-proxy-stack"
+  cat > "$PLIST_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$HOME/.local/bin/ai-proxy-stack</string>
+    <string>supervisor</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>WorkingDirectory</key><string>$WORKDIR</string>
+  <key>StandardOutPath</key><string>$LOG_DIR/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>$LOG_DIR/launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$DEFAULT_PATH</string>
+    <key>AI_PROXY_STACK_ROOT</key><string>$STACK_ROOT</string>
+    <key>AI_PROXY_STACK_CONFIG</key><string>$CONFIG_FILE</string>
+    <key>AI_PROXY_STACK_STATE</key><string>$STATE_DIR</string>
+  </dict>
+</dict>
+</plist>
+EOF
+}
+
+install_service() {
+  load_config
+  stop_legacy_services
+  write_plist
+  launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
+  sleep 2
+  stop_stale_supervisors
+  stop_children
+  launchctl bootstrap "$(launchd_domain)" "$PLIST_FILE"
+  launchctl enable "$(launchd_domain)/$LABEL" >/dev/null 2>&1 || true
+  launchctl kickstart -k "$(launchd_domain)/$LABEL" >/dev/null 2>&1 || true
+  echo "installed and started: $PLIST_FILE"
+}
+
+stop_service() {
+  launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
+  local spid
+  spid="$(read_pid "$RUN_DIR/supervisor.pid")"
+  pid_alive "$spid" && kill "$spid" 2>/dev/null || true
+  sleep 2
+  stop_stale_supervisors
+  stop_children
+  echo "stopped"
+}
+
+uninstall_service() {
+  stop_service
+  rm -f "$PLIST_FILE"
+  echo "removed: $PLIST_FILE"
+}
+
+set_config_var() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done = 0 }
+    $0 ~ "^" key "=" { print key "=" value; done = 1; next }
+    { print }
+    END { if (!done) print key "=" value }
+  ' "$CONFIG_FILE" > "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+}
+
+current_mode() {
+  if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+    echo "off"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
+    echo "full"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
+    echo "headroom-squeezr"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+    echo "headroom"
+  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" == "1" ]]; then
+    echo "pxpipe"
+  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
+    echo "squeezr"
+  else
+    echo "direct"
+  fi
+}
+
+chain_description() {
+  if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+    echo "disabled (ANTHROPIC_BASE_URL removed)"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> upstream"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> Squeezr($BIND_HOST:$SQUEEZR_PORT) -> upstream"
+  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> $HEADROOM_TARGET_API_URL"
+  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" == "1" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> upstream"
+  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Squeezr($BIND_HOST:$SQUEEZR_PORT) -> upstream"
+  else
+    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> upstream directly"
+  fi
+}
+
+mode_hint() {
+  if [[ "$(current_mode)" == "off" ]]; then
+    echo "Claude Code base URL: unset ANTHROPIC_BASE_URL"
+  else
+    echo "Claude Code base URL: http://host.docker.internal:$GATEWAY_PORT"
+  fi
+}
+
+claude_base_url_for_mode() {
+  if [[ "$(current_mode)" == "off" ]]; then
+    echo ""
+  else
+    echo "http://host.docker.internal:$GATEWAY_PORT"
+  fi
+}
+
+sync_claude_settings() {
+  load_config
+  local mode base_url
+  mode="$(current_mode)"
+  base_url="$(claude_base_url_for_mode)"
+  if [[ ! -f "$CLAUDE_SETTINGS_FILE" ]]; then
+    mkdir -p "$(dirname "$CLAUDE_SETTINGS_FILE")"
+    printf '{\n  "env": {}\n}\n' > "$CLAUDE_SETTINGS_FILE"
+  fi
+  python3 - "$CLAUDE_SETTINGS_FILE" "$base_url" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+base_url = sys.argv[2]
+
+try:
+    data = json.loads(path.read_text())
+except json.JSONDecodeError as exc:
+    raise SystemExit(f"invalid JSON in {path}: {exc}")
+
+if not isinstance(data, dict):
+    raise SystemExit(f"{path} must contain a JSON object")
+
+env = data.setdefault("env", {})
+if not isinstance(env, dict):
+    raise SystemExit(f"{path} env must be a JSON object")
+
+if base_url:
+    env["ANTHROPIC_BASE_URL"] = base_url
+else:
+    env.pop("ANTHROPIC_BASE_URL", None)
+
+path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+  if [[ -n "$base_url" ]]; then
+    echo "Claude settings: ANTHROPIC_BASE_URL=$base_url"
+  else
+    echo "Claude settings: ANTHROPIC_BASE_URL removed"
+  fi
+  echo "Claude settings file: $CLAUDE_SETTINGS_FILE"
+  echo "Restart Claude Code for settings changes to take effect."
+}
+
+
+disable_stack() {
+  load_config
+  set_config_var GATEWAY_ENABLED 0
+  set_config_var HEADROOM_ENABLED 0
+  set_config_var PXPIPE_ENABLED 0
+  set_config_var SQUEEZR_ENABLED 0
+  set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
+  set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
+  load_config
+  echo "mode set: $(current_mode)"
+  echo "chain: $(chain_description)"
+  mode_hint
+  sync_claude_settings
+  stop_service
+  status
+}
+
+set_mode() {
+  local mode="${1:-}" restart="1" sync_claude="1"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) restart="0" ;;
+      --no-claude-sync) sync_claude="0" ;;
+      *) echo "usage: $0 mode [full|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
+    esac
+    shift
+  done
+  load_config
+  case "$mode" in
+    full)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 1
+      set_config_var PXPIPE_ENABLED 1
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
+      ;;
+    headroom|no-pxpipe)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 1
+      set_config_var PXPIPE_ENABLED 0
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
+      ;;
+    pxpipe|no-headroom)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 0
+      set_config_var PXPIPE_ENABLED 1
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
+      ;;
+    squeezr|squeezr-only)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 0
+      set_config_var PXPIPE_ENABLED 0
+      set_config_var SQUEEZR_ENABLED 1
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
+      ;;
+    headroom-squeezr|squeezr-headroom)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 1
+      set_config_var PXPIPE_ENABLED 0
+      set_config_var SQUEEZR_ENABLED 1
+      set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
+      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
+      ;;
+    direct)
+      set_config_var GATEWAY_ENABLED 1
+      set_config_var HEADROOM_ENABLED 0
+      set_config_var PXPIPE_ENABLED 0
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
+      set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
+      ;;
+    off)
+      set_config_var GATEWAY_ENABLED 0
+      set_config_var HEADROOM_ENABLED 0
+      set_config_var PXPIPE_ENABLED 0
+      set_config_var SQUEEZR_ENABLED 0
+      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
+      set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
+      ;;
+    current|status|"")
+      echo "mode: $(current_mode)"
+      echo "chain: $(chain_description)"
+      mode_hint
+      return 0
+      ;;
+    *)
+      echo "usage: $0 mode [full|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
+      return 2
+      ;;
+  esac
+  load_config
+  echo "mode set: $(current_mode)"
+  echo "chain: $(chain_description)"
+  mode_hint
+  if [[ "$sync_claude" == "1" ]]; then
+    sync_claude_settings
+  fi
+  if [[ "$restart" == "1" ]]; then
+    AI_PROXY_STACK_TAKEOVER=1 install_service
+    sleep 5
+    status
+  else
+    echo "not restarted; run: ai-proxy-stack install"
+  fi
+}
+
+status() {
+  load_config
+  local spid gpid ppid hpid sqpid gport pport hport sqport sstate ghealth phealth hhealth sqhealth
+  spid="$(read_pid "$RUN_DIR/supervisor.pid")"
+  gpid="$(read_pid "$RUN_DIR/gateway.pid")"
+  ppid="$(read_pid "$RUN_DIR/pxpipe.pid")"
+  hpid="$(read_pid "$RUN_DIR/headroom.pid")"
+  sqpid="$(read_pid "$RUN_DIR/squeezr.pid")"
+  gport="$(port_pid "$GATEWAY_PORT")"
+  pport="$(port_pid "$PXPIPE_PORT")"
+  hport="$(port_pid "$HEADROOM_PORT")"
+  sqport="$(port_pid "$SQUEEZR_PORT")"
+  if pid_alive "$spid"; then sstate="running"; else sstate="stopped"; fi
+  if [[ "$GATEWAY_ENABLED" == "1" ]]; then
+    if gateway_ok; then ghealth="ok"; else ghealth="fail"; fi
+  else
+    ghealth="disabled"
+  fi
+  if [[ "$PXPIPE_ENABLED" == "1" ]]; then
+    if pxpipe_ok; then phealth="ok"; else phealth="fail"; fi
+  else
+    phealth="disabled"
+  fi
+  if [[ "$HEADROOM_ENABLED" == "1" ]]; then
+    if headroom_ok; then hhealth="ok"; else hhealth="fail"; fi
+  else
+    hhealth="disabled"
+  fi
+  if [[ "$SQUEEZR_ENABLED" == "1" ]]; then
+    if squeezr_ok; then sqhealth="ok"; else sqhealth="fail"; fi
+  else
+    sqhealth="disabled"
+  fi
+  echo "config: $CONFIG_FILE"
+  echo "mode: $(current_mode)"
+  echo "chain: $(chain_description)"
+  echo "supervisor: ${spid:-none} $sstate"
+  echo "Gateway:   pidfile=${gpid:-none} listener=${gport:-none} health=$ghealth"
+  echo "pxpipe:    pidfile=${ppid:-none} listener=${pport:-none} health=$phealth"
+  if [[ "$PXPIPE_ENABLED" == "1" ]]; then
+    echo "pxpipe models: $PXPIPE_MODELS"
+  fi
+  echo "Headroom:  pidfile=${hpid:-none} listener=${hport:-none} health=$hhealth"
+  echo "Squeezr:   pidfile=${sqpid:-none} listener=${sqport:-none} health=$sqhealth"
+  if [[ "$SQUEEZR_ENABLED" == "1" ]]; then
+    echo "Squeezr dashboard: http://$BIND_HOST:$SQUEEZR_PORT/squeezr/dashboard"
+  fi
+  echo "logs: $LOG_DIR"
+}
+
+doctor() {
+  status
+  echo
+  echo "commands:"
+  command -v node || true
+  command -v npx || true
+  command -v headroom || true
+  command -v squeezr || true
+  command -v python3 || true
+  command -v ast-grep || true
+  command -v sg || true
+  echo
+  echo "Headroom doctor:"
+  headroom doctor || true
+}
+
+show_logs() {
+  local file="${1:-supervisor}"
+  local headroom_proxy_log="${HEADROOM_LOG_FILE:-$HOME/.headroom/logs/proxy.log}"
+  case "$file" in
+    all)
+      log_files=()
+      for name in supervisor gateway headroom pxpipe squeezr launchd.out launchd.err; do
+        path="$LOG_DIR/$name.log"
+        [[ -f "$path" ]] || : > "$path"
+        log_files+=("$path")
+      done
+      mkdir -p "$(dirname "$headroom_proxy_log")"
+      [[ -f "$headroom_proxy_log" ]] || : > "$headroom_proxy_log"
+      log_files+=("$headroom_proxy_log")
+      tail -n 40 -F "${log_files[@]}"
+      ;;
+    headroom)
+      [[ -f "$LOG_DIR/headroom.log" ]] || : > "$LOG_DIR/headroom.log"
+      mkdir -p "$(dirname "$headroom_proxy_log")"
+      [[ -f "$headroom_proxy_log" ]] || : > "$headroom_proxy_log"
+      tail -n 80 -F "$LOG_DIR/headroom.log" "$headroom_proxy_log"
+      ;;
+    headroom.stdout)
+      [[ -f "$LOG_DIR/headroom.log" ]] || : > "$LOG_DIR/headroom.log"
+      tail -n 80 -F "$LOG_DIR/headroom.log"
+      ;;
+    headroom.proxy)
+      mkdir -p "$(dirname "$headroom_proxy_log")"
+      [[ -f "$headroom_proxy_log" ]] || : > "$headroom_proxy_log"
+      tail -n 80 -F "$headroom_proxy_log"
+      ;;
+    supervisor|gateway|pxpipe|squeezr|launchd.out|launchd.err)
+      [[ -f "$LOG_DIR/$file.log" ]] || : > "$LOG_DIR/$file.log"
+      tail -n 80 -F "$LOG_DIR/$file.log"
+      ;;
+    *)
+      echo "usage: $0 logs [all|supervisor|gateway|pxpipe|squeezr|headroom|headroom.stdout|headroom.proxy|launchd.out|launchd.err]" >&2
+      exit 2
+      ;;
+  esac
+}
+
+dashboard_urls() {
+  load_config
+  echo "pxpipe dashboard: http://$BIND_HOST:$PXPIPE_PORT/"
+  echo "Gateway health:   http://$BIND_HOST:$GATEWAY_PORT/livez"
+  echo "Headroom health:  http://$BIND_HOST:$HEADROOM_PORT/livez"
+  echo "Headroom stats:   http://$BIND_HOST:$HEADROOM_PORT/stats"
+  echo "Squeezr health:   http://$BIND_HOST:$SQUEEZR_PORT/squeezr/health"
+  echo "Squeezr dashboard:http://$BIND_HOST:$SQUEEZR_PORT/squeezr/dashboard"
+}
+
+open_dashboard() {
+  load_config
+  dashboard_urls
+  if [[ "${1:-}" == "--open" ]]; then
+    open "http://$BIND_HOST:$GATEWAY_PORT/livez" >/dev/null 2>&1 || true
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: ai-proxy-stack <command>
+
+Commands:
+  start [--takeover]   Start supervisor in the background
+  stop                 Stop launchd service/supervisor and owned children
+  disable              Stop stack/gateway and remove ANTHROPIC_BASE_URL
+  restart [--takeover] Stop then start
+  status               Show current health and pids
+  mode [name]          Show/set mode and sync Claude settings
+  doctor               Show status plus dependency diagnostics
+  install              Install/start macOS LaunchAgent with KeepAlive
+  uninstall            Stop and remove macOS LaunchAgent
+  supervisor           Internal foreground supervisor for launchd
+  logs [name]          Follow logs: all, supervisor, gateway, pxpipe, squeezr, headroom, headroom.proxy, launchd.*
+  urls                 Print dashboard, health, and stats URLs
+  dashboard [--open]   Print URLs; with --open, open the pxpipe dashboard
+
+Mode options:
+  full                 Claude -> Headroom -> pxpipe -> upstream
+  headroom             Claude -> Headroom -> Anthropic directly
+  squeezr              Claude -> Squeezr -> Anthropic directly
+  headroom-squeezr     Claude -> Headroom -> Squeezr -> Anthropic
+  pxpipe               Claude -> pxpipe -> upstream
+  direct               Gateway pass-through to Anthropic
+  off                  Disable local services in config
+  --no-claude-sync     Do not update ~/.claude/settings.json
+
+Config: $CONFIG_FILE
+EOF
+}
+
+cmd="${1:-status}"
+shift || true
+case "$cmd" in
+  supervisor) supervisor ;;
+  start) start_bg "${1:-}" ;;
+  stop) stop_service ;;
+  disable) disable_stack ;;
+  restart) stop_service; start_bg "${1:-}" ;;
+  status) status ;;
+  mode) set_mode "${@:-current}" ;;
+  doctor) doctor ;;
+  install) install_service ;;
+  uninstall) uninstall_service ;;
+  logs) show_logs "${1:-supervisor}" ;;
+  urls) dashboard_urls ;;
+  dashboard) open_dashboard "${1:-}" ;;
+  help|-h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

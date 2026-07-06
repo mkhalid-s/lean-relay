@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+dist_index="$(
+  npx -y --package squeezr-ai -- sh -c '
+    bin="$(command -v squeezr)"
+    SQUEEZR_BIN="$bin" node <<'"'"'NODE'"'"'
+const { createRequire } = require("module");
+const path = require("path");
+const req = createRequire(process.env.SQUEEZR_BIN);
+const pkg = req.resolve("squeezr-ai/package.json");
+console.log(path.join(path.dirname(pkg), "dist", "index.js"));
+NODE
+  '
+)"
+
+exec node "$dist_index"
