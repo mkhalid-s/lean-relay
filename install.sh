@@ -200,7 +200,8 @@ backup_if_different() {
   local src="$1"
   local dst="$2"
   if [[ -f "$dst" ]] && ! cmp -s "$src" "$dst"; then
-    local backup="$dst.bak.$(date +%Y%m%d%H%M%S)"
+    local backup
+    backup="$dst.bak.$(date +%Y%m%d%H%M%S)"
     run_step "backup existing $(basename "$dst")" cp "$dst" "$backup"
   fi
 }

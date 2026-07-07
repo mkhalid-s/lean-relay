@@ -895,7 +895,28 @@ check_updates() {
 }
 
 do_update() {
-  local repo installer
+  local repo installer force=0 target_ref=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      --to) shift; target_ref="${1:-}" ;;
+      --to=*) target_ref="${1#--to=}" ;;
+      --to-latest) target_ref="$UPDATE_REPO_BRANCH" ;;
+      -h|--help)
+        cat <<EOF
+Usage: apx update [--to <ref>|--to-latest] [--force]
+
+  --to <ref>    Check out a branch, tag, or SHA before reinstalling.
+  --to-latest   Alias for --to $UPDATE_REPO_BRANCH.
+  --force       git reset --hard the source clone before pulling; discards
+                any local changes made inside the source repo.
+EOF
+        return 0
+        ;;
+      *) echo "unknown option: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
   repo="$(read_source_repo)"
   if [[ -z "$repo" ]]; then
     cat >&2 <<EOF
@@ -920,9 +941,139 @@ EOF
     echo "error: installer not found or not executable: $installer" >&2
     return 1
   fi
-  echo "updating from $repo"
-  ( cd "$repo" && git fetch --tags --prune origin && git pull --ff-only origin "$UPDATE_REPO_BRANCH" )
+
+  local dirty detached current_ref
+  dirty="$(git -C "$repo" status --porcelain 2>/dev/null || true)"
+  if [[ -n "$dirty" ]]; then
+    if [[ "$force" != "1" ]]; then
+      cat >&2 <<EOF
+error: local changes in source clone: $repo
+Run one of:
+  cd $repo && git status
+  apx update --force            # git reset --hard, discards local edits
+EOF
+      return 1
+    fi
+    echo "resetting local changes in $repo (--force)"
+    ( cd "$repo" && git reset --hard HEAD && git clean -fd )
+  fi
+
+  if ! current_ref="$(git -C "$repo" symbolic-ref -q --short HEAD)"; then
+    detached=1
+    current_ref="$(git -C "$repo" rev-parse --short HEAD)"
+  else
+    detached=0
+  fi
+
+  echo "updating from $repo (currently on ${detached:+detached }$current_ref)"
+  ( cd "$repo" && git fetch --tags --prune origin )
+
+  if [[ -n "$target_ref" ]]; then
+    echo "checking out $target_ref"
+    ( cd "$repo" && git checkout "$target_ref" && git pull --ff-only origin "$target_ref" 2>/dev/null || true )
+  elif [[ "$detached" == "1" ]]; then
+    cat >&2 <<EOF
+warning: source clone is on detached HEAD ($current_ref).
+apx will reinstall from this ref without pulling. To advance:
+  apx update --to $UPDATE_REPO_BRANCH   # latest on default branch
+  apx update --to v0.2.0                # specific release tag
+EOF
+  else
+    ( cd "$repo" && git pull --ff-only origin "$current_ref" )
+  fi
+
   "$installer" --yes
+}
+
+print_completions() {
+  local shell="${1:-}"
+  local cmds="start stop disable restart status mode doctor install uninstall supervisor logs urls dashboard version check-updates update completions help"
+  local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
+  local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
+  case "$shell" in
+    bash)
+      cat <<BASH
+# apx bash completion. Install with:
+#   apx completions bash > ~/.local/share/bash-completion/completions/apx
+_apx_completions() {
+  local cur prev words cword
+  _get_comp_words_by_ref -n : cur prev words cword 2>/dev/null || {
+    cur="\${COMP_WORDS[COMP_CWORD]}"
+    prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  }
+  if [[ "\$cword" -le 1 ]]; then
+    COMPREPLY=( \$(compgen -W "$cmds" -- "\$cur") )
+    return
+  fi
+  case "\${words[1]}" in
+    mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
+    logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
+    completions) COMPREPLY=( \$(compgen -W "bash zsh fish" -- "\$cur") ) ;;
+    update)   COMPREPLY=( \$(compgen -W "--to --to-latest --force" -- "\$cur") ) ;;
+  esac
+}
+complete -F _apx_completions apx
+BASH
+      ;;
+    zsh)
+      cat <<'ZSH'
+# apx zsh completion. Install with:
+#   apx completions zsh > "${fpath[1]}/_apx"
+# or source it directly in ~/.zshrc.
+#compdef apx
+_apx() {
+  local -a cmds modes log_targets
+ZSH
+      printf '  cmds=(%s)\n' "$cmds"
+      printf '  modes=(%s)\n' "$modes"
+      printf '  log_targets=(%s)\n' "$log_targets"
+      cat <<'ZSH'
+  if (( CURRENT == 2 )); then
+    _describe -t commands 'apx command' cmds
+    return
+  fi
+  case "$words[2]" in
+    mode) _describe -t modes 'apx mode' modes ;;
+    logs) _describe -t logs 'apx log target' log_targets ;;
+    completions) _values 'shell' 'bash' 'zsh' 'fish' ;;
+    update) _values 'flag' '--to[git ref]' '--to-latest' '--force' ;;
+  esac
+}
+_apx "$@"
+ZSH
+      ;;
+    fish)
+      cat <<FISH
+# apx fish completion. Install with:
+#   apx completions fish > ~/.config/fish/completions/apx.fish
+complete -c apx -f
+FISH
+      for c in $cmds; do
+        printf 'complete -c apx -n "__fish_use_subcommand" -a "%s"\n' "$c"
+      done
+      for m in $modes; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from mode" -a "%s"\n' "$m"
+      done
+      for l in $log_targets; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from logs" -a "%s"\n' "$l"
+      done
+      cat <<'FISH'
+complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish"
+complete -c apx -n "__fish_seen_subcommand_from update" -l to -l to-latest -l force
+FISH
+      ;;
+    *)
+      cat >&2 <<EOF
+Usage: apx completions <bash|zsh|fish>
+
+Examples:
+  apx completions bash > ~/.local/share/bash-completion/completions/apx
+  apx completions zsh > "\${fpath[1]}/_apx"
+  apx completions fish > ~/.config/fish/completions/apx.fish
+EOF
+      return 2
+      ;;
+  esac
 }
 
 usage() {
@@ -945,7 +1096,8 @@ Commands:
   dashboard [--open]   Print URLs; with --open, open the pxpipe dashboard
   version              Print installed and source-repo version
   check-updates        Compare installed version against origin/main
-  update               git pull the recorded source repo and reinstall
+  update [--to REF]    git pull the recorded source repo and reinstall
+  completions SHELL    Print shell completion script (bash, zsh, or fish)
 
 Mode options:
   headroom-pxpipe      Claude -> Headroom -> pxpipe -> Anthropic (alias: full)
@@ -980,7 +1132,8 @@ case "$cmd" in
   dashboard) open_dashboard "${1:-}" ;;
   version|--version|-V) show_version ;;
   check-updates|check-update) check_updates ;;
-  update|upgrade) do_update ;;
+  update|upgrade) do_update "$@" ;;
+  completions) print_completions "${1:-}" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

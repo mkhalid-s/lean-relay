@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax check
+        run: |
+          bash -n install.sh
+          bash -n bootstrap.sh
+          bash -n bin/apx
+          bash -n bin/apx-squeezr
+
+      - name: Shellcheck
+        run: |
+          shellcheck --severity=warning \
+            install.sh \
+            bootstrap.sh \
+            bin/apx \
+            bin/apx-squeezr
+
+      - name: Python compile
+        run: |
+          python -m py_compile bin/apx-gateway
+
+      - name: Verify apx CLI help renders
+        run: |
+          chmod +x bin/apx
+          ./bin/apx help
+
+      - name: Verify completions render
+        run: |
+          ./bin/apx completions bash > /tmp/apx.bash
+          ./bin/apx completions zsh  > /tmp/apx.zsh
+          ./bin/apx completions fish > /tmp/apx.fish
+          test -s /tmp/apx.bash && test -s /tmp/apx.zsh && test -s /tmp/apx.fish
+
+      - name: Verify install.sh --help (macOS gate is bypassed via APX_SKIP_MACOS_GATE)
+        run: |
+          # We only exercise --help since the installer requires Darwin.
+          ./install.sh --help

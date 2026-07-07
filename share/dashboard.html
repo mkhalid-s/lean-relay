@@ -177,11 +177,19 @@
         <div class="row"><a href="/api/headroom/stats" target="_blank">raw /stats JSON</a></div>
       </div>
 
+      <div class="card">
+        <h2>Cost &amp; tokens (session)</h2>
+        <div class="row"><span class="k">Input tokens</span><span class="v" id="s-tokens-in">—</span></div>
+        <div class="row"><span class="k">Output tokens</span><span class="v" id="s-tokens-out">—</span></div>
+        <div class="row"><span class="k">Estimated cost</span><span class="v" id="s-cost">—</span></div>
+        <div class="row"><span class="k">2xx / 4xx / 5xx</span><span class="v" id="s-status">—</span></div>
+      </div>
+
       <div class="card full">
         <h2>Recent gateway requests</h2>
         <table class="history">
-          <thead><tr><th>time</th><th>method</th><th>path</th><th>status</th><th>latency</th><th>upstream</th></tr></thead>
-          <tbody id="history-body"><tr><td colspan="6" class="k">no requests yet</td></tr></tbody>
+          <thead><tr><th>time</th><th>method</th><th>path</th><th>model</th><th>status</th><th>latency</th><th>tok in</th><th>tok out</th><th>cost</th><th>req id</th></tr></thead>
+          <tbody id="history-body"><tr><td colspan="10" class="k">no requests yet</td></tr></tbody>
         </table>
       </div>
 
@@ -198,13 +206,13 @@
       </div>
 
       <div class="card full">
-        <h2>pxpipe dashboard <span class="k">(<a id="pxpipe-link" href="#" target="_blank">open</a>)</span></h2>
-        <div class="iframe-wrap"><iframe id="pxpipe-frame" src="about:blank" title="pxpipe dashboard" loading="lazy"></iframe></div>
+        <h2>pxpipe dashboard <span class="k">(<a id="pxpipe-link" href="/proxy/pxpipe/" target="_blank">open</a>)</span></h2>
+        <div class="iframe-wrap"><iframe id="pxpipe-frame" src="/proxy/pxpipe/" title="pxpipe dashboard" loading="lazy"></iframe></div>
       </div>
 
       <div class="card full">
-        <h2>Squeezr dashboard <span class="k">(<a id="squeezr-link" href="#" target="_blank">open</a>)</span></h2>
-        <div class="iframe-wrap"><iframe id="squeezr-frame" src="about:blank" title="Squeezr dashboard" loading="lazy"></iframe></div>
+        <h2>Squeezr dashboard <span class="k">(<a id="squeezr-link" href="/proxy/squeezr/squeezr/dashboard" target="_blank">open</a>)</span></h2>
+        <div class="iframe-wrap"><iframe id="squeezr-frame" src="/proxy/squeezr/squeezr/dashboard" title="Squeezr dashboard" loading="lazy"></iframe></div>
       </div>
     </section>
   </main>
@@ -219,6 +227,8 @@
     };
     const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : (n ?? '—');
     const fmtMs = (n) => (typeof n === 'number' && !isNaN(n)) ? `${Math.round(n)} ms` : '—';
+    const fmtUsd = (n) => (typeof n === 'number' && !isNaN(n) && n > 0) ? `$${n.toFixed(4)}` : '—';
+    const shortId = (s) => (s ? String(s).slice(-6) : '—');
     const fmtDur = (s) => {
       if (!s && s !== 0) return '—';
       s = Math.floor(s);
@@ -240,8 +250,15 @@
         $('uptime').textContent = fmtDur(j.uptime_seconds);
         $('req-count').textContent = fmt(j.request_count);
         $('req-latency').textContent = fmtMs(j.avg_latency_ms);
-        $('header-meta').textContent = `${j.mode || 'unknown mode'} · ${j.chain_short || ''}`;
+        const meta = `${j.mode || 'unknown mode'} · ${j.chain_short || ''}`;
+        $('header-meta').textContent = j.bind_warning ? `${meta} · ${j.bind_warning}` : meta;
         $('version-badge').textContent = 'apx ' + (j.version || '?');
+
+        const s = j.stats || {};
+        $('s-tokens-in').textContent = fmt(s.tokens_in);
+        $('s-tokens-out').textContent = fmt(s.tokens_out);
+        $('s-cost').textContent = fmtUsd(s.cost_est_usd);
+        $('s-status').textContent = `${fmt(s.status_2xx)} / ${fmt(s.status_4xx)} / ${fmt(s.status_5xx)}`;
 
         const c = $('chain-view');
         c.innerHTML = '';
@@ -257,20 +274,6 @@
         $('h-pxpipe').innerHTML = badge(h.pxpipe || '?');
         $('h-squeezr').innerHTML = badge(h.squeezr || '?');
 
-        if (j.pxpipe_url) {
-          $('pxpipe-link').href = j.pxpipe_url;
-          if ($('pxpipe-frame').src === 'about:blank' || $('pxpipe-frame').dataset.url !== j.pxpipe_url) {
-            $('pxpipe-frame').dataset.url = j.pxpipe_url;
-            $('pxpipe-frame').src = j.pxpipe_url;
-          }
-        }
-        if (j.squeezr_url) {
-          $('squeezr-link').href = j.squeezr_url + '/squeezr/dashboard';
-          if ($('squeezr-frame').src === 'about:blank' || $('squeezr-frame').dataset.url !== j.squeezr_url) {
-            $('squeezr-frame').dataset.url = j.squeezr_url;
-            $('squeezr-frame').src = j.squeezr_url + '/squeezr/dashboard';
-          }
-        }
       } catch (e) {
         $('header-meta').textContent = 'gateway unreachable';
       }
@@ -299,7 +302,7 @@
         const rows = (await res.json()).items || [];
         const body = $('history-body');
         if (!rows.length) {
-          body.innerHTML = '<tr><td colspan="6" class="k">no requests yet</td></tr>';
+          body.innerHTML = '<tr><td colspan="10" class="k">no requests yet</td></tr>';
           return;
         }
         body.innerHTML = rows.slice().reverse().map(r => {
@@ -309,9 +312,13 @@
             <td>${t}</td>
             <td>${r.method || ''}</td>
             <td>${escapeHtml(r.path || '')}</td>
+            <td>${escapeHtml(r.model || '')}</td>
             <td class="${cls}">${r.status ?? ''}</td>
             <td>${fmtMs(r.latency_ms)}</td>
-            <td>${escapeHtml(r.upstream || '')}</td>
+            <td>${fmt(r.tokens_in || 0)}</td>
+            <td>${fmt(r.tokens_out || 0)}</td>
+            <td>${fmtUsd(r.cost_est_usd)}</td>
+            <td title="${escapeHtml(r.request_id || '')}">${shortId(r.request_id)}</td>
           </tr>`;
         }).join('');
       } catch (e) {}

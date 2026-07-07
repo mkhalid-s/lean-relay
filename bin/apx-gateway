@@ -7,9 +7,11 @@ import collections
 import http.client
 import json
 import os
+import secrets
 import signal
 import threading
 import time
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -21,6 +23,7 @@ REQUEST_TIMEOUT = float(os.environ.get("GATEWAY_REQUEST_TIMEOUT_SECONDS", "600")
 
 DASHBOARD_ENABLED = os.environ.get("APX_DASHBOARD_ENABLED", "1") == "1"
 DASHBOARD_HTML_PATH = os.environ.get("APX_DASHBOARD_HTML", "")
+DASHBOARD_TOKEN = os.environ.get("APX_DASHBOARD_TOKEN", "").strip()
 HISTORY_SIZE = int(os.environ.get("APX_HISTORY_SIZE", "500"))
 STATE_DIR = os.environ.get("APX_STATE_DIR", os.path.expanduser("~/.local/state/apx"))
 LOG_DIR = os.environ.get("APX_LOG_DIR", os.path.join(STATE_DIR, "logs"))
@@ -31,8 +34,31 @@ SQUEEZR_URL = os.environ.get("APX_SQUEEZR_URL", "http://127.0.0.1:18780").rstrip
 HEADROOM_PROXY_LOG = os.environ.get(
     "HEADROOM_LOG_FILE", os.path.expanduser("~/.headroom/logs/proxy.log")
 )
+HISTORY_PERSIST = os.environ.get("APX_HISTORY_PERSIST", "1") == "1"
+HISTORY_DIR = os.environ.get("APX_HISTORY_DIR", os.path.join(STATE_DIR, "history"))
+HEALTH_INTERVAL_SECONDS = float(os.environ.get("APX_HEALTH_INTERVAL_SECONDS", "5"))
+MAX_LOG_STREAMS_PER_IP = int(os.environ.get("APX_MAX_LOG_STREAMS_PER_IP", "8"))
 
 VERSION_FILE = os.path.join(STATE_DIR, "VERSION")
+
+# Approximate USD costs per million tokens for common model bases.
+# Kept intentionally coarse; users should treat this as an estimate only.
+# Sources: Anthropic and OpenAI public pricing pages, rounded to nearest cent.
+MODEL_COSTS = {
+    "claude-opus-4-8": (15.00, 75.00),
+    "claude-opus-4-7": (15.00, 75.00),
+    "claude-opus-4": (15.00, 75.00),
+    "claude-sonnet-5": (3.00, 15.00),
+    "claude-sonnet-4-6": (3.00, 15.00),
+    "claude-sonnet-4": (3.00, 15.00),
+    "claude-fable-5": (1.00, 5.00),
+    "claude-haiku": (0.80, 4.00),
+    "gpt-5.6": (5.00, 15.00),
+    "gpt-5.5": (5.00, 15.00),
+    "gpt-5": (5.00, 15.00),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+}
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -54,8 +80,18 @@ _STATS = {
     "status_2xx": 0,
     "status_4xx": 0,
     "status_5xx": 0,
+    "tokens_in": 0,
+    "tokens_out": 0,
+    "cost_est_usd": 0.0,
 }
 _STATS_LOCK = threading.Lock()
+_HEALTH_CACHE: dict = {"ts": 0.0, "value": {}}
+_HEALTH_LOCK = threading.Lock()
+_LOG_STREAMS_BY_IP: "collections.defaultdict[str, int]" = collections.defaultdict(int)
+_LOG_STREAMS_LOCK = threading.Lock()
+_HISTORY_FH = None
+_HISTORY_FH_DATE: str | None = None
+_HISTORY_FH_LOCK = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -154,7 +190,7 @@ def _service_ok(url: str, path: str = "/livez", timeout: float = 1.5) -> bool:
         return False
 
 
-def _health_map(cfg: dict[str, str]) -> dict[str, str]:
+def _health_map_uncached(cfg: dict[str, str]) -> dict[str, str]:
     def state(enabled: str, ok: bool) -> str:
         if enabled != "1":
             return "disabled"
@@ -168,14 +204,112 @@ def _health_map(cfg: dict[str, str]) -> dict[str, str]:
     }
 
 
-def _record_request(method: str, path: str, status: int, latency_ms: float, upstream: str) -> None:
+def _health_snapshot(cfg: dict[str, str]) -> dict[str, str]:
+    with _HEALTH_LOCK:
+        cached = _HEALTH_CACHE.get("value") or {}
+        return dict(cached) if cached else {"gateway": "ok"}
+
+
+def _health_refresher_loop() -> None:
+    while True:
+        try:
+            cfg = _load_config_values()
+            snapshot = _health_map_uncached(cfg)
+        except Exception:  # noqa: BLE001
+            snapshot = {"gateway": "ok"}
+        with _HEALTH_LOCK:
+            _HEALTH_CACHE["value"] = snapshot
+            _HEALTH_CACHE["ts"] = time.time()
+        time.sleep(max(1.0, HEALTH_INTERVAL_SECONDS))
+
+
+def _new_request_id() -> str:
+    return f"apx-{secrets.token_hex(8)}"
+
+
+def _model_from_path(path: str, body: bytes) -> str | None:
+    if body:
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            payload = None
+        if isinstance(payload, dict):
+            model = payload.get("model")
+            if isinstance(model, str):
+                return model
+    return None
+
+
+def _cost_estimate(model: str | None, tokens_in: int, tokens_out: int) -> float:
+    if not model or (tokens_in <= 0 and tokens_out <= 0):
+        return 0.0
+    m = model.lower()
+    for base, (rate_in, rate_out) in MODEL_COSTS.items():
+        if m.startswith(base):
+            return round((tokens_in / 1_000_000.0) * rate_in + (tokens_out / 1_000_000.0) * rate_out, 6)
+    return 0.0
+
+
+def _rotate_history_fh() -> "any":
+    global _HISTORY_FH, _HISTORY_FH_DATE
+    if not HISTORY_PERSIST:
+        return None
+    today = date.today().isoformat()
+    if _HISTORY_FH is not None and _HISTORY_FH_DATE == today:
+        return _HISTORY_FH
+    try:
+        if _HISTORY_FH is not None:
+            _HISTORY_FH.close()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        Path(HISTORY_DIR).mkdir(parents=True, exist_ok=True)
+        _HISTORY_FH = open(os.path.join(HISTORY_DIR, f"{today}.jsonl"), "a", encoding="utf-8")
+        _HISTORY_FH_DATE = today
+    except OSError:
+        _HISTORY_FH = None
+        _HISTORY_FH_DATE = None
+    return _HISTORY_FH
+
+
+def _persist_history(entry: dict) -> None:
+    with _HISTORY_FH_LOCK:
+        fh = _rotate_history_fh()
+        if fh is None:
+            return
+        try:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            fh.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _record_request(
+    method: str,
+    path: str,
+    status: int,
+    latency_ms: float,
+    upstream: str,
+    request_id: str = "",
+    model: str | None = None,
+    tokens_in: int = 0,
+    tokens_out: int = 0,
+    bytes_out: int = 0,
+) -> None:
+    cost = _cost_estimate(model, tokens_in, tokens_out)
     entry = {
         "ts": time.time(),
+        "request_id": request_id,
         "method": method,
         "path": path,
         "status": status,
-        "latency_ms": latency_ms,
+        "latency_ms": round(latency_ms, 2),
         "upstream": upstream,
+        "model": model or "",
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "cost_est_usd": cost,
+        "bytes_out": bytes_out,
     }
     with _HISTORY_LOCK:
         _HISTORY.append(entry)
@@ -184,6 +318,10 @@ def _record_request(method: str, path: str, status: int, latency_ms: float, upst
         _STATS["latency_sum_ms"] += latency_ms
         bucket = "status_2xx" if status < 400 else "status_4xx" if status < 500 else "status_5xx"
         _STATS[bucket] += 1
+        _STATS["tokens_in"] += tokens_in
+        _STATS["tokens_out"] += tokens_out
+        _STATS["cost_est_usd"] += cost
+    _persist_history(entry)
 
 
 def _fetch_json(url: str, timeout: float = 3.0) -> dict:
@@ -260,6 +398,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._proxy()
 
+    def _client_ip(self) -> str:
+        try:
+            return self.client_address[0]
+        except Exception:  # noqa: BLE001
+            return "unknown"
+
+    def _authorized_for_dashboard(self) -> bool:
+        if not DASHBOARD_TOKEN:
+            return True
+        provided = ""
+        auth = self.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        if not provided:
+            parsed = urlsplit(self.path)
+            provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
+        if not provided:
+            cookie = self.headers.get("cookie", "")
+            for part in cookie.split(";"):
+                if part.strip().startswith("apx_token="):
+                    provided = part.strip().split("=", 1)[1]
+                    break
+        return secrets.compare_digest(provided, DASHBOARD_TOKEN)
+
     def _handle_dashboard_or_api(self) -> bool:
         if not DASHBOARD_ENABLED:
             return False
@@ -267,10 +429,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
+        if path.startswith("/proxy/pxpipe/") or path == "/proxy/pxpipe":
+            self._passthrough(PXPIPE_URL, path[len("/proxy/pxpipe"):] or "/", parsed.query)
+            return True
+        if path.startswith("/proxy/squeezr/") or path == "/proxy/squeezr":
+            self._passthrough(SQUEEZR_URL, path[len("/proxy/squeezr"):] or "/squeezr/dashboard", parsed.query)
+            return True
+
         if path in ("/", "/dashboard"):
+            if not self._authorized_for_dashboard():
+                self._require_token()
+                return True
             body = _read_dashboard_html()
             self._respond(200, body, content_type="text/html; charset=utf-8")
             return True
+        if path.startswith("/api/"):
+            if not self._authorized_for_dashboard():
+                self._respond_json(401, {"error": "unauthorized", "hint": "set APX_DASHBOARD_TOKEN and pass ?token= or Authorization: Bearer"})
+                return True
         if path == "/api/status":
             self._respond_json(200, self._build_status_payload())
             return True
@@ -291,7 +467,59 @@ class GatewayHandler(BaseHTTPRequestHandler):
             service = (query.get("service", ["supervisor"])[0]) or "supervisor"
             self._stream_log(service)
             return True
+        if path == "/metrics":
+            self._respond(200, self._build_metrics_payload(), content_type="text/plain; version=0.0.4; charset=utf-8")
+            return True
         return False
+
+    def _require_token(self) -> None:
+        body = (
+            b"<!doctype html><meta charset=utf-8><title>apx</title>"
+            b"<h1>apx dashboard</h1><p>Set <code>APX_DASHBOARD_TOKEN</code> and open with "
+            b"<code>?token=...</code> or an <code>Authorization: Bearer</code> header.</p>"
+        )
+        self._respond(401, body, content_type="text/html; charset=utf-8")
+
+    def _passthrough(self, base_url: str, sub_path: str, query: str) -> None:
+        target = urlsplit(base_url)
+        if target.scheme not in {"http", "https"} or not target.netloc:
+            self._respond_json(502, {"error": f"invalid passthrough target: {base_url}"})
+            return
+        path = sub_path if sub_path.startswith("/") else "/" + sub_path
+        if query:
+            path = f"{path}?{query}"
+        conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
+        try:
+            headers = {}
+            for key in ("accept", "accept-encoding", "user-agent"):
+                if key in self.headers:
+                    headers[key] = self.headers[key]
+            headers["Host"] = target.netloc
+            body = self._read_request_body_bytes()
+            conn.request(self.command, path, body=body, headers=headers)
+            resp = conn.getresponse()
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                lower = key.lower()
+                if lower in HOP_BY_HOP_HEADERS or lower == "x-frame-options" or lower == "content-security-policy":
+                    continue
+                self.send_header(key, value)
+            self.send_header("connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    try:
+                        self.wfile.write(chunk)
+                    except Exception:  # noqa: BLE001
+                        break
+        except Exception as exc:  # noqa: BLE001
+            self._respond_json(502, {"error": "proxy_error", "message": str(exc)})
+        finally:
+            conn.close()
 
     def _build_status_payload(self) -> dict:
         cfg = _load_config_values()
@@ -306,7 +534,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "mode": mode,
             "chain_hops": hops,
             "chain_short": " -> ".join(hops),
-            "health": _health_map(cfg),
+            "health": _health_snapshot(cfg),
             "request_count": req,
             "avg_latency_ms": avg,
             "uptime_seconds": int(time.time() - START_TIME),
@@ -315,7 +543,43 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "pxpipe_url": PXPIPE_URL,
             "squeezr_url": SQUEEZR_URL,
             "stats": stats_snapshot,
+            "bind_host": BIND_HOST,
+            "bind_warning": (
+                "bound to non-loopback host; dashboard exposes logs and history"
+                if BIND_HOST not in ("127.0.0.1", "::1", "localhost")
+                else ""
+            ),
         }
+
+    def _build_metrics_payload(self) -> bytes:
+        with _STATS_LOCK:
+            snapshot = dict(_STATS)
+        lines = [
+            "# HELP apx_requests_total total number of requests proxied through the gateway",
+            "# TYPE apx_requests_total counter",
+            f"apx_requests_total {snapshot['requests']}",
+            "# HELP apx_latency_ms_sum sum of per-request latency in milliseconds",
+            "# TYPE apx_latency_ms_sum counter",
+            f"apx_latency_ms_sum {snapshot['latency_sum_ms']}",
+            "# HELP apx_requests_by_status_total requests bucketed by HTTP status class",
+            "# TYPE apx_requests_by_status_total counter",
+            f'apx_requests_by_status_total{{class="2xx"}} {snapshot["status_2xx"]}',
+            f'apx_requests_by_status_total{{class="4xx"}} {snapshot["status_4xx"]}',
+            f'apx_requests_by_status_total{{class="5xx"}} {snapshot["status_5xx"]}',
+            "# HELP apx_tokens_in_total total input tokens observed",
+            "# TYPE apx_tokens_in_total counter",
+            f"apx_tokens_in_total {snapshot['tokens_in']}",
+            "# HELP apx_tokens_out_total total output tokens observed",
+            "# TYPE apx_tokens_out_total counter",
+            f"apx_tokens_out_total {snapshot['tokens_out']}",
+            "# HELP apx_cost_usd_total estimated cost in USD",
+            "# TYPE apx_cost_usd_total counter",
+            f"apx_cost_usd_total {snapshot['cost_est_usd']}",
+            "# HELP apx_uptime_seconds gateway process uptime in seconds",
+            "# TYPE apx_uptime_seconds gauge",
+            f"apx_uptime_seconds {int(time.time() - START_TIME)}",
+        ]
+        return ("\n".join(lines) + "\n").encode("utf-8")
 
     def _stream_log(self, service: str) -> None:
         allowed = {
@@ -332,6 +596,21 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not path:
             self._respond_json(400, {"error": f"unknown service: {service}"})
             return
+
+        ip = self._client_ip()
+        with _LOG_STREAMS_LOCK:
+            active = _LOG_STREAMS_BY_IP[ip]
+            if active >= MAX_LOG_STREAMS_PER_IP:
+                self._respond_json(429, {"error": "too many log streams", "limit": MAX_LOG_STREAMS_PER_IP})
+                return
+            _LOG_STREAMS_BY_IP[ip] = active + 1
+        try:
+            self._stream_log_body(path, service)
+        finally:
+            with _LOG_STREAMS_LOCK:
+                _LOG_STREAMS_BY_IP[ip] = max(0, _LOG_STREAMS_BY_IP[ip] - 1)
+
+    def _stream_log_body(self, path: str, service: str) -> None:
         try:
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -412,13 +691,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: dict[str, object]) -> None:
         self._respond_json(status, payload)
 
-    def _request_body(self) -> bytes:
+    def _read_request_body_bytes(self, cap: int = 32 * 1024 * 1024) -> bytes:
         length = self.headers.get("content-length")
-        if not length:
-            return b""
-        return self.rfile.read(int(length))
+        if length:
+            try:
+                n = int(length)
+            except ValueError:
+                return b""
+            if n <= 0:
+                return b""
+            return self.rfile.read(min(n, cap))
+        if self.headers.get("transfer-encoding", "").lower() == "chunked":
+            chunks: list[bytes] = []
+            remaining = cap
+            while True:
+                size_line = self.rfile.readline().strip()
+                if not size_line:
+                    break
+                try:
+                    size = int(size_line.split(b";")[0], 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    self.rfile.readline()
+                    break
+                read = self.rfile.read(min(size, remaining))
+                chunks.append(read)
+                self.rfile.readline()
+                remaining -= len(read)
+                if remaining <= 0:
+                    break
+            return b"".join(chunks)
+        return b""
 
-    def _proxy_headers(self, target) -> dict[str, str]:
+    def _proxy_headers(self, target, request_id: str) -> dict[str, str]:
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
             lower = key.lower()
@@ -427,7 +733,51 @@ class GatewayHandler(BaseHTTPRequestHandler):
             headers[key] = value
         headers["Host"] = target.netloc
         headers["X-Apx-Gateway-Target"] = TARGET_URL
+        headers["X-Apx-Request-Id"] = request_id
         return headers
+
+    def _extract_tokens_from_json(self, payload_bytes: bytes) -> tuple[int, int]:
+        if not payload_bytes:
+            return 0, 0
+        try:
+            data = json.loads(payload_bytes.decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            return 0, 0
+        if not isinstance(data, dict):
+            return 0, 0
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            tokens_in = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+            tokens_out = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+            return tokens_in, tokens_out
+        return 0, 0
+
+    def _extract_tokens_from_sse(self, body_bytes: bytes) -> tuple[int, int]:
+        if not body_bytes:
+            return 0, 0
+        tokens_in = 0
+        tokens_out = 0
+        try:
+            text = body_bytes.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return 0, 0
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                obj = json.loads(data)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(obj, dict):
+                continue
+            usage = obj.get("usage") or (obj.get("message") or {}).get("usage")
+            if isinstance(usage, dict):
+                tokens_in = int(usage.get("input_tokens", usage.get("prompt_tokens", tokens_in)) or tokens_in)
+                tokens_out = int(usage.get("output_tokens", usage.get("completion_tokens", tokens_out)) or tokens_out)
+        return tokens_in, tokens_out
 
     def _proxy(self) -> None:
         target = urlsplit(TARGET_URL)
@@ -435,26 +785,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(502, {"error": f"invalid gateway target: {TARGET_URL}"})
             return
 
+        request_id = self.headers.get("x-apx-request-id") or _new_request_id()
         path = self.path if self.path.startswith("/") else f"/{self.path}"
         upstream_path = f"{target.path.rstrip('/')}{path}"
         if not upstream_path.startswith("/"):
             upstream_path = f"/{upstream_path}"
 
-        body = self._request_body()
+        body = self._read_request_body_bytes()
+        model = _model_from_path(path, body)
+
         conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
         started = time.time()
         status = 0
+        bytes_out = 0
+        response_chunks: list[bytes] = []
+        capture_response = self.command == "POST" and body
         conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
         try:
-            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target))
+            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id))
             resp = conn.getresponse()
             status = resp.status
+            content_type = resp.getheader("content-type", "").lower()
             self.send_response(resp.status, resp.reason)
             for key, value in resp.getheaders():
                 lower = key.lower()
                 if lower in HOP_BY_HOP_HEADERS:
                     continue
                 self.send_header(key, value)
+            self.send_header("x-apx-request-id", request_id)
             self.send_header("connection", "close")
             self.end_headers()
 
@@ -463,18 +821,66 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     chunk = resp.read(8192)
                     if not chunk:
                         break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                    try:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    bytes_out += len(chunk)
+                    if capture_response and len(response_chunks) * 8192 < 512 * 1024:
+                        response_chunks.append(chunk)
 
             elapsed_ms = (time.time() - started) * 1000
-            log(f"{self.command} {self.path} -> {resp.status} via {TARGET_URL} ({int(elapsed_ms)}ms)")
-            _record_request(self.command, self.path, resp.status, elapsed_ms, TARGET_URL)
+
+            tokens_in = 0
+            tokens_out = 0
+            if capture_response and 200 <= status < 300:
+                joined = b"".join(response_chunks)
+                if "text/event-stream" in content_type:
+                    tokens_in, tokens_out = self._extract_tokens_from_sse(joined)
+                elif "application/json" in content_type:
+                    tokens_in, tokens_out = self._extract_tokens_from_json(joined)
+
+            log(
+                f"{self.command} {self.path} -> {resp.status} via {TARGET_URL} "
+                f"({int(elapsed_ms)}ms) req_id={request_id}"
+            )
+            _record_request(
+                self.command,
+                self.path,
+                resp.status,
+                elapsed_ms,
+                TARGET_URL,
+                request_id=request_id,
+                model=model,
+                tokens_in=tokens_in,
+                tokens_out=tokens_out,
+                bytes_out=bytes_out,
+            )
         except BrokenPipeError:
-            log(f"client disconnected during {self.command} {self.path}")
-            _record_request(self.command, self.path, status or 499, (time.time() - started) * 1000, TARGET_URL)
+            log(f"client disconnected during {self.command} {self.path} req_id={request_id}")
+            _record_request(
+                self.command,
+                self.path,
+                status or 499,
+                (time.time() - started) * 1000,
+                TARGET_URL,
+                request_id=request_id,
+                model=model,
+                bytes_out=bytes_out,
+            )
         except Exception as exc:  # noqa: BLE001
-            log(f"proxy error for {self.command} {self.path}: {exc}")
-            _record_request(self.command, self.path, 502, (time.time() - started) * 1000, TARGET_URL)
+            log(f"proxy error for {self.command} {self.path} req_id={request_id}: {exc}")
+            _record_request(
+                self.command,
+                self.path,
+                502,
+                (time.time() - started) * 1000,
+                TARGET_URL,
+                request_id=request_id,
+                model=model,
+                bytes_out=bytes_out,
+            )
             if not self.wfile.closed:
                 try:
                     self._json(502, {"error": "gateway_proxy_error", "message": str(exc)})
@@ -495,9 +901,23 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
 
+    health_thread = threading.Thread(target=_health_refresher_loop, daemon=True)
+    health_thread.start()
+
+    if BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
+        log(
+            f"WARNING: apx-gateway is bound to {BIND_HOST}; dashboard exposes "
+            "logs and history. Set APX_DASHBOARD_TOKEN or bind to 127.0.0.1."
+        )
+    if DASHBOARD_ENABLED and not DASHBOARD_TOKEN and BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
+        log("WARNING: dashboard is enabled without APX_DASHBOARD_TOKEN; refusing to start")
+        return 2
+
     log(
         f"listening on http://{BIND_HOST}:{PORT} -> {TARGET_URL}"
-        f" (dashboard={'on' if DASHBOARD_ENABLED else 'off'})"
+        f" (dashboard={'on' if DASHBOARD_ENABLED else 'off'},"
+        f" auth={'token' if DASHBOARD_TOKEN else 'none'},"
+        f" history_persist={'on' if HISTORY_PERSIST else 'off'})"
     )
     httpd.serve_forever()
     return 0
