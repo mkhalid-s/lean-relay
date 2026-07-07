@@ -21,14 +21,6 @@ RUNTIME_VERSION_FILE="$RUNTIME_STATE/VERSION"
 RUNTIME_SHARE_DIR="$HOME/.local/share/apx"
 RUNTIME_DASHBOARD_HTML="$RUNTIME_SHARE_DIR/dashboard.html"
 
-LEGACY_LABEL="io.github.ai-proxy-stack"
-LEGACY_BIN="$RUNTIME_BIN_DIR/ai-proxy-stack"
-LEGACY_GATEWAY_BIN="$RUNTIME_BIN_DIR/ai-proxy-gateway"
-LEGACY_SQUEEZR_BIN="$RUNTIME_BIN_DIR/ai-proxy-squeezr-foreground"
-LEGACY_CONFIG_DIR="$HOME/.config/ai-proxy-stack"
-LEGACY_CONFIG="$LEGACY_CONFIG_DIR/config.env"
-LEGACY_STATE="$HOME/.local/state/ai-proxy-stack"
-
 STACK_VERSION="$( [ -f "$SRC_VERSION_FILE" ] && head -n 1 "$SRC_VERSION_FILE" | tr -d '[:space:]' || echo "unknown" )"
 
 YES=0
@@ -36,6 +28,7 @@ NO_START=0
 SKIP_DEPS=0
 CHECK_ONLY=0
 UNINSTALL=0
+PURGE=0
 
 usage() {
   cat <<EOF
@@ -46,7 +39,9 @@ Options:
   --no-start     Sync runtime files but do not install/start the LaunchAgent
   --skip-deps    Skip dependency installation
   --check-only   Print checks/actions without changing anything
-  --uninstall    Stop/remove LaunchAgent and runtime command; keep config/logs
+  --uninstall    Stop the LaunchAgent and remove runtime binaries only
+  --purge        Uninstall service and delete config, state, and dashboard
+                 files. Preserves anything owned by other tools.
   -h, --help     Show this help
 
 This package keeps source files in:
@@ -66,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --skip-deps) SKIP_DEPS=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --purge) UNINSTALL=1; PURGE=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -239,59 +235,6 @@ sync_config() {
     }
   ' "$RUNTIME_CONFIG" "$SRC_CONFIG" >> "$tmp"
   mv "$tmp" "$RUNTIME_CONFIG"
-
-  if grep -q '^GATEWAY_CMD=.*ai-proxy-gateway' "$RUNTIME_CONFIG" 2>/dev/null; then
-    sed -i.bak 's|ai-proxy-gateway|apx-gateway|g' "$RUNTIME_CONFIG"
-    rm -f "$RUNTIME_CONFIG.bak"
-    log "rewrote legacy GATEWAY_CMD to $HOME/.local/bin/apx-gateway"
-  fi
-  if grep -q '^SQUEEZR_CMD=.*ai-proxy-squeezr-foreground' "$RUNTIME_CONFIG" 2>/dev/null; then
-    sed -i.bak 's|ai-proxy-squeezr-foreground|apx-squeezr|g' "$RUNTIME_CONFIG"
-    rm -f "$RUNTIME_CONFIG.bak"
-    log "rewrote legacy SQUEEZR_CMD to $HOME/.local/bin/apx-squeezr"
-  fi
-}
-
-migrate_legacy() {
-  local legacy_plist="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
-  if [[ -f "$legacy_plist" ]]; then
-    run_step "stop legacy LaunchAgent $LEGACY_LABEL" bash -c 'launchctl bootout "gui/$(id -u)" "'"$legacy_plist"'" >/dev/null 2>&1 || true'
-    run_step "remove legacy LaunchAgent plist" rm -f "$legacy_plist"
-  fi
-
-  if [[ -f "$LEGACY_CONFIG" && ! -f "$RUNTIME_CONFIG" ]]; then
-    if [[ "$CHECK_ONLY" == "1" ]]; then
-      log "would migrate $LEGACY_CONFIG -> $RUNTIME_CONFIG"
-    else
-      mkdir -p "$RUNTIME_CONFIG_DIR"
-      run_step "migrate legacy config" cp "$LEGACY_CONFIG" "$RUNTIME_CONFIG"
-    fi
-  fi
-
-  if [[ -d "$LEGACY_STATE" && ! -d "$RUNTIME_STATE" ]]; then
-    if [[ "$CHECK_ONLY" == "1" ]]; then
-      log "would migrate $LEGACY_STATE -> $RUNTIME_STATE"
-    else
-      mkdir -p "$(dirname "$RUNTIME_STATE")"
-      run_step "migrate legacy state" cp -R "$LEGACY_STATE" "$RUNTIME_STATE"
-    fi
-  fi
-}
-
-install_legacy_shim() {
-  local target="$1" name="$2"
-  if [[ "$CHECK_ONLY" == "1" ]]; then
-    log "would install deprecation shim: $target -> apx bin/$name"
-    return 0
-  fi
-  cat > "$target" <<SHIM
-#!/usr/bin/env bash
-# Deprecation shim: forwards to the renamed apx binary.
-printf '[apx] deprecation notice: %s is now %s; update your scripts.\n' "\$(basename "\$0")" "$name" >&2
-exec "$HOME/.local/bin/$name" "\$@"
-SHIM
-  chmod +x "$target"
-  log "installed deprecation shim: $target"
 }
 
 sync_dashboard() {
@@ -307,6 +250,15 @@ sync_dashboard() {
   run_step "install dashboard html" cp "$SRC_DASHBOARD_HTML" "$RUNTIME_DASHBOARD_HTML"
 }
 
+install_bin() {
+  # Atomic install: `install` writes to a temp file and renames into place, so
+  # a killed installer can never leave a half-written executable that a
+  # concurrent `apx update` would then try to run.
+  local src="$1" dst="$2" label="$3"
+  backup_if_different "$src" "$dst"
+  run_step "install $label" install -m 0755 "$src" "$dst"
+}
+
 sync_runtime() {
   if [[ "$CHECK_ONLY" == "1" ]]; then
     log "would sync runtime command/config into launchd-safe paths"
@@ -314,23 +266,9 @@ sync_runtime() {
     mkdir -p "$RUNTIME_BIN_DIR" "$RUNTIME_CONFIG_DIR" "$RUNTIME_STATE/logs" "$RUNTIME_STATE/run" "$RUNTIME_SHARE_DIR"
   fi
 
-  migrate_legacy
-
-  backup_if_different "$SRC_BIN" "$RUNTIME_BIN"
-  run_step "install runtime command" cp "$SRC_BIN" "$RUNTIME_BIN"
-  run_step "make runtime command executable" chmod +x "$RUNTIME_BIN"
-
-  backup_if_different "$SRC_GATEWAY_BIN" "$RUNTIME_GATEWAY_BIN"
-  run_step "install runtime gateway" cp "$SRC_GATEWAY_BIN" "$RUNTIME_GATEWAY_BIN"
-  run_step "make runtime gateway executable" chmod +x "$RUNTIME_GATEWAY_BIN"
-
-  backup_if_different "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN"
-  run_step "install runtime Squeezr helper" cp "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN"
-  run_step "make runtime Squeezr helper executable" chmod +x "$RUNTIME_SQUEEZR_BIN"
-
-  install_legacy_shim "$LEGACY_BIN" "apx"
-  install_legacy_shim "$LEGACY_GATEWAY_BIN" "apx-gateway"
-  install_legacy_shim "$LEGACY_SQUEEZR_BIN" "apx-squeezr"
+  install_bin "$SRC_BIN"         "$RUNTIME_BIN"         "runtime command"
+  install_bin "$SRC_GATEWAY_BIN" "$RUNTIME_GATEWAY_BIN" "runtime gateway"
+  install_bin "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN" "runtime Squeezr helper"
 
   sync_dashboard
 
@@ -423,14 +361,19 @@ install_service() {
 }
 
 uninstall() {
+  # Delegate to `apx uninstall --purge` so the CLI is the single source of
+  # truth for what a purge removes. If the CLI is missing we fall back to
+  # removing the binaries only.
   if [[ -x "$RUNTIME_BIN" ]]; then
-    run_step "stop/remove LaunchAgent" "$RUNTIME_BIN" uninstall
+    if [[ "$PURGE" == "1" ]]; then
+      run_step "apx uninstall --purge" "$RUNTIME_BIN" uninstall --purge --yes
+    else
+      run_step "apx uninstall (service only)" "$RUNTIME_BIN" uninstall
+    fi
+    return 0
   fi
   run_step "remove runtime command" rm -f "$RUNTIME_BIN" "$RUNTIME_GATEWAY_BIN" "$RUNTIME_SQUEEZR_BIN"
-  run_step "remove deprecation shims" rm -f "$LEGACY_BIN" "$LEGACY_GATEWAY_BIN" "$LEGACY_SQUEEZR_BIN"
-  log "kept config and logs:"
-  log "  $RUNTIME_CONFIG"
-  log "  $RUNTIME_STATE"
+  log "note: apx CLI was already missing; run install.sh --purge on a source clone to remove state/config"
 }
 
 main() {

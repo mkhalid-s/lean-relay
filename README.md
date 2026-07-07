@@ -71,12 +71,22 @@ Disable the dashboard entirely by setting `APX_DASHBOARD_ENABLED=0` in `~/.confi
 Once installed, upgrade in place from the recorded source clone:
 
 ```bash
-apx check-updates   # compare installed vs origin/main
-apx update          # git pull + rerun install.sh --yes
-apx version         # show installed version and source repo
+apx check-updates             # compare installed vs origin/main
+apx update                    # git pull + rerun install.sh --yes
+apx update --dry-run          # preview commits and installer actions
+apx update --to v0.2.0        # move to a specific tag or branch
+apx version                   # show installed version and source repo
 ```
 
-`update` fast-forwards the source clone, then reinstalls binaries into `~/.local/bin/`, merges any new default keys into `~/.config/apx/config.env` (backing up the existing file), refreshes the dashboard HTML, and reloads the LaunchAgent. Local port/mode/PXPIPE_MODELS customizations are preserved.
+`update` fast-forwards the source clone, then reinstalls binaries into `~/.local/bin/`, merges any new default keys into `~/.config/apx/config.env` (backing up the existing file), refreshes the dashboard HTML, and reloads the LaunchAgent. Local port/mode/PXPIPE_MODELS customizations are preserved. Binaries are copied via `install -m 0755`, which writes to a temp file and renames atomically, so an interrupted upgrade never leaves a half-written executable.
+
+After an update, if you had installed shell completions with `apx completions install`, `apx update` warns you when they look stale so you can refresh them:
+
+```bash
+apx completions install       # detects your shell
+apx completions install --shell zsh
+apx completions uninstall     # remove installed completion files
+```
 
 If you installed with the curl bootstrap, the source clone lives at `~/.local/share/apx-src` and `apx update` handles the pull for you. If you cloned somewhere else and moved the directory, either:
 
@@ -188,8 +198,15 @@ apx logs pxpipe
 apx logs squeezr
 apx install
 apx stop
-apx uninstall
+apx uninstall                       # stop LaunchAgent; keep everything else
+apx uninstall --purge --dry-run     # preview a full removal
+apx uninstall --purge --yes         # remove binaries, config, state, share,
+                                    # completions, and ANTHROPIC_BASE_URL from
+                                    # ~/.claude/settings.json
+apx uninstall --purge=state,logs    # remove selectively
 ```
+
+`--purge` categories: `binaries`, `share`, `state`, `config`, `claude`, `completions`, `source`. Anything owned by other tools (`~/.headroom`, `~/.squeezr`, `~/.certs`, `~/.cache/tiktoken`, ...) is never touched. `--purge=source` refuses to delete the source clone if the running `apx` binary lives inside it, and prints the exact `rm -rf` command to run manually.
 
 Debug everything at once:
 

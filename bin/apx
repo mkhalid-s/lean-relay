@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Load-bearing paths still honor the legacy AI_PROXY_STACK_* env names for one
-# release cycle so existing shells and cron jobs don't break during upgrade.
-# Non-load-bearing tuning knobs use the APX_* names only.
 LABEL="${APX_LABEL:-io.github.apx}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/../config" ]]; then
@@ -11,20 +8,24 @@ if [[ -d "$SCRIPT_DIR/../config" ]]; then
 else
   DEFAULT_STACK_ROOT="$HOME/.local/share/apx"
 fi
-STACK_ROOT="${APX_ROOT:-${AI_PROXY_STACK_ROOT:-$DEFAULT_STACK_ROOT}}"
-CONFIG_FILE="${APX_CONFIG:-${AI_PROXY_STACK_CONFIG:-$HOME/.config/apx/config.env}}"
+STACK_ROOT="${APX_ROOT:-$DEFAULT_STACK_ROOT}"
+CONFIG_FILE="${APX_CONFIG:-$HOME/.config/apx/config.env}"
 CONFIG_DIR="$(dirname "$CONFIG_FILE")"
 SOURCE_PATH_FILE="$CONFIG_DIR/source.path"
-STATE_DIR="${APX_STATE:-${AI_PROXY_STACK_STATE:-$HOME/.local/state/apx}}"
+# PRICES_FILE is not consumed by the CLI (apx-gateway reads it directly), but
+# it is documented here so users find the expected path via `grep` in bin/apx.
+# shellcheck disable=SC2034
+PRICES_FILE="$CONFIG_DIR/prices.env"
+STATE_DIR="${APX_STATE:-$HOME/.local/state/apx}"
 VERSION_FILE="$STATE_DIR/VERSION"
-DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$HOME/.local/share/apx/dashboard.html}"
+SHARE_DIR="${APX_SHARE:-$HOME/.local/share/apx}"
+DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$SHARE_DIR/dashboard.html}"
 RUN_DIR="$STATE_DIR/run"
 LOG_DIR="$STATE_DIR/logs"
 UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}"
 UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-main}"
 PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
 CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
-LEGACY_LABELS="${APX_LEGACY_LABELS:-io.github.ai-proxy-stack}"
 DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH="${APX_PATH:-$DEFAULT_PATH}:$PATH"
 
@@ -51,15 +52,6 @@ load_config() {
   : "${GATEWAY_CMD:=$HOME/.local/bin/apx-gateway}"
   : "${PXPIPE_CMD:=npx -y pxpipe-proxy@0.8.0}"
   : "${SQUEEZR_CMD:=$HOME/.local/bin/apx-squeezr}"
-  if [[ "$SQUEEZR_CMD" == "npx -y --package squeezr-ai squeezr start" ]]; then
-    SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
-  fi
-  if [[ "$SQUEEZR_CMD" == "$HOME/.local/bin/ai-proxy-squeezr-foreground" ]]; then
-    SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
-  fi
-  if [[ "$GATEWAY_CMD" == "$HOME/.local/bin/ai-proxy-gateway" ]]; then
-    GATEWAY_CMD="$HOME/.local/bin/apx-gateway"
-  fi
   : "${PXPIPE_MODELS:=claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5}"
   : "${HEADROOM_CMD:=headroom proxy}"
   : "${PXPIPE_TARGET_API_URL:=https://api.anthropic.com}"
@@ -183,7 +175,7 @@ start_gateway() {
   existing="$(port_pid "$GATEWAY_PORT")"
   if [[ -n "$existing" ]]; then
     if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
-      safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'apx-gateway|python.*apx-gateway|ai-proxy-gateway|python.*ai-proxy-gateway' || return 1
+      safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'apx-gateway|python.*apx-gateway' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/gateway.adopted.pid"
       log "Gateway already listening on $GATEWAY_PORT; adopting external pid $existing"
@@ -341,7 +333,7 @@ stop_stale_supervisors() {
   while read -r pid cmd; do
     [[ -n "${pid:-}" ]] || continue
     [[ "$pid" == "$self" ]] && continue
-    [[ "$cmd" == *"apx supervisor"* || "$cmd" == *"ai-proxy-stack supervisor"* ]] || continue
+    [[ "$cmd" == *"apx supervisor"* ]] || continue
     log "stopping stale supervisor pid $pid: $cmd"
     kill "$pid" 2>/dev/null || true
     sleep 1
@@ -418,16 +410,6 @@ start_bg() {
 
 launchd_domain() { printf 'gui/%s' "$(id -u)"; }
 
-stop_legacy_services() {
-  local legacy legacy_plist
-  for legacy in $LEGACY_LABELS; do
-    [[ "$legacy" == "$LABEL" ]] && continue
-    legacy_plist="$HOME/Library/LaunchAgents/$legacy.plist"
-    launchctl bootout "$(launchd_domain)" "$legacy_plist" >/dev/null 2>&1 || true
-    rm -f "$legacy_plist"
-  done
-}
-
 write_plist() {
   mkdir -p "$HOME/Library/LaunchAgents" "$STATE_DIR"
   cat > "$PLIST_FILE" <<EOF
@@ -460,7 +442,6 @@ EOF
 
 install_service() {
   load_config
-  stop_legacy_services
   write_plist
   launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
   sleep 2
@@ -483,10 +464,269 @@ stop_service() {
   echo "stopped"
 }
 
-uninstall_service() {
-  stop_service
-  rm -f "$PLIST_FILE"
-  echo "removed: $PLIST_FILE"
+# --- uninstall / purge ------------------------------------------------------
+#
+# `apx uninstall` (no flags)              → stop LaunchAgent, remove plist. Everything else stays.
+# `apx uninstall --purge`                 → stop service + delete binaries, share, state, config,
+#                                            claude entry, completion files, and the source clone.
+# `apx uninstall --purge=cat1,cat2,...`   → selectively delete listed categories.
+# `apx uninstall --dry-run`               → print what would happen; change nothing.
+# `apx uninstall --yes`                   → skip the interactive confirmation.
+#
+# Categories:
+#   service     : LaunchAgent plist + running processes (implicit for any purge)
+#   binaries    : ~/.local/bin/apx, apx-gateway, apx-squeezr
+#   share       : ~/.local/share/apx/ (dashboard.html)
+#   state       : ~/.local/state/apx/ (logs, history, run, VERSION)
+#   config      : ~/.config/apx/ (config.env, prices.env, source.path)
+#   claude      : remove ANTHROPIC_BASE_URL from ~/.claude/settings.json (file is preserved)
+#   completions : bash/zsh/fish completion files at their canonical paths
+#   source      : the git clone recorded in ~/.config/apx/source.path
+#
+# Never touched: ~/.headroom, ~/.squeezr, ~/.certs, ~/.cache/tiktoken, and
+# everything else we don't own.
+
+APX_ALL_PURGE_CATEGORIES=(binaries share state config claude completions source)
+
+parse_purge_categories() {
+  local input="$1"
+  APX_PURGE_CATS=()
+  if [[ "$input" == "1" || -z "$input" ]]; then
+    APX_PURGE_CATS=("${APX_ALL_PURGE_CATEGORIES[@]}")
+    return 0
+  fi
+  local IFS=,
+  local cat
+  for cat in $input; do
+    cat="${cat// /}"
+    [[ -z "$cat" ]] && continue
+    local found=0 known
+    for known in "${APX_ALL_PURGE_CATEGORIES[@]}"; do
+      if [[ "$cat" == "$known" ]]; then
+        APX_PURGE_CATS+=("$cat")
+        found=1
+        break
+      fi
+    done
+    if (( found == 0 )); then
+      echo "error: unknown purge category: $cat" >&2
+      echo "valid: ${APX_ALL_PURGE_CATEGORIES[*]}" >&2
+      return 2
+    fi
+  done
+}
+
+purge_has() {
+  local target="$1" cat
+  for cat in "${APX_PURGE_CATS[@]:-}"; do
+    [[ "$cat" == "$target" ]] && return 0
+  done
+  return 1
+}
+
+purge_action() {
+  local desc="$1"
+  shift
+  if [[ "${APX_DRY_RUN:-0}" == "1" ]]; then
+    printf '[apx:uninstall] (dry-run) %s\n' "$desc"
+    return 0
+  fi
+  printf '[apx:uninstall] %s\n' "$desc"
+  "$@"
+}
+
+confirm_purge() {
+  if [[ "${APX_YES:-0}" == "1" || "${APX_DRY_RUN:-0}" == "1" ]]; then
+    return 0
+  fi
+  printf 'This will remove the following categories: %s\n' "${APX_PURGE_CATS[*]}"
+  printf 'Type "yes" to proceed: '
+  local reply
+  read -r reply || return 1
+  [[ "$reply" == "yes" ]]
+}
+
+remove_from_claude_settings() {
+  [[ ! -f "$CLAUDE_SETTINGS_FILE" ]] && return 0
+  python3 - "$CLAUDE_SETTINGS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text())
+except json.JSONDecodeError:
+    sys.exit(0)
+if not isinstance(data, dict):
+    sys.exit(0)
+env = data.get("env")
+if isinstance(env, dict) and "ANTHROPIC_BASE_URL" in env:
+    env.pop("ANTHROPIC_BASE_URL", None)
+    path.write_text(json.dumps(data, indent=2) + "\n")
+PY
+}
+
+remove_completion_files() {
+  local -a paths=(
+    "$HOME/.local/share/bash-completion/completions/apx"
+    "/opt/homebrew/etc/bash_completion.d/apx"
+    "/usr/local/etc/bash_completion.d/apx"
+    "$HOME/.config/fish/completions/apx.fish"
+  )
+  local zdir
+  for zdir in "$HOME/.zfunc" "$HOME/.zsh/completions" "/opt/homebrew/share/zsh/site-functions" "/usr/local/share/zsh/site-functions"; do
+    paths+=("$zdir/_apx")
+  done
+  local p
+  for p in "${paths[@]}"; do
+    if [[ -f "$p" ]]; then
+      rm -f "$p" || true
+    fi
+  done
+  return 0
+}
+
+source_clone_path() {
+  [[ -f "$SOURCE_PATH_FILE" ]] || return 1
+  local p
+  p="$(head -n 1 "$SOURCE_PATH_FILE" | tr -d '[:space:]')"
+  [[ -n "$p" && -d "$p/.git" ]] || return 1
+  case "$p" in
+    "$HOME"/*) printf '%s\n' "$p" ;;
+    *) return 1 ;;
+  esac
+}
+
+running_inside_dir() {
+  # True if the currently executing apx binary (BASH_SOURCE[0]) lives under
+  # the given directory. Used to refuse deleting the source clone we are
+  # running from.
+  local dir="$1" real
+  real="$(python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}" 2>/dev/null)"
+  [[ -n "$real" ]] || return 1
+  case "$real" in
+    "$dir"/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+delete_source_clone() {
+  local src="$1"
+  if running_inside_dir "$src"; then
+    echo "[apx:uninstall] refusing to delete source clone $src (this apx binary lives inside it)"
+    echo "[apx:uninstall]   remove it manually after uninstall:  rm -rf $src"
+    return 0
+  fi
+  rm -rf "$src"
+}
+
+do_uninstall_service_only() {
+  # stop_service touches config-derived ports; the config may already be gone.
+  if [[ -f "$CONFIG_FILE" ]]; then
+    load_config
+    stop_service
+  else
+    # Fall back to a best-effort launchctl bootout when config is missing.
+    launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
+  fi
+  purge_action "remove $PLIST_FILE" rm -f "$PLIST_FILE"
+  echo "removed LaunchAgent. Config, state, and binaries were preserved."
+  echo "Run 'apx uninstall --purge' to remove everything."
+}
+
+do_uninstall_purge() {
+  # Always stop the service first so nothing races the deletions.
+  if [[ -f "$CONFIG_FILE" ]]; then
+    purge_action "stop service and remove plist" bash -c "'$0' stop >/dev/null 2>&1 || true; rm -f '$PLIST_FILE'"
+  else
+    purge_action "bootout LaunchAgent (config missing)" bash -c "launchctl bootout '$(launchd_domain)' '$PLIST_FILE' >/dev/null 2>&1 || true; rm -f '$PLIST_FILE'"
+  fi
+
+  if purge_has claude; then
+    purge_action "remove ANTHROPIC_BASE_URL from $CLAUDE_SETTINGS_FILE" remove_from_claude_settings
+  fi
+  if purge_has completions; then
+    purge_action "remove installed shell completion files" remove_completion_files
+  fi
+  if purge_has share; then
+    purge_action "remove $SHARE_DIR" rm -rf "$SHARE_DIR"
+  fi
+  if purge_has state; then
+    purge_action "remove $STATE_DIR" rm -rf "$STATE_DIR"
+  fi
+  if purge_has config; then
+    purge_action "remove $CONFIG_DIR" rm -rf "$CONFIG_DIR"
+  fi
+  if purge_has source; then
+    local src
+    if src="$(source_clone_path)"; then
+      purge_action "remove source clone $src" delete_source_clone "$src"
+    fi
+  fi
+  if purge_has binaries; then
+    # Remove the CLI last so any prior category deletions can still shell out
+    # through this same script if they need to.
+    purge_action "remove $HOME/.local/bin/apx*" rm -f \
+      "$HOME/.local/bin/apx" \
+      "$HOME/.local/bin/apx-gateway" \
+      "$HOME/.local/bin/apx-squeezr"
+  fi
+
+  if [[ "${APX_DRY_RUN:-0}" != "1" ]]; then
+    echo "apx uninstalled (categories: ${APX_PURGE_CATS[*]})."
+    echo "Anything owned by other tools (Headroom, pxpipe, Squeezr, CA bundle, tiktoken cache) was preserved."
+  fi
+}
+
+uninstall_command() {
+  APX_DRY_RUN=0
+  APX_YES=0
+  APX_PURGE_CATS=()
+  local purge_arg="" mode="service"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --purge) mode="purge"; purge_arg="1" ;;
+      --purge=*) mode="purge"; purge_arg="${1#--purge=}" ;;
+      --dry-run) APX_DRY_RUN=1 ;;
+      --yes|-y) APX_YES=1 ;;
+      -h|--help) uninstall_usage; return 0 ;;
+      *) uninstall_usage >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  if [[ "$mode" == "service" ]]; then
+    do_uninstall_service_only
+    return
+  fi
+
+  if ! parse_purge_categories "$purge_arg"; then
+    return 2
+  fi
+  if ! confirm_purge; then
+    echo "aborted"
+    return 1
+  fi
+  do_uninstall_purge
+}
+
+uninstall_usage() {
+  cat <<EOF
+usage: apx uninstall [--purge[=cats]] [--dry-run] [--yes]
+
+  (no flags)              Stop the LaunchAgent and remove the plist only.
+                          Binaries, config, state, and Claude settings stay.
+  --purge                 Remove everything apx owns:
+                            ${APX_ALL_PURGE_CATEGORIES[*]}
+  --purge=cats            Remove only the listed categories (comma-separated).
+                          Available: ${APX_ALL_PURGE_CATEGORIES[*]}
+  --dry-run               Print planned actions; make no changes.
+  --yes, -y               Skip the interactive confirmation.
+
+Never touched: ~/.headroom, ~/.squeezr, ~/.certs, ~/.cache/tiktoken, and
+everything else apx does not own.
+EOF
 }
 
 set_config_var() {
@@ -1089,21 +1329,23 @@ check_updates() {
 }
 
 do_update() {
-  local repo installer force=0 target_ref=""
+  local repo installer force=0 target_ref="" dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force) force=1 ;;
       --to) shift; target_ref="${1:-}" ;;
       --to=*) target_ref="${1#--to=}" ;;
       --to-latest) target_ref="$UPDATE_REPO_BRANCH" ;;
+      --dry-run) dry_run=1 ;;
       -h|--help)
         cat <<EOF
-Usage: apx update [--to <ref>|--to-latest] [--force]
+Usage: apx update [--to <ref>|--to-latest] [--force] [--dry-run]
 
   --to <ref>    Check out a branch, tag, or SHA before reinstalling.
   --to-latest   Alias for --to $UPDATE_REPO_BRANCH.
   --force       git reset --hard the source clone before pulling; discards
                 any local changes made inside the source repo.
+  --dry-run     Fetch and show what would change; do not modify anything.
 EOF
         return 0
         ;;
@@ -1162,6 +1404,22 @@ EOF
   echo "updating from $repo (currently on ${detached:+detached }$current_ref)"
   ( cd "$repo" && git fetch --tags --prune origin )
 
+  local pre_version post_version
+  pre_version="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+
+  if [[ "$dry_run" == "1" ]]; then
+    echo "=== dry-run: git changes ==="
+    if [[ -n "$target_ref" ]]; then
+      ( cd "$repo" && git log --oneline "HEAD..$target_ref" 2>/dev/null || echo "(no visible commits between HEAD and $target_ref)" )
+    else
+      ( cd "$repo" && git log --oneline "HEAD..origin/$current_ref" 2>/dev/null || echo "(source clone is up to date or on a detached ref)" )
+    fi
+    echo
+    echo "=== dry-run: installer check-only ==="
+    "$installer" --check-only
+    return 0
+  fi
+
   if [[ -n "$target_ref" ]]; then
     echo "checking out $target_ref"
     ( cd "$repo" && git checkout "$target_ref" && git pull --ff-only origin "$target_ref" 2>/dev/null || true )
@@ -1177,6 +1435,32 @@ EOF
   fi
 
   "$installer" --yes
+
+  post_version="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+  echo
+  echo "=== apx update summary ==="
+  echo "  version:      $pre_version -> $post_version"
+  echo "  source:       $repo"
+  echo "  config:       $CONFIG_FILE"
+  echo "  restart:      done (LaunchAgent reloaded)"
+  if command -v apx >/dev/null 2>&1; then
+    # Warn if any installed completion file is older than the CLI binary.
+    local cli_time f stale=0
+    cli_time="$(stat -f %m "$HOME/.local/bin/apx" 2>/dev/null || echo 0)"
+    for f in \
+      "$HOME/.local/share/bash-completion/completions/apx" \
+      "$HOME/.zfunc/_apx" \
+      "$HOME/.config/fish/completions/apx.fish"; do
+      if [[ -f "$f" ]]; then
+        local ft
+        ft="$(stat -f %m "$f" 2>/dev/null || echo 0)"
+        if (( ft < cli_time )); then stale=1; fi
+      fi
+    done
+    if (( stale == 1 )); then
+      echo "  completions:  stale detected. Re-run: apx completions install"
+    fi
+  fi
 }
 
 print_completions() {
@@ -1205,8 +1489,9 @@ _apx_completions() {
     mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
     chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
-    completions) COMPREPLY=( \$(compgen -W "bash zsh fish" -- "\$cur") ) ;;
-    update)   COMPREPLY=( \$(compgen -W "--to --to-latest --force" -- "\$cur") ) ;;
+    completions) COMPREPLY=( \$(compgen -W "bash zsh fish install uninstall" -- "\$cur") ) ;;
+    uninstall) COMPREPLY=( \$(compgen -W "--purge --dry-run --yes" -- "\$cur") ) ;;
+    update)   COMPREPLY=( \$(compgen -W "--to --to-latest --force --dry-run" -- "\$cur") ) ;;
   esac
 }
 complete -F _apx_completions apx
@@ -1235,8 +1520,9 @@ ZSH
     mode) _describe -t modes 'apx mode' modes ;;
     chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
-    completions) _values 'shell' 'bash' 'zsh' 'fish' ;;
-    update) _values 'flag' '--to[git ref]' '--to-latest' '--force' ;;
+    completions) _values 'action' 'bash' 'zsh' 'fish' 'install' 'uninstall' ;;
+    uninstall) _values 'flag' '--purge' '--dry-run' '--yes' ;;
+    update) _values 'flag' '--to[git ref]' '--to-latest' '--force' '--dry-run' ;;
   esac
 }
 _apx "$@"
@@ -1264,20 +1550,124 @@ FISH
         printf 'complete -c apx -n "__fish_seen_subcommand_from logs" -a "%s"\n' "$l"
       done
       cat <<'FISH'
-complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish"
-complete -c apx -n "__fish_seen_subcommand_from update" -l to -l to-latest -l force
+complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install uninstall"
+complete -c apx -n "__fish_seen_subcommand_from uninstall" -l purge -l dry-run -l yes
+complete -c apx -n "__fish_seen_subcommand_from update" -l to -l to-latest -l force -l dry-run
 FISH
       ;;
     *)
       cat >&2 <<EOF
-Usage: apx completions <bash|zsh|fish>
+Usage: apx completions <shell>|install|uninstall [--shell SHELL]
 
-Examples:
-  apx completions bash > ~/.local/share/bash-completion/completions/apx
-  apx completions zsh > "\${fpath[1]}/_apx"
-  apx completions fish > ~/.config/fish/completions/apx.fish
+Emit or install shell completion scripts.
+
+  apx completions bash > file        Print bash completion script
+  apx completions zsh > file         Print zsh completion script
+  apx completions fish > file        Print fish completion script
+  apx completions install [--shell]  Detect current shell and install
+  apx completions uninstall          Remove installed completion files
 EOF
       return 2
+      ;;
+  esac
+}
+
+detect_shell() {
+  local s="${APX_COMPLETION_SHELL:-}"
+  if [[ -n "$s" ]]; then
+    printf '%s\n' "$s"
+    return
+  fi
+  # $SHELL is set by login; fall back to parent process comm for exotic setups.
+  s="$(basename "${SHELL:-}")"
+  case "$s" in
+    bash|zsh|fish) printf '%s\n' "$s" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
+
+completion_target_path() {
+  case "$1" in
+    bash) printf '%s\n' "$HOME/.local/share/bash-completion/completions/apx" ;;
+    zsh)
+      # Prefer a user-writable fpath dir. Falls back to ~/.zfunc, which the
+      # user needs to add to fpath in .zshrc.
+      local dir="$HOME/.zfunc"
+      if [[ -w "/opt/homebrew/share/zsh/site-functions" ]]; then
+        dir="/opt/homebrew/share/zsh/site-functions"
+      elif [[ -w "/usr/local/share/zsh/site-functions" ]]; then
+        dir="/usr/local/share/zsh/site-functions"
+      fi
+      printf '%s/_apx\n' "$dir"
+      ;;
+    fish) printf '%s\n' "$HOME/.config/fish/completions/apx.fish" ;;
+    *) return 1 ;;
+  esac
+}
+
+install_completion_for_shell() {
+  local shell="$1" dst
+  if ! dst="$(completion_target_path "$shell")"; then
+    echo "unknown shell: $shell" >&2
+    return 2
+  fi
+  mkdir -p "$(dirname "$dst")"
+  print_completions "$shell" > "$dst"
+  echo "installed $shell completions: $dst"
+  case "$shell" in
+    zsh)
+      case "$dst" in
+        "$HOME/.zfunc/"*)
+          echo "note: add these lines to ~/.zshrc if they are not already there:"
+          echo "  fpath=($HOME/.zfunc \$fpath)"
+          echo "  autoload -Uz compinit && compinit"
+          ;;
+      esac
+      ;;
+    bash)
+      echo "note: ensure your ~/.bashrc sources bash-completion, e.g.:"
+      echo "  [[ -r /opt/homebrew/etc/profile.d/bash_completion.sh ]] && source /opt/homebrew/etc/profile.d/bash_completion.sh"
+      ;;
+  esac
+}
+
+completions_command() {
+  local sub="${1:-}"
+  case "$sub" in
+    install)
+      shift
+      local shell=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --shell) shift; shell="${1:-}" ;;
+          --shell=*) shell="${1#--shell=}" ;;
+          *) echo "unknown option: $1" >&2; return 2 ;;
+        esac
+        shift
+      done
+      if [[ -z "$shell" ]]; then
+        shell="$(detect_shell)"
+      fi
+      if [[ -z "$shell" ]]; then
+        echo "error: could not detect shell. Pass --shell bash|zsh|fish." >&2
+        return 2
+      fi
+      install_completion_for_shell "$shell"
+      ;;
+    uninstall)
+      # This is a subset of `apx uninstall --purge=completions --yes`; we
+      # keep it as a friendly alias.
+      APX_PURGE_CATS=(completions) APX_DRY_RUN=0 APX_YES=1 remove_completion_files
+      echo "removed installed apx completion files"
+      ;;
+    bash|zsh|fish)
+      print_completions "$sub"
+      ;;
+    -h|--help|"")
+      print_completions ""  # prints usage to stderr
+      ;;
+    *)
+      print_completions "$sub"
       ;;
   esac
 }
@@ -1296,7 +1686,7 @@ Commands:
   chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
   doctor               Show status plus dependency diagnostics
   install              Install/start macOS LaunchAgent with KeepAlive
-  uninstall            Stop and remove macOS LaunchAgent
+  uninstall [--purge]  Stop and remove LaunchAgent; --purge also removes files
   supervisor           Internal foreground supervisor for launchd
   logs [name]          Follow logs: all, supervisor, gateway, pxpipe, squeezr, headroom, headroom.proxy, launchd.*
   urls                 Print dashboard, health, and stats URLs
@@ -1304,7 +1694,8 @@ Commands:
   version              Print installed and source-repo version
   check-updates        Compare installed version against origin/main
   update [--to REF]    git pull the recorded source repo and reinstall
-  completions SHELL    Print shell completion script (bash, zsh, or fish)
+                       (--dry-run to preview; --to REF to change branch/tag)
+  completions <sub>    Print or install shell completions (bash|zsh|fish|install|uninstall)
 
 Mode presets:
   headroom-pxpipe      Claude -> Headroom -> pxpipe -> Anthropic (alias: full)
@@ -1342,14 +1733,14 @@ case "$cmd" in
   chain) chain_cli "$@" ;;
   doctor) doctor ;;
   install) install_service ;;
-  uninstall) uninstall_service ;;
+  uninstall) uninstall_command "$@" ;;
   logs) show_logs "${1:-supervisor}" ;;
   urls) dashboard_urls ;;
   dashboard) open_dashboard "${1:-}" ;;
   version|--version|-V) show_version ;;
   check-updates|check-update) check_updates ;;
   update|upgrade) do_update "$@" ;;
-  completions) print_completions "${1:-}" ;;
+  completions) completions_command "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

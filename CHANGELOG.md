@@ -8,6 +8,38 @@ All notable changes to apx are documented here. The format follows
 
 ### Added
 
+- `apx uninstall` grew a categorized `--purge` flag so users can fully
+  remove apx. Categories: `binaries`, `share`, `state`, `config`, `claude`,
+  `completions`, `source`. Combine with `--dry-run` to preview and
+  `--yes` to skip the confirmation prompt. The default `apx uninstall`
+  (no flags) still just stops the LaunchAgent.
+- `apx uninstall --purge=claude` scrubs `ANTHROPIC_BASE_URL` from
+  `~/.claude/settings.json` while preserving every other key.
+- `apx completions install [--shell bash|zsh|fish]` writes the completion
+  script to the canonical location for that shell. `apx completions
+  uninstall` removes any files installed by that command.
+- `apx update --dry-run` previews git and installer changes.
+- `apx update` prints a post-flight summary (old → new version,
+  source clone path, whether shell completions look stale).
+- `install.sh --purge` alias for `--uninstall`; delegates to
+  `apx uninstall --purge --yes` when the CLI is present so there is a
+  single canonical uninstall path.
+
+### Changed
+
+- Binaries are now installed via `install -m 0755` (atomic
+  write-then-rename) instead of `cp` + `chmod`. An interrupted upgrade
+  can no longer leave a partially-written executable on disk.
+- Deleted migration/deprecation-shim code (`migrate_legacy`,
+  `install_legacy_shim`, `LEGACY_*` constants, per-key
+  `AI_PROXY_STACK_*` env fallbacks, `SQUEEZR_CMD` / `GATEWAY_CMD`
+  rewrite blocks in `load_config`). v0.1 has never been released
+  publicly, so nothing depended on them; keeping them was pure
+  maintenance drag.
+- `apx uninstall --purge=source` refuses to delete the source clone
+  when the running `apx` binary lives inside it, and prints the exact
+  `rm -rf` command to run manually afterwards.
+
 - Chain-based routing. `APX_CHAIN` in `config.env` is a comma-separated
   ordered list of local services between the gateway and the upstream.
   All `*_ENABLED` and `*_TARGET_API_URL` values are derived from it.
