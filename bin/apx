@@ -1,23 +1,29 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-LABEL="${AI_PROXY_STACK_LABEL:-io.github.ai-proxy-stack}"
+LABEL="${APX_LABEL:-${AI_PROXY_STACK_LABEL:-io.github.apx}}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/../config" ]]; then
   DEFAULT_STACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 else
-  DEFAULT_STACK_ROOT="$HOME/.local/share/ai-proxy-stack"
+  DEFAULT_STACK_ROOT="$HOME/.local/share/apx"
 fi
-STACK_ROOT="${AI_PROXY_STACK_ROOT:-$DEFAULT_STACK_ROOT}"
-CONFIG_FILE="${AI_PROXY_STACK_CONFIG:-$HOME/.config/ai-proxy-stack/config.env}"
-STATE_DIR="${AI_PROXY_STACK_STATE:-$HOME/.local/state/ai-proxy-stack}"
+STACK_ROOT="${APX_ROOT:-${AI_PROXY_STACK_ROOT:-$DEFAULT_STACK_ROOT}}"
+CONFIG_FILE="${APX_CONFIG:-${AI_PROXY_STACK_CONFIG:-$HOME/.config/apx/config.env}}"
+CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+SOURCE_PATH_FILE="$CONFIG_DIR/source.path"
+STATE_DIR="${APX_STATE:-${AI_PROXY_STACK_STATE:-$HOME/.local/state/apx}}"
+VERSION_FILE="$STATE_DIR/VERSION"
+DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$HOME/.local/share/apx/dashboard.html}"
 RUN_DIR="$STATE_DIR/run"
 LOG_DIR="$STATE_DIR/logs"
+UPDATE_REPO_URL="${APX_REPO_URL:-${AI_PROXY_STACK_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}}"
+UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-${AI_PROXY_STACK_REPO_BRANCH:-main}}"
 PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
-CLAUDE_SETTINGS_FILE="${AI_PROXY_STACK_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
-LEGACY_LABELS="${AI_PROXY_STACK_LEGACY_LABELS:-}"
+CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-${AI_PROXY_STACK_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}}"
+LEGACY_LABELS="${APX_LEGACY_LABELS:-${AI_PROXY_STACK_LEGACY_LABELS:-io.github.ai-proxy-stack}}"
 DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export PATH="${AI_PROXY_STACK_PATH:-$DEFAULT_PATH}:$PATH"
+export PATH="${APX_PATH:-${AI_PROXY_STACK_PATH:-$DEFAULT_PATH}}:$PATH"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -39,11 +45,17 @@ load_config() {
   : "${PXPIPE_ENABLED:=1}"
   : "${HEADROOM_ENABLED:=1}"
   : "${SQUEEZR_ENABLED:=0}"
-  : "${GATEWAY_CMD:=$HOME/.local/bin/ai-proxy-gateway}"
+  : "${GATEWAY_CMD:=$HOME/.local/bin/apx-gateway}"
   : "${PXPIPE_CMD:=npx -y pxpipe-proxy@0.8.0}"
-  : "${SQUEEZR_CMD:=$HOME/.local/bin/ai-proxy-squeezr-foreground}"
+  : "${SQUEEZR_CMD:=$HOME/.local/bin/apx-squeezr}"
   if [[ "$SQUEEZR_CMD" == "npx -y --package squeezr-ai squeezr start" ]]; then
-    SQUEEZR_CMD="$HOME/.local/bin/ai-proxy-squeezr-foreground"
+    SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
+  fi
+  if [[ "$SQUEEZR_CMD" == "$HOME/.local/bin/ai-proxy-squeezr-foreground" ]]; then
+    SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
+  fi
+  if [[ "$GATEWAY_CMD" == "$HOME/.local/bin/ai-proxy-gateway" ]]; then
+    GATEWAY_CMD="$HOME/.local/bin/apx-gateway"
   fi
   : "${PXPIPE_MODELS:=claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5}"
   : "${HEADROOM_CMD:=headroom proxy}"
@@ -67,6 +79,8 @@ load_config() {
   : "${PXPIPE_EXTRA_ARGS:=}"
   : "${HEADROOM_EXTRA_ARGS:=}"
   : "${SQUEEZR_EXTRA_ARGS:=}"
+  : "${APX_DASHBOARD_ENABLED:=1}"
+  : "${APX_HISTORY_SIZE:=500}"
 }
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -143,8 +157,8 @@ start_gateway() {
   fi
   existing="$(port_pid "$GATEWAY_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
-      safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'ai-proxy-gateway|python.*ai-proxy-gateway' || return 1
+    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
+      safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'apx-gateway|python.*apx-gateway|ai-proxy-gateway|python.*ai-proxy-gateway' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/gateway.adopted.pid"
       log "Gateway already listening on $GATEWAY_PORT; adopting external pid $existing"
@@ -158,6 +172,9 @@ start_gateway() {
   (
     cd "$WORKDIR"
     export HOST="$BIND_HOST" GATEWAY_HOST="$BIND_HOST" GATEWAY_PORT="$GATEWAY_PORT" GATEWAY_TARGET_URL="$GATEWAY_TARGET_API_URL"
+    export APX_DASHBOARD_ENABLED="$APX_DASHBOARD_ENABLED" APX_DASHBOARD_HTML="$DASHBOARD_HTML" APX_HISTORY_SIZE="$APX_HISTORY_SIZE"
+    export APX_STATE_DIR="$STATE_DIR" APX_LOG_DIR="$LOG_DIR" APX_CONFIG="$CONFIG_FILE"
+    export APX_HEADROOM_URL="http://$BIND_HOST:$HEADROOM_PORT" APX_PXPIPE_URL="http://$BIND_HOST:$PXPIPE_PORT" APX_SQUEEZR_URL="http://$BIND_HOST:$SQUEEZR_PORT"
     exec bash -lc "exec $GATEWAY_CMD"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/gateway.pid"
@@ -173,7 +190,7 @@ start_squeezr() {
   fi
   existing="$(port_pid "$SQUEEZR_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
       safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/squeezr.adopted.pid"
@@ -204,7 +221,7 @@ start_pxpipe() {
   fi
   existing="$(port_pid "$PXPIPE_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
       safe_kill_port_owner "pxpipe" "$PXPIPE_PORT" 'pxpipe|node .*/pxpipe' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/pxpipe.adopted.pid"
@@ -244,7 +261,7 @@ start_headroom() {
   fi
   existing="$(port_pid "$HEADROOM_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${AI_PROXY_STACK_TAKEOVER:-0}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
       safe_kill_port_owner "headroom" "$HEADROOM_PORT" 'headroom|Python' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/headroom.adopted.pid"
@@ -297,7 +314,7 @@ stop_stale_supervisors() {
   while read -r pid cmd; do
     [[ -n "${pid:-}" ]] || continue
     [[ "$pid" == "$self" ]] && continue
-    [[ "$cmd" == *"ai-proxy-stack supervisor"* ]] || continue
+    [[ "$cmd" == *"apx supervisor"* || "$cmd" == *"ai-proxy-stack supervisor"* ]] || continue
     log "stopping stale supervisor pid $pid: $cmd"
     kill "$pid" 2>/dev/null || true
     sleep 1
@@ -366,7 +383,7 @@ start_bg() {
     echo "already running: supervisor pid $spid"
     return 0
   fi
-  AI_PROXY_STACK_TAKEOVER="$takeover" nohup "$0" supervisor >> "$LOG_DIR/supervisor.log" 2>&1 &
+  APX_TAKEOVER="$takeover" nohup "$0" supervisor >> "$LOG_DIR/supervisor.log" 2>&1 &
   echo $! > "$RUN_DIR/supervisor.pid"
   sleep 2
   status
@@ -385,7 +402,7 @@ stop_legacy_services() {
 }
 
 write_plist() {
-  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/.local/state/ai-proxy-stack"
+  mkdir -p "$HOME/Library/LaunchAgents" "$STATE_DIR"
   cat > "$PLIST_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -394,7 +411,7 @@ write_plist() {
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$HOME/.local/bin/ai-proxy-stack</string>
+    <string>$HOME/.local/bin/apx</string>
     <string>supervisor</string>
   </array>
   <key>RunAtLoad</key><true/>
@@ -405,9 +422,9 @@ write_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key><string>$DEFAULT_PATH</string>
-    <key>AI_PROXY_STACK_ROOT</key><string>$STACK_ROOT</string>
-    <key>AI_PROXY_STACK_CONFIG</key><string>$CONFIG_FILE</string>
-    <key>AI_PROXY_STACK_STATE</key><string>$STATE_DIR</string>
+    <key>APX_ROOT</key><string>$STACK_ROOT</string>
+    <key>APX_CONFIG</key><string>$CONFIG_FILE</string>
+    <key>APX_STATE</key><string>$STATE_DIR</string>
   </dict>
 </dict>
 </plist>
@@ -463,7 +480,7 @@ current_mode() {
   elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" && "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" && "$PXPIPE_TARGET_API_URL" == "http://$BIND_HOST:$HEADROOM_PORT" ]]; then
     echo "pxpipe-headroom"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
-    echo "full"
+    echo "headroom-pxpipe"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
     echo "headroom-squeezr"
   elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
@@ -583,13 +600,13 @@ set_mode() {
     case "$1" in
       --no-restart) restart="0" ;;
       --no-claude-sync) sync_claude="0" ;;
-      *) echo "usage: $0 mode [full|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
+      *) echo "usage: $0 mode [headroom-pxpipe|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
     esac
     shift
   done
   load_config
   case "$mode" in
-    full)
+    headroom-pxpipe|full)
       set_config_var GATEWAY_ENABLED 1
       set_config_var HEADROOM_ENABLED 1
       set_config_var PXPIPE_ENABLED 1
@@ -666,7 +683,7 @@ set_mode() {
       return 0
       ;;
     *)
-      echo "usage: $0 mode [full|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
+      echo "usage: $0 mode [headroom-pxpipe|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
       return 2
       ;;
   esac
@@ -678,11 +695,11 @@ set_mode() {
     sync_claude_settings
   fi
   if [[ "$restart" == "1" ]]; then
-    AI_PROXY_STACK_TAKEOVER=1 install_service
+    APX_TAKEOVER=1 install_service
     sleep 5
     status
   else
-    echo "not restarted; run: ai-proxy-stack install"
+    echo "not restarted; run: apx install"
   fi
 }
 
@@ -719,6 +736,7 @@ status() {
   else
     sqhealth="disabled"
   fi
+  echo "version: $(read_installed_version)"
   echo "config: $CONFIG_FILE"
   echo "mode: $(current_mode)"
   echo "chain: $(chain_description)"
@@ -812,9 +830,104 @@ open_dashboard() {
   fi
 }
 
+read_installed_version() {
+  if [[ -f "$VERSION_FILE" ]]; then
+    head -n 1 "$VERSION_FILE" | tr -d '[:space:]'
+  else
+    echo "unknown"
+  fi
+}
+
+read_source_repo() {
+  if [[ -f "$SOURCE_PATH_FILE" ]]; then
+    head -n 1 "$SOURCE_PATH_FILE" | tr -d '[:space:]'
+  else
+    echo ""
+  fi
+}
+
+remote_version() {
+  local url="$UPDATE_REPO_URL"
+  local branch="$UPDATE_REPO_BRANCH"
+  local tmp
+  tmp="$(mktemp -d)"
+  local ver="unknown"
+  if command -v curl >/dev/null 2>&1; then
+    local raw_url="${url%.git}"
+    raw_url="${raw_url/github.com/raw.githubusercontent.com}/$branch/VERSION"
+    local fetched
+    fetched="$(curl -fsSL --max-time 10 "$raw_url" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)"
+    if [[ -n "$fetched" ]]; then
+      ver="$fetched"
+    fi
+  fi
+  rm -rf "$tmp"
+  echo "$ver"
+}
+
+show_version() {
+  local installed local_repo local_ver
+  installed="$(read_installed_version)"
+  local_repo="$(read_source_repo)"
+  echo "installed version: $installed"
+  if [[ -n "$local_repo" && -d "$local_repo/.git" ]]; then
+    local_ver="$(git -C "$local_repo" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+    echo "source repo:       $local_repo"
+    echo "source git rev:    $local_ver"
+  else
+    echo "source repo:       (unknown; set via reinstall from a git clone)"
+  fi
+  echo "update channel:    $UPDATE_REPO_URL ($UPDATE_REPO_BRANCH)"
+}
+
+check_updates() {
+  local installed remote
+  installed="$(read_installed_version)"
+  echo "installed version: $installed"
+  remote="$(remote_version)"
+  echo "latest version:    $remote"
+  if [[ "$installed" == "$remote" || "$remote" == "unknown" ]]; then
+    echo "status: up to date"
+  else
+    echo "status: update available"
+    echo "run: apx update"
+  fi
+}
+
+do_update() {
+  local repo installer
+  repo="$(read_source_repo)"
+  if [[ -z "$repo" ]]; then
+    cat >&2 <<EOF
+error: no recorded source repo path.
+
+Options:
+  1. Run install.sh again from a fresh clone:
+       git clone $UPDATE_REPO_URL /tmp/apx-update
+       cd /tmp/apx-update
+       ./install.sh --yes
+  2. Point the CLI at a clone once, then rerun update:
+       echo /path/to/apx-source > "$SOURCE_PATH_FILE"
+EOF
+    return 1
+  fi
+  if [[ ! -d "$repo/.git" ]]; then
+    echo "error: recorded source path is not a git repo: $repo" >&2
+    return 1
+  fi
+  installer="$repo/install.sh"
+  if [[ ! -x "$installer" ]]; then
+    echo "error: installer not found or not executable: $installer" >&2
+    return 1
+  fi
+  echo "updating from $repo"
+  ( cd "$repo" && git fetch --tags --prune origin && git pull --ff-only origin "$UPDATE_REPO_BRANCH" )
+  "$installer" --yes
+}
+
 usage() {
   cat <<EOF
-Usage: ai-proxy-stack <command>
+Usage: apx <command>
 
 Commands:
   start [--takeover]   Start supervisor in the background
@@ -830,10 +943,13 @@ Commands:
   logs [name]          Follow logs: all, supervisor, gateway, pxpipe, squeezr, headroom, headroom.proxy, launchd.*
   urls                 Print dashboard, health, and stats URLs
   dashboard [--open]   Print URLs; with --open, open the pxpipe dashboard
+  version              Print installed and source-repo version
+  check-updates        Compare installed version against origin/main
+  update               git pull the recorded source repo and reinstall
 
 Mode options:
-  full                 Claude -> Headroom -> pxpipe -> upstream
-  pxpipe-headroom     Claude -> pxpipe -> Headroom -> Anthropic
+  headroom-pxpipe      Claude -> Headroom -> pxpipe -> Anthropic (alias: full)
+  pxpipe-headroom      Claude -> pxpipe -> Headroom -> Anthropic
   headroom             Claude -> Headroom -> Anthropic directly
   squeezr              Claude -> Squeezr -> Anthropic directly
   headroom-squeezr     Claude -> Headroom -> Squeezr -> Anthropic
@@ -862,6 +978,9 @@ case "$cmd" in
   logs) show_logs "${1:-supervisor}" ;;
   urls) dashboard_urls ;;
   dashboard) open_dashboard "${1:-}" ;;
+  version|--version|-V) show_version ;;
+  check-updates|check-update) check_updates ;;
+  update|upgrade) do_update ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;
 esac

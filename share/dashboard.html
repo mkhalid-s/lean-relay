@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>apx dashboard</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0f1115;
+      --panel: #171a21;
+      --panel-2: #1e222b;
+      --border: #2b313d;
+      --text: #e6e8ee;
+      --muted: #8b93a4;
+      --ok: #34c759;
+      --warn: #ffb020;
+      --fail: #ff4d4f;
+      --link: #7aa2ff;
+    }
+    @media (prefers-color-scheme: light) {
+      :root {
+        --bg: #f6f7fb;
+        --panel: #ffffff;
+        --panel-2: #f0f2f7;
+        --border: #dfe3ec;
+        --text: #1a1d24;
+        --muted: #626878;
+        --link: #2b5cff;
+      }
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 0.5px;
+    }
+    header .meta { color: var(--muted); font-size: 12px; }
+    main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      min-height: 120px;
+    }
+    .card h2 {
+      margin: 0 0 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+    }
+    .card .row { display: flex; justify-content: space-between; padding: 4px 0; }
+    .card .row + .row { border-top: 1px dashed var(--border); }
+    .card .k { color: var(--muted); }
+    .card .v { font-variant-numeric: tabular-nums; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      background: var(--panel-2);
+      color: var(--muted);
+    }
+    .badge.ok { color: #0a3d17; background: color-mix(in oklab, var(--ok) 30%, transparent); color: var(--ok); }
+    .badge.warn { color: var(--warn); background: color-mix(in oklab, var(--warn) 25%, transparent); }
+    .badge.fail { color: var(--fail); background: color-mix(in oklab, var(--fail) 25%, transparent); }
+    .chain {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .chain .hop { padding: 4px 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); }
+    .chain .arr { color: var(--muted); }
+    a { color: var(--link); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .full { grid-column: 1 / -1; }
+    .iframe-wrap { position: relative; height: 480px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
+    .iframe-wrap iframe { width: 100%; height: 100%; border: 0; background: white; }
+    .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
+    .tab {
+      padding: 6px 12px; border-radius: 6px; cursor: pointer; user-select: none;
+      background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 12px;
+    }
+    .tab.active { color: var(--text); background: var(--bg); }
+    .log-view {
+      background: #0a0d13; color: #d0d4de; border-radius: 8px; padding: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+      height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    }
+    table.history {
+      width: 100%; border-collapse: collapse; font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    table.history th, table.history td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+    table.history th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+    table.history td.status-ok { color: var(--ok); }
+    table.history td.status-warn { color: var(--warn); }
+    table.history td.status-fail { color: var(--fail); }
+    .kpi { font-size: 20px; font-weight: 600; }
+    footer { padding: 20px; text-align: center; color: var(--muted); font-size: 11px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>apx dashboard</h1>
+      <div class="meta" id="header-meta">loading…</div>
+    </div>
+    <div class="meta">
+      <span id="version-badge" class="badge">apx</span>
+      <span id="refresh-badge" class="badge">refresh 2s</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="grid">
+      <div class="card">
+        <h2>Overview</h2>
+        <div class="row"><span class="k">Mode</span><span class="v" id="mode">—</span></div>
+        <div class="row"><span class="k">Version</span><span class="v" id="version">—</span></div>
+        <div class="row"><span class="k">Uptime</span><span class="v" id="uptime">—</span></div>
+        <div class="row"><span class="k">Total requests</span><span class="v" id="req-count">—</span></div>
+        <div class="row"><span class="k">Avg latency</span><span class="v" id="req-latency">—</span></div>
+      </div>
+
+      <div class="card">
+        <h2>Chain</h2>
+        <div class="chain" id="chain-view">—</div>
+      </div>
+
+      <div class="card">
+        <h2>Health</h2>
+        <div class="row"><span class="k">Gateway</span><span class="v" id="h-gateway"><span class="badge">?</span></span></div>
+        <div class="row"><span class="k">Headroom</span><span class="v" id="h-headroom"><span class="badge">?</span></span></div>
+        <div class="row"><span class="k">pxpipe</span><span class="v" id="h-pxpipe"><span class="badge">?</span></span></div>
+        <div class="row"><span class="k">Squeezr</span><span class="v" id="h-squeezr"><span class="badge">?</span></span></div>
+      </div>
+
+      <div class="card">
+        <h2>Headroom stats</h2>
+        <div class="row"><span class="k">Requests compressed</span><span class="v" id="hr-compressed">—</span></div>
+        <div class="row"><span class="k">Tokens saved</span><span class="v" id="hr-saved">—</span></div>
+        <div class="row"><span class="k">Cache hits</span><span class="v" id="hr-cache-hits">—</span></div>
+        <div class="row"><span class="k">Cache misses</span><span class="v" id="hr-cache-misses">—</span></div>
+        <div class="row"><a href="/api/headroom/stats" target="_blank">raw /stats JSON</a></div>
+      </div>
+
+      <div class="card full">
+        <h2>Recent gateway requests</h2>
+        <table class="history">
+          <thead><tr><th>time</th><th>method</th><th>path</th><th>status</th><th>latency</th><th>upstream</th></tr></thead>
+          <tbody id="history-body"><tr><td colspan="6" class="k">no requests yet</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="card full">
+        <h2>Logs</h2>
+        <div class="tabs" id="log-tabs">
+          <div class="tab active" data-service="supervisor">supervisor</div>
+          <div class="tab" data-service="gateway">gateway</div>
+          <div class="tab" data-service="headroom">headroom</div>
+          <div class="tab" data-service="pxpipe">pxpipe</div>
+          <div class="tab" data-service="squeezr">squeezr</div>
+        </div>
+        <div class="log-view" id="log-view">connecting…</div>
+      </div>
+
+      <div class="card full">
+        <h2>pxpipe dashboard <span class="k">(<a id="pxpipe-link" href="#" target="_blank">open</a>)</span></h2>
+        <div class="iframe-wrap"><iframe id="pxpipe-frame" src="about:blank" title="pxpipe dashboard" loading="lazy"></iframe></div>
+      </div>
+
+      <div class="card full">
+        <h2>Squeezr dashboard <span class="k">(<a id="squeezr-link" href="#" target="_blank">open</a>)</span></h2>
+        <div class="iframe-wrap"><iframe id="squeezr-frame" src="about:blank" title="Squeezr dashboard" loading="lazy"></iframe></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>apx dashboard · served by apx-gateway · <a href="/api/status" target="_blank">/api/status</a></footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const badge = (state) => {
+      const cls = state === 'ok' ? 'ok' : state === 'disabled' ? '' : 'fail';
+      return `<span class="badge ${cls}">${state}</span>`;
+    };
+    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : (n ?? '—');
+    const fmtMs = (n) => (typeof n === 'number' && !isNaN(n)) ? `${Math.round(n)} ms` : '—';
+    const fmtDur = (s) => {
+      if (!s && s !== 0) return '—';
+      s = Math.floor(s);
+      const d = Math.floor(s / 86400); s -= d * 86400;
+      const h = Math.floor(s / 3600); s -= h * 3600;
+      const m = Math.floor(s / 60); s -= m * 60;
+      if (d) return `${d}d ${h}h`;
+      if (h) return `${h}h ${m}m`;
+      if (m) return `${m}m ${s}s`;
+      return `${s}s`;
+    };
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch('/api/status', { cache: 'no-store' });
+        const j = await res.json();
+        $('mode').textContent = j.mode || '—';
+        $('version').textContent = j.version || '—';
+        $('uptime').textContent = fmtDur(j.uptime_seconds);
+        $('req-count').textContent = fmt(j.request_count);
+        $('req-latency').textContent = fmtMs(j.avg_latency_ms);
+        $('header-meta').textContent = `${j.mode || 'unknown mode'} · ${j.chain_short || ''}`;
+        $('version-badge').textContent = 'apx ' + (j.version || '?');
+
+        const c = $('chain-view');
+        c.innerHTML = '';
+        const hops = j.chain_hops || [];
+        hops.forEach((hop, i) => {
+          if (i > 0) c.insertAdjacentHTML('beforeend', '<span class="arr">→</span>');
+          c.insertAdjacentHTML('beforeend', `<span class="hop">${hop}</span>`);
+        });
+
+        const h = j.health || {};
+        $('h-gateway').innerHTML = badge(h.gateway || '?');
+        $('h-headroom').innerHTML = badge(h.headroom || '?');
+        $('h-pxpipe').innerHTML = badge(h.pxpipe || '?');
+        $('h-squeezr').innerHTML = badge(h.squeezr || '?');
+
+        if (j.pxpipe_url) {
+          $('pxpipe-link').href = j.pxpipe_url;
+          if ($('pxpipe-frame').src === 'about:blank' || $('pxpipe-frame').dataset.url !== j.pxpipe_url) {
+            $('pxpipe-frame').dataset.url = j.pxpipe_url;
+            $('pxpipe-frame').src = j.pxpipe_url;
+          }
+        }
+        if (j.squeezr_url) {
+          $('squeezr-link').href = j.squeezr_url + '/squeezr/dashboard';
+          if ($('squeezr-frame').src === 'about:blank' || $('squeezr-frame').dataset.url !== j.squeezr_url) {
+            $('squeezr-frame').dataset.url = j.squeezr_url;
+            $('squeezr-frame').src = j.squeezr_url + '/squeezr/dashboard';
+          }
+        }
+      } catch (e) {
+        $('header-meta').textContent = 'gateway unreachable';
+      }
+    }
+
+    async function refreshHeadroom() {
+      try {
+        const res = await fetch('/api/headroom/stats', { cache: 'no-store' });
+        if (!res.ok) throw new Error(res.statusText);
+        const j = await res.json();
+        $('hr-compressed').textContent = fmt(j.requests_compressed ?? j.compressed_requests);
+        $('hr-saved').textContent = fmt(j.tokens_saved);
+        $('hr-cache-hits').textContent = fmt(j.cache_hits);
+        $('hr-cache-misses').textContent = fmt(j.cache_misses);
+      } catch (e) {
+        $('hr-compressed').textContent = '—';
+        $('hr-saved').textContent = '—';
+        $('hr-cache-hits').textContent = '—';
+        $('hr-cache-misses').textContent = '—';
+      }
+    }
+
+    async function refreshHistory() {
+      try {
+        const res = await fetch('/api/history?n=50', { cache: 'no-store' });
+        const rows = (await res.json()).items || [];
+        const body = $('history-body');
+        if (!rows.length) {
+          body.innerHTML = '<tr><td colspan="6" class="k">no requests yet</td></tr>';
+          return;
+        }
+        body.innerHTML = rows.slice().reverse().map(r => {
+          const cls = r.status >= 500 ? 'status-fail' : r.status >= 400 ? 'status-warn' : 'status-ok';
+          const t = new Date(r.ts * 1000).toLocaleTimeString();
+          return `<tr>
+            <td>${t}</td>
+            <td>${r.method || ''}</td>
+            <td>${escapeHtml(r.path || '')}</td>
+            <td class="${cls}">${r.status ?? ''}</td>
+            <td>${fmtMs(r.latency_ms)}</td>
+            <td>${escapeHtml(r.upstream || '')}</td>
+          </tr>`;
+        }).join('');
+      } catch (e) {}
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    let logSource = null;
+    function connectLogs(service) {
+      if (logSource) { logSource.close(); logSource = null; }
+      const view = $('log-view');
+      view.textContent = `[apx] streaming ${service}.log …\n`;
+      try {
+        logSource = new EventSource('/api/logs/stream?service=' + encodeURIComponent(service));
+        logSource.onmessage = (ev) => {
+          view.textContent += ev.data + '\n';
+          if (view.textContent.length > 200000) {
+            view.textContent = view.textContent.slice(-150000);
+          }
+          view.scrollTop = view.scrollHeight;
+        };
+        logSource.onerror = () => {
+          view.textContent += `[apx] connection to ${service} log lost. retry in 3s.\n`;
+          setTimeout(() => connectLogs(service), 3000);
+        };
+      } catch (e) {
+        view.textContent += `[apx] error: ${e.message}\n`;
+      }
+    }
+
+    document.querySelectorAll('.tab').forEach(el => {
+      el.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        el.classList.add('active');
+        connectLogs(el.dataset.service);
+      });
+    });
+
+    refreshStatus();
+    refreshHeadroom();
+    refreshHistory();
+    connectLogs('supervisor');
+    setInterval(refreshStatus, 2000);
+    setInterval(refreshHeadroom, 5000);
+    setInterval(refreshHistory, 3000);
+  </script>
+</body>
+</html>

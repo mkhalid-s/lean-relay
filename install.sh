@@ -2,17 +2,34 @@
 set -Eeuo pipefail
 
 STACK_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC_BIN="$STACK_ROOT/bin/ai-proxy-stack"
-SRC_GATEWAY_BIN="$STACK_ROOT/bin/ai-proxy-gateway"
-SRC_SQUEEZR_BIN="$STACK_ROOT/bin/ai-proxy-squeezr-foreground"
+SRC_BIN="$STACK_ROOT/bin/apx"
+SRC_GATEWAY_BIN="$STACK_ROOT/bin/apx-gateway"
+SRC_SQUEEZR_BIN="$STACK_ROOT/bin/apx-squeezr"
 SRC_CONFIG="$STACK_ROOT/config/config.env"
+SRC_VERSION_FILE="$STACK_ROOT/VERSION"
+SRC_DASHBOARD_HTML="$STACK_ROOT/share/dashboard.html"
 
-RUNTIME_BIN="$HOME/.local/bin/ai-proxy-stack"
-RUNTIME_GATEWAY_BIN="$HOME/.local/bin/ai-proxy-gateway"
-RUNTIME_SQUEEZR_BIN="$HOME/.local/bin/ai-proxy-squeezr-foreground"
-RUNTIME_CONFIG_DIR="$HOME/.config/ai-proxy-stack"
+RUNTIME_BIN_DIR="$HOME/.local/bin"
+RUNTIME_BIN="$RUNTIME_BIN_DIR/apx"
+RUNTIME_GATEWAY_BIN="$RUNTIME_BIN_DIR/apx-gateway"
+RUNTIME_SQUEEZR_BIN="$RUNTIME_BIN_DIR/apx-squeezr"
+RUNTIME_CONFIG_DIR="$HOME/.config/apx"
 RUNTIME_CONFIG="$RUNTIME_CONFIG_DIR/config.env"
-RUNTIME_STATE="$HOME/.local/state/ai-proxy-stack"
+RUNTIME_SOURCE_PATH_FILE="$RUNTIME_CONFIG_DIR/source.path"
+RUNTIME_STATE="$HOME/.local/state/apx"
+RUNTIME_VERSION_FILE="$RUNTIME_STATE/VERSION"
+RUNTIME_SHARE_DIR="$HOME/.local/share/apx"
+RUNTIME_DASHBOARD_HTML="$RUNTIME_SHARE_DIR/dashboard.html"
+
+LEGACY_LABEL="io.github.ai-proxy-stack"
+LEGACY_BIN="$RUNTIME_BIN_DIR/ai-proxy-stack"
+LEGACY_GATEWAY_BIN="$RUNTIME_BIN_DIR/ai-proxy-gateway"
+LEGACY_SQUEEZR_BIN="$RUNTIME_BIN_DIR/ai-proxy-squeezr-foreground"
+LEGACY_CONFIG_DIR="$HOME/.config/ai-proxy-stack"
+LEGACY_CONFIG="$LEGACY_CONFIG_DIR/config.env"
+LEGACY_STATE="$HOME/.local/state/ai-proxy-stack"
+
+STACK_VERSION="$( [ -f "$SRC_VERSION_FILE" ] && head -n 1 "$SRC_VERSION_FILE" | tr -d '[:space:]' || echo "unknown" )"
 
 YES=0
 NO_START=0
@@ -33,7 +50,7 @@ Options:
   -h, --help     Show this help
 
 This package keeps source files in:
-  $STACK_ROOT
+  $STACK_ROOT (version $STACK_VERSION)
 
 The macOS LaunchAgent runs from launchd-safe runtime paths:
   $RUNTIME_BIN
@@ -55,9 +72,9 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-log() { printf '[ai-proxy-stack] %s\n' "$*"; }
-warn() { printf '[ai-proxy-stack] warning: %s\n' "$*" >&2; }
-die() { printf '[ai-proxy-stack] error: %s\n' "$*" >&2; exit 1; }
+log() { printf '[apx] %s\n' "$*"; }
+warn() { printf '[apx] warning: %s\n' "$*" >&2; }
+die() { printf '[apx] error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 urls_ok() {
   local url
@@ -71,7 +88,7 @@ run_step() {
   local desc="$1"
   shift
   if [[ "$CHECK_ONLY" == "1" ]]; then
-    printf '[ai-proxy-stack] would: %s: ' "$desc"
+    printf '[apx] would: %s: ' "$desc"
     printf '%q ' "$@"
     printf '\n'
     return 0
@@ -213,7 +230,7 @@ sync_config() {
       if (!(key in seen)) {
         if (!header) {
           print ""
-          print "# Added by ai-proxy-stack installer from current defaults."
+          print "# Added by apx installer from current defaults."
           header = 1
         }
         print $0
@@ -221,14 +238,82 @@ sync_config() {
     }
   ' "$RUNTIME_CONFIG" "$SRC_CONFIG" >> "$tmp"
   mv "$tmp" "$RUNTIME_CONFIG"
+
+  if grep -q '^GATEWAY_CMD=.*ai-proxy-gateway' "$RUNTIME_CONFIG" 2>/dev/null; then
+    sed -i.bak 's|ai-proxy-gateway|apx-gateway|g' "$RUNTIME_CONFIG"
+    rm -f "$RUNTIME_CONFIG.bak"
+    log "rewrote legacy GATEWAY_CMD to $HOME/.local/bin/apx-gateway"
+  fi
+  if grep -q '^SQUEEZR_CMD=.*ai-proxy-squeezr-foreground' "$RUNTIME_CONFIG" 2>/dev/null; then
+    sed -i.bak 's|ai-proxy-squeezr-foreground|apx-squeezr|g' "$RUNTIME_CONFIG"
+    rm -f "$RUNTIME_CONFIG.bak"
+    log "rewrote legacy SQUEEZR_CMD to $HOME/.local/bin/apx-squeezr"
+  fi
+}
+
+migrate_legacy() {
+  local legacy_plist="$HOME/Library/LaunchAgents/$LEGACY_LABEL.plist"
+  if [[ -f "$legacy_plist" ]]; then
+    run_step "stop legacy LaunchAgent $LEGACY_LABEL" bash -c 'launchctl bootout "gui/$(id -u)" "'"$legacy_plist"'" >/dev/null 2>&1 || true'
+    run_step "remove legacy LaunchAgent plist" rm -f "$legacy_plist"
+  fi
+
+  if [[ -f "$LEGACY_CONFIG" && ! -f "$RUNTIME_CONFIG" ]]; then
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+      log "would migrate $LEGACY_CONFIG -> $RUNTIME_CONFIG"
+    else
+      mkdir -p "$RUNTIME_CONFIG_DIR"
+      run_step "migrate legacy config" cp "$LEGACY_CONFIG" "$RUNTIME_CONFIG"
+    fi
+  fi
+
+  if [[ -d "$LEGACY_STATE" && ! -d "$RUNTIME_STATE" ]]; then
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+      log "would migrate $LEGACY_STATE -> $RUNTIME_STATE"
+    else
+      mkdir -p "$(dirname "$RUNTIME_STATE")"
+      run_step "migrate legacy state" cp -R "$LEGACY_STATE" "$RUNTIME_STATE"
+    fi
+  fi
+}
+
+install_legacy_shim() {
+  local target="$1" name="$2"
+  if [[ "$CHECK_ONLY" == "1" ]]; then
+    log "would install deprecation shim: $target -> apx bin/$name"
+    return 0
+  fi
+  cat > "$target" <<SHIM
+#!/usr/bin/env bash
+# Deprecation shim: forwards to the renamed apx binary.
+printf '[apx] deprecation notice: %s is now %s; update your scripts.\n' "\$(basename "\$0")" "$name" >&2
+exec "$HOME/.local/bin/$name" "\$@"
+SHIM
+  chmod +x "$target"
+  log "installed deprecation shim: $target"
+}
+
+sync_dashboard() {
+  if [[ ! -f "$SRC_DASHBOARD_HTML" ]]; then
+    warn "no dashboard.html in source tree; dashboard will show a placeholder page"
+    return 0
+  fi
+  if [[ "$CHECK_ONLY" == "1" ]]; then
+    log "would install dashboard html to $RUNTIME_DASHBOARD_HTML"
+    return 0
+  fi
+  mkdir -p "$RUNTIME_SHARE_DIR"
+  run_step "install dashboard html" cp "$SRC_DASHBOARD_HTML" "$RUNTIME_DASHBOARD_HTML"
 }
 
 sync_runtime() {
   if [[ "$CHECK_ONLY" == "1" ]]; then
     log "would sync runtime command/config into launchd-safe paths"
   else
-    mkdir -p "$HOME/.local/bin" "$RUNTIME_CONFIG_DIR" "$RUNTIME_STATE/logs" "$RUNTIME_STATE/run"
+    mkdir -p "$RUNTIME_BIN_DIR" "$RUNTIME_CONFIG_DIR" "$RUNTIME_STATE/logs" "$RUNTIME_STATE/run" "$RUNTIME_SHARE_DIR"
   fi
+
+  migrate_legacy
 
   backup_if_different "$SRC_BIN" "$RUNTIME_BIN"
   run_step "install runtime command" cp "$SRC_BIN" "$RUNTIME_BIN"
@@ -241,6 +326,22 @@ sync_runtime() {
   backup_if_different "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN"
   run_step "install runtime Squeezr helper" cp "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN"
   run_step "make runtime Squeezr helper executable" chmod +x "$RUNTIME_SQUEEZR_BIN"
+
+  install_legacy_shim "$LEGACY_BIN" "apx"
+  install_legacy_shim "$LEGACY_GATEWAY_BIN" "apx-gateway"
+  install_legacy_shim "$LEGACY_SQUEEZR_BIN" "apx-squeezr"
+
+  sync_dashboard
+
+  if [[ -f "$SRC_VERSION_FILE" && "$CHECK_ONLY" != "1" ]]; then
+    printf '%s\n' "$STACK_VERSION" > "$RUNTIME_VERSION_FILE"
+    log "recorded installed version: $STACK_VERSION"
+  fi
+
+  if [[ "$CHECK_ONLY" != "1" && -d "$STACK_ROOT/.git" ]]; then
+    printf '%s\n' "$STACK_ROOT" > "$RUNTIME_SOURCE_PATH_FILE"
+    log "recorded source repo path for future updates: $STACK_ROOT"
+  fi
 
   sync_config
 }
@@ -264,7 +365,9 @@ print_urls() {
   cat <<EOF
 
 Dashboard and service URLs:
+  apx dashboard:    http://$bind_host:$gateway_port/
   Gateway health:   http://$bind_host:$gateway_port/livez
+  apx status API:   http://$bind_host:$gateway_port/api/status
   pxpipe dashboard: http://$bind_host:$pxpipe_port/
   Headroom health:  http://$bind_host:$headroom_port/livez
   Headroom stats:   http://$bind_host:$headroom_port/stats
@@ -302,7 +405,7 @@ validate_health() {
   until urls_ok "${checks[@]}"; do
     if (( SECONDS >= deadline )); then
       "$RUNTIME_BIN" status || true
-      die "service did not become healthy within 60s; inspect logs with: ai-proxy-stack logs supervisor"
+      die "service did not become healthy within 60s; inspect logs with: apx logs supervisor"
     fi
     sleep 2
   done
@@ -315,14 +418,15 @@ install_service() {
     log "skipping LaunchAgent install/start because --no-start was set"
     return 0
   fi
-  run_step "install/start LaunchAgent" env AI_PROXY_STACK_ROOT="$STACK_ROOT" "$RUNTIME_BIN" install
+  run_step "install/start LaunchAgent" env APX_ROOT="$STACK_ROOT" "$RUNTIME_BIN" install
 }
 
 uninstall() {
   if [[ -x "$RUNTIME_BIN" ]]; then
     run_step "stop/remove LaunchAgent" "$RUNTIME_BIN" uninstall
   fi
-  run_step "remove runtime command" rm -f "$RUNTIME_BIN"
+  run_step "remove runtime command" rm -f "$RUNTIME_BIN" "$RUNTIME_GATEWAY_BIN" "$RUNTIME_SQUEEZR_BIN"
+  run_step "remove deprecation shims" rm -f "$LEGACY_BIN" "$LEGACY_GATEWAY_BIN" "$LEGACY_SQUEEZR_BIN"
   log "kept config and logs:"
   log "  $RUNTIME_CONFIG"
   log "  $RUNTIME_STATE"
@@ -332,6 +436,8 @@ main() {
   require_macos
   require_sources
 
+  log "apx installer version $STACK_VERSION"
+
   if [[ "$UNINSTALL" == "1" ]]; then
     uninstall
     return 0
@@ -340,7 +446,7 @@ main() {
   if [[ "$CHECK_ONLY" == "1" ]]; then
     log "check-only mode: no changes will be made"
   elif [[ "$YES" != "1" ]]; then
-    confirm "Install/sync AI proxy stack runtime files and safe dependencies?" || die "aborted"
+    confirm "Install/sync apx runtime files and safe dependencies?" || die "aborted"
   fi
 
   install_deps

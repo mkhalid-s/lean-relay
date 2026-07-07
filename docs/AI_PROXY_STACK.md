@@ -1,6 +1,8 @@
-# AI Proxy Stack
+# apx
 
-This project packages a local, switchable proxy stack for Claude Code. The stack provides one stable Gateway URL for Claude and routes traffic through Headroom, pxpipe, Squeezr, or directly to Anthropic depending on the selected mode.
+`apx` (formerly `ai-proxy-stack`) packages a local, switchable proxy stack for Claude Code. It provides one stable Gateway URL for Claude and routes traffic through Headroom, pxpipe, Squeezr, or directly to Anthropic depending on the selected mode. The gateway also serves a unified dashboard that aggregates health, request history, Headroom stats, and log tails from every component.
+
+> **Renamed:** the CLI is `apx`, the gateway binary is `apx-gateway`, and the Squeezr helper is `apx-squeezr`. The old `ai-proxy-stack*` binary names remain installed as deprecation shims that forward to the new commands.
 
 ## Architecture
 
@@ -13,7 +15,7 @@ ANTHROPIC_BASE_URL=http://host.docker.internal:8787
 The Gateway listens on `127.0.0.1:8787` and routes to one of these downstream paths:
 
 ```text
-full              Claude -> Gateway :8787 -> Headroom :8788 -> pxpipe :47821 -> Anthropic
+headroom-pxpipe   Claude -> Gateway :8787 -> Headroom :8788 -> pxpipe :47821 -> Anthropic
 pxpipe-headroom   Claude -> Gateway :8787 -> pxpipe :47821 -> Headroom :8788 -> Anthropic
 headroom          Claude -> Gateway :8787 -> Headroom :8788 -> Anthropic
 squeezr           Claude -> Gateway :8787 -> Squeezr :18780 -> Anthropic
@@ -23,19 +25,21 @@ direct            Claude -> Gateway :8787 -> Anthropic
 off               Local proxy services disabled
 ```
 
+`full` remains a deprecated alias of `headroom-pxpipe` for backward compatibility.
+
 The stable Gateway means mode changes do not require changing `ANTHROPIC_BASE_URL` or restarting Claude Code just to change proxy routing.
 
 ## Components
 
 ### Gateway
 
-`bin/ai-proxy-gateway` is a small local reverse proxy. It is dependency-free Python and supports streaming enough for Claude Code traffic. It owns the stable public port:
+`bin/apx-gateway` is a small local reverse proxy. It is dependency-free Python and supports streaming enough for Claude Code traffic. It owns the stable public port and, when the dashboard is enabled, also serves the unified dashboard at `/` and JSON APIs at `/api/*`.
 
 ```text
 Gateway: 127.0.0.1:8787
 ```
 
-Its only job is to forward requests to the current route target.
+Its main job is to forward requests to the current route target; the dashboard is a thin layer bolted onto the same server.
 
 ### Headroom
 
@@ -80,9 +84,15 @@ Devcontainer Bash output -> RTK -> Claude Code -> Gateway :8787 -> selected rout
 ## Installation
 
 ```bash
-git clone <repo-url> ai-proxy-stack
+git clone https://github.com/mkhalid-s/ai-proxy-stack.git
 cd ai-proxy-stack
 ./install.sh --yes
+```
+
+Or one-line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mkhalid-s/ai-proxy-stack/main/bootstrap.sh | bash
 ```
 
 Check-only preview:
@@ -128,22 +138,27 @@ RTK and Ponytail are optional add-ons and are not installed by default.
 Source files in this repo:
 
 ```text
-./bin/ai-proxy-stack
-./bin/ai-proxy-gateway
-./bin/ai-proxy-squeezr-foreground
+./bin/apx
+./bin/apx-gateway
+./bin/apx-squeezr
 ./config/config.env
+./share/dashboard.html
 ./docs/AI_PROXY_STACK.md
 ```
 
 Runtime mirrors:
 
 ```text
-~/.local/bin/ai-proxy-stack
-~/.local/bin/ai-proxy-gateway
-~/.local/bin/ai-proxy-squeezr-foreground
-~/.config/ai-proxy-stack/config.env
-~/.local/state/ai-proxy-stack/
-~/Library/LaunchAgents/io.github.ai-proxy-stack.plist
+~/.local/bin/apx
+~/.local/bin/apx-gateway
+~/.local/bin/apx-squeezr
+~/.local/bin/ai-proxy-stack               # legacy shim -> apx
+~/.local/bin/ai-proxy-gateway             # legacy shim -> apx-gateway
+~/.local/bin/ai-proxy-squeezr-foreground  # legacy shim -> apx-squeezr
+~/.config/apx/config.env
+~/.local/state/apx/
+~/.local/share/apx/dashboard.html
+~/Library/LaunchAgents/io.github.apx.plist
 ```
 
 The runtime mirror is intentional. macOS LaunchAgents can hit privacy/TCC failures when reading protected directories such as `~/Documents`.
@@ -153,7 +168,7 @@ The runtime mirror is intentional. macOS LaunchAgents can hit privacy/TCC failur
 Default config file:
 
 ```text
-~/.config/ai-proxy-stack/config.env
+~/.config/apx/config.env
 ```
 
 Source template:
@@ -181,8 +196,8 @@ GATEWAY_TARGET_API_URL="http://127.0.0.1:8788"
 PXPIPE_TARGET_API_URL="https://api.anthropic.com"
 HEADROOM_TARGET_API_URL="https://api.anthropic.com"
 
-GATEWAY_CMD="$HOME/.local/bin/ai-proxy-gateway"
-SQUEEZR_CMD="$HOME/.local/bin/ai-proxy-squeezr-foreground"
+GATEWAY_CMD="$HOME/.local/bin/apx-gateway"
+SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
 PXPIPE_CMD="npx -y pxpipe-proxy@0.8.0"
 PXPIPE_MODELS="claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5"
 HEADROOM_CMD="headroom proxy"
@@ -194,16 +209,16 @@ CA_BUNDLE_FILE="${HOME}/.certs/ca-bundle.pem"
 TIKTOKEN_CACHE_DIR="${HOME}/.cache/tiktoken"
 ```
 
-Do not edit the runtime config by hand for normal mode switches. Prefer `ai-proxy-stack mode ...`.
+Do not edit the runtime config by hand for normal mode switches. Prefer `apx mode ...`.
 
 ### Squeezr Experiment
 
 The first Squeezr experiment is intentionally isolated from Headroom and pxpipe:
 
 ```bash
-ai-proxy-stack mode squeezr
-ai-proxy-stack status
-ai-proxy-stack logs squeezr
+apx mode squeezr
+apx status
+apx logs squeezr
 ```
 
 Expected route:
@@ -215,7 +230,7 @@ Claude Code -> Gateway :8787 -> Squeezr :18780 -> Anthropic
 The stack exports `SQUEEZR_PORT=18780` and `SQUEEZR_MITM_PORT=18781` when starting Squeezr, so it does not use Squeezr's default `8080` port. Return to plain pass-through with:
 
 ```bash
-ai-proxy-stack mode direct
+apx mode direct
 ```
 
 ### pxpipe Before Headroom
@@ -223,7 +238,7 @@ ai-proxy-stack mode direct
 `pxpipe-headroom` runs the same order used by some devcontainer experiments:
 
 ```bash
-ai-proxy-stack mode pxpipe-headroom
+apx mode pxpipe-headroom
 ```
 
 Expected route:
@@ -232,13 +247,13 @@ Expected route:
 Claude Code -> Gateway :8787 -> pxpipe :47821 -> Headroom :8788 -> Anthropic
 ```
 
-This is separate from `full`, which keeps the older `Gateway -> Headroom -> pxpipe` order.
+This is separate from `headroom-pxpipe` (formerly `full`), which keeps the `Gateway -> Headroom -> pxpipe` order.
 
 ### pxpipe Model Scope
 
-pxpipe only converts requests to image blocks for model bases listed in `PXPIPE_MODELS`. The stack exports this value when it starts pxpipe, so it survives launchd restarts and `ai-proxy-stack mode ...` changes.
+pxpipe only converts requests to image blocks for model bases listed in `PXPIPE_MODELS`. The stack exports this value when it starts pxpipe, so it survives launchd restarts and `apx mode ...` changes.
 
-The pxpipe dashboard chips are runtime-only live overrides. They are useful for quick experiments, but they reset when pxpipe restarts. Keep persistent model policy in `~/.config/ai-proxy-stack/config.env`:
+The pxpipe dashboard chips are runtime-only live overrides. They are useful for quick experiments, but they reset when pxpipe restarts. Keep persistent model policy in `~/.config/apx/config.env`:
 
 ```bash
 PXPIPE_MODELS="claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5"
@@ -249,27 +264,27 @@ Use `PXPIPE_MODELS=off` to disable image conversion while leaving pxpipe running
 ## Commands
 
 ```bash
-ai-proxy-stack status
-ai-proxy-stack mode current
-ai-proxy-stack mode full
-ai-proxy-stack mode pxpipe-headroom
-ai-proxy-stack mode headroom
-ai-proxy-stack mode squeezr
-ai-proxy-stack mode headroom-squeezr
-ai-proxy-stack mode pxpipe
-ai-proxy-stack mode direct
-ai-proxy-stack mode off
-ai-proxy-stack disable
-ai-proxy-stack urls
-ai-proxy-stack logs gateway
-ai-proxy-stack logs headroom
-ai-proxy-stack logs headroom.proxy
-ai-proxy-stack logs headroom.stdout
-ai-proxy-stack logs pxpipe
-ai-proxy-stack logs squeezr
-ai-proxy-stack install
-ai-proxy-stack stop
-ai-proxy-stack uninstall
+apx status
+apx mode current
+apx mode headroom-pxpipe
+apx mode pxpipe-headroom
+apx mode headroom
+apx mode squeezr
+apx mode headroom-squeezr
+apx mode pxpipe
+apx mode direct
+apx mode off
+apx disable
+apx urls
+apx logs gateway
+apx logs headroom
+apx logs headroom.proxy
+apx logs headroom.stdout
+apx logs pxpipe
+apx logs squeezr
+apx install
+apx stop
+apx uninstall
 ```
 
 ## Mode Behavior
@@ -277,30 +292,30 @@ ai-proxy-stack uninstall
 `mode` updates config, restarts the LaunchAgent, and syncs Claude settings by default.
 
 ```bash
-ai-proxy-stack mode pxpipe
+apx mode pxpipe
 ```
 
 Skip restart:
 
 ```bash
-ai-proxy-stack mode pxpipe --no-restart
+apx mode pxpipe --no-restart
 ```
 
 Skip Claude settings sync:
 
 ```bash
-ai-proxy-stack mode pxpipe --no-claude-sync
+apx mode pxpipe --no-claude-sync
 ```
 
 Override Claude settings path:
 
 ```bash
-AI_PROXY_STACK_CLAUDE_SETTINGS=/path/to/settings.json ai-proxy-stack mode full
+APX_CLAUDE_SETTINGS=/path/to/settings.json apx mode headroom-pxpipe
 ```
 
 ## Claude Settings
 
-`ai-proxy-stack mode ...` keeps this value in `~/.claude/settings.json`:
+`apx mode ...` keeps this value in `~/.claude/settings.json`:
 
 ```json
 {
@@ -310,7 +325,7 @@ AI_PROXY_STACK_CLAUDE_SETTINGS=/path/to/settings.json ai-proxy-stack mode full
 }
 ```
 
-`ai-proxy-stack disable` removes `ANTHROPIC_BASE_URL`.
+`apx disable` removes `ANTHROPIC_BASE_URL`.
 
 Other useful Claude settings from this local setup:
 
@@ -333,13 +348,13 @@ Other useful Claude settings from this local setup:
 `stop` stops the LaunchAgent and child processes, but leaves Claude settings alone.
 
 ```bash
-ai-proxy-stack stop
+apx stop
 ```
 
 `disable` is the hard off switch:
 
 ```bash
-ai-proxy-stack disable
+apx disable
 ```
 
 It does all of this:
@@ -354,8 +369,8 @@ removes ANTHROPIC_BASE_URL from ~/.claude/settings.json
 ## Health Checks
 
 ```bash
-ai-proxy-stack status
-ai-proxy-stack urls
+apx status
+apx urls
 curl -fsS http://127.0.0.1:8787/livez
 curl -fsS http://127.0.0.1:8788/livez
 curl -fsS http://127.0.0.1:8788/stats
@@ -366,15 +381,15 @@ curl -fsS http://127.0.0.1:18780/squeezr/health
 Logs:
 
 ```bash
-ai-proxy-stack logs all
-ai-proxy-stack logs supervisor
-ai-proxy-stack logs gateway
-ai-proxy-stack logs headroom
-ai-proxy-stack logs headroom.proxy
-ai-proxy-stack logs headroom.stdout
-ai-proxy-stack logs pxpipe
-ai-proxy-stack logs squeezr
-ai-proxy-stack logs launchd.err
+apx logs all
+apx logs supervisor
+apx logs gateway
+apx logs headroom
+apx logs headroom.proxy
+apx logs headroom.stdout
+apx logs pxpipe
+apx logs squeezr
+apx logs launchd.err
 ```
 
 `headroom` follows both the stack-captured Headroom stdout log and Headroom's detailed proxy request log at `~/.headroom/logs/proxy.log`. Use `headroom.proxy` for request/error details only, and `headroom.stdout` for startup banners only.
@@ -384,21 +399,21 @@ ai-proxy-stack logs launchd.err
 When something goes wrong, start with status and all logs:
 
 ```bash
-ai-proxy-stack status
-ai-proxy-stack logs all
+apx status
+apx logs all
 ```
 
 Stream one component at a time:
 
 ```bash
-ai-proxy-stack logs gateway     # stable entrypoint, route target, HTTP status
-ai-proxy-stack logs headroom    # Headroom startup plus detailed proxy request/error logs
-ai-proxy-stack logs headroom.proxy # Headroom request/error details only
-ai-proxy-stack logs pxpipe      # upstream Anthropic/OpenAI status and dashboard
-ai-proxy-stack logs squeezr     # Squeezr startup, self-test, and request handling
-ai-proxy-stack logs supervisor  # process restarts and health checks
-ai-proxy-stack logs launchd.err # macOS LaunchAgent failures
-ai-proxy-stack logs launchd.out
+apx logs gateway     # stable entrypoint, route target, HTTP status
+apx logs headroom    # Headroom startup plus detailed proxy request/error logs
+apx logs headroom.proxy # Headroom request/error details only
+apx logs pxpipe      # upstream Anthropic/OpenAI status and dashboard
+apx logs squeezr     # Squeezr startup, self-test, and request handling
+apx logs supervisor  # process restarts and health checks
+apx logs launchd.err # macOS LaunchAgent failures
+apx logs launchd.out
 ```
 
 Interpret common failures:
@@ -415,12 +430,12 @@ Squeezr health failed     -> Squeezr process did not start or port is in use
 Quick isolation:
 
 ```bash
-ai-proxy-stack mode direct   # Gateway -> Anthropic
-ai-proxy-stack mode pxpipe-headroom # Gateway -> pxpipe -> Headroom -> Anthropic
-ai-proxy-stack mode squeezr  # Gateway -> Squeezr -> Anthropic
-ai-proxy-stack mode pxpipe   # Gateway -> pxpipe -> Anthropic
-ai-proxy-stack mode headroom # Gateway -> Headroom -> Anthropic
-ai-proxy-stack mode full     # Gateway -> Headroom -> pxpipe -> Anthropic
+apx mode direct   # Gateway -> Anthropic
+apx mode pxpipe-headroom # Gateway -> pxpipe -> Headroom -> Anthropic
+apx mode squeezr  # Gateway -> Squeezr -> Anthropic
+apx mode pxpipe   # Gateway -> pxpipe -> Anthropic
+apx mode headroom # Gateway -> Headroom -> Anthropic
+apx mode headroom-pxpipe # Gateway -> Headroom -> pxpipe -> Anthropic
 ```
 
 ## Troubleshooting
@@ -445,8 +460,8 @@ Headroom request path: 502
 Use `pxpipe` or `direct` mode as a workaround:
 
 ```bash
-ai-proxy-stack mode pxpipe
-ai-proxy-stack mode direct
+apx mode pxpipe
+apx mode direct
 ```
 
 Recent local finding:
@@ -479,8 +494,8 @@ TIKTOKEN_CACHE_DIR="${HOME}/.cache/tiktoken"
 If needed, pre-seed the cache with the known encoder files using a trusted downloader, then restart:
 
 ```bash
-ai-proxy-stack install
-ai-proxy-stack logs headroom.proxy
+apx install
+apx logs headroom.proxy
 ```
 
 After the cache is seeded, the old `openaipublic.blob.core.windows.net ... SSLCertVerificationError` tokenizer warning should not appear.
@@ -508,14 +523,14 @@ Install the heavier ML extra only if you explicitly want Kompress ML compression
 
 ```bash
 pipx inject headroom-ai 'headroom-ai[ml]'
-ai-proxy-stack install
+apx install
 ```
 
 Install LiteLLM only if you want Headroom to estimate request costs:
 
 ```bash
 pipx inject headroom-ai litellm
-ai-proxy-stack install
+apx install
 ```
 
 Leaving LiteLLM uninstalled only disables local cost calculation; it does not block proxying, caching, CCR, or AST/code-aware compression.
@@ -549,7 +564,8 @@ That means Headroom is running but not materially reducing the request. RTK also
 pxpipe is only running in these modes:
 
 ```text
-full
+headroom-pxpipe
+pxpipe-headroom
 pxpipe
 ```
 

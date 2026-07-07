@@ -1,0 +1,507 @@
+#!/usr/bin/env python3
+"""apx-gateway: streaming reverse proxy + unified dashboard."""
+
+from __future__ import annotations
+
+import collections
+import http.client
+import json
+import os
+import signal
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+BIND_HOST = os.environ.get("GATEWAY_HOST") or os.environ.get("HOST") or "127.0.0.1"
+PORT = int(os.environ.get("GATEWAY_PORT", "8787"))
+TARGET_URL = os.environ.get("GATEWAY_TARGET_URL", "https://api.anthropic.com").rstrip("/")
+REQUEST_TIMEOUT = float(os.environ.get("GATEWAY_REQUEST_TIMEOUT_SECONDS", "600"))
+
+DASHBOARD_ENABLED = os.environ.get("APX_DASHBOARD_ENABLED", "1") == "1"
+DASHBOARD_HTML_PATH = os.environ.get("APX_DASHBOARD_HTML", "")
+HISTORY_SIZE = int(os.environ.get("APX_HISTORY_SIZE", "500"))
+STATE_DIR = os.environ.get("APX_STATE_DIR", os.path.expanduser("~/.local/state/apx"))
+LOG_DIR = os.environ.get("APX_LOG_DIR", os.path.join(STATE_DIR, "logs"))
+CONFIG_FILE = os.environ.get("APX_CONFIG", os.path.expanduser("~/.config/apx/config.env"))
+HEADROOM_URL = os.environ.get("APX_HEADROOM_URL", "http://127.0.0.1:8788").rstrip("/")
+PXPIPE_URL = os.environ.get("APX_PXPIPE_URL", "http://127.0.0.1:47821").rstrip("/")
+SQUEEZR_URL = os.environ.get("APX_SQUEEZR_URL", "http://127.0.0.1:18780").rstrip("/")
+HEADROOM_PROXY_LOG = os.environ.get(
+    "HEADROOM_LOG_FILE", os.path.expanduser("~/.headroom/logs/proxy.log")
+)
+
+VERSION_FILE = os.path.join(STATE_DIR, "VERSION")
+
+HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+
+START_TIME = time.time()
+_HISTORY: "collections.deque[dict]" = collections.deque(maxlen=HISTORY_SIZE)
+_HISTORY_LOCK = threading.Lock()
+_STATS = {
+    "requests": 0,
+    "latency_sum_ms": 0.0,
+    "status_2xx": 0,
+    "status_4xx": 0,
+    "status_5xx": 0,
+}
+_STATS_LOCK = threading.Lock()
+
+
+def log(message: str) -> None:
+    print(f"[{time.strftime('%Y-%m-%dT%H:%M:%S%z')}] [apx-gateway] {message}", flush=True)
+
+
+def _read_version() -> str:
+    try:
+        with open(VERSION_FILE, "r", encoding="utf-8") as fh:
+            return fh.readline().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _load_config_values() -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                value = value.strip().strip('"').strip("'")
+                out[key.strip()] = value
+    except OSError:
+        pass
+    return out
+
+
+def _current_mode(cfg: dict[str, str]) -> str:
+    g = cfg.get("GATEWAY_ENABLED", "1")
+    h = cfg.get("HEADROOM_ENABLED", "0")
+    p = cfg.get("PXPIPE_ENABLED", "0")
+    s = cfg.get("SQUEEZR_ENABLED", "0")
+    if g != "1" and h != "1" and p != "1" and s != "1":
+        return "off"
+    gt = cfg.get("GATEWAY_TARGET_API_URL", "")
+    pt = cfg.get("PXPIPE_TARGET_API_URL", "")
+    bind = cfg.get("BIND_HOST", "127.0.0.1")
+    pxp = f"http://{bind}:{cfg.get('PXPIPE_PORT', '47821')}"
+    hdr = f"http://{bind}:{cfg.get('HEADROOM_PORT', '8788')}"
+    sqz = f"http://{bind}:{cfg.get('SQUEEZR_PORT', '18780')}"
+    if h == "1" and p == "1" and gt == pxp and pt == hdr:
+        return "pxpipe-headroom"
+    if h == "1" and p == "1":
+        return "headroom-pxpipe"
+    if h == "1" and s == "1":
+        return "headroom-squeezr"
+    if h == "1":
+        return "headroom"
+    if p == "1":
+        return "pxpipe"
+    if s == "1":
+        return "squeezr"
+    return "direct"
+
+
+def _chain_hops(cfg: dict[str, str], mode: str) -> list[str]:
+    bind = cfg.get("BIND_HOST", "127.0.0.1")
+    gw = f"Gateway:{cfg.get('GATEWAY_PORT', '8787')}"
+    hr = f"Headroom:{cfg.get('HEADROOM_PORT', '8788')}"
+    pxp = f"pxpipe:{cfg.get('PXPIPE_PORT', '47821')}"
+    sqz = f"Squeezr:{cfg.get('SQUEEZR_PORT', '18780')}"
+    up = "Anthropic"
+    if mode == "off":
+        return ["disabled"]
+    if mode == "headroom-pxpipe":
+        return ["Claude", gw, hr, pxp, up]
+    if mode == "pxpipe-headroom":
+        return ["Claude", gw, pxp, hr, up]
+    if mode == "headroom":
+        return ["Claude", gw, hr, up]
+    if mode == "headroom-squeezr":
+        return ["Claude", gw, hr, sqz, up]
+    if mode == "squeezr":
+        return ["Claude", gw, sqz, up]
+    if mode == "pxpipe":
+        return ["Claude", gw, pxp, up]
+    return ["Claude", gw, up]
+
+
+def _service_ok(url: str, path: str = "/livez", timeout: float = 1.5) -> bool:
+    try:
+        target = urlsplit(url + path)
+        cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        conn = cls(target.netloc, timeout=timeout)
+        try:
+            conn.request("GET", target.path or "/")
+            resp = conn.getresponse()
+            resp.read()
+            return 200 <= resp.status < 500
+        finally:
+            conn.close()
+    except Exception:
+        return False
+
+
+def _health_map(cfg: dict[str, str]) -> dict[str, str]:
+    def state(enabled: str, ok: bool) -> str:
+        if enabled != "1":
+            return "disabled"
+        return "ok" if ok else "fail"
+
+    return {
+        "gateway": "ok",
+        "headroom": state(cfg.get("HEADROOM_ENABLED", "0"), _service_ok(HEADROOM_URL)),
+        "pxpipe": state(cfg.get("PXPIPE_ENABLED", "0"), _service_ok(PXPIPE_URL, path="/")),
+        "squeezr": state(cfg.get("SQUEEZR_ENABLED", "0"), _service_ok(SQUEEZR_URL, path="/squeezr/health")),
+    }
+
+
+def _record_request(method: str, path: str, status: int, latency_ms: float, upstream: str) -> None:
+    entry = {
+        "ts": time.time(),
+        "method": method,
+        "path": path,
+        "status": status,
+        "latency_ms": latency_ms,
+        "upstream": upstream,
+    }
+    with _HISTORY_LOCK:
+        _HISTORY.append(entry)
+    with _STATS_LOCK:
+        _STATS["requests"] += 1
+        _STATS["latency_sum_ms"] += latency_ms
+        bucket = "status_2xx" if status < 400 else "status_4xx" if status < 500 else "status_5xx"
+        _STATS[bucket] += 1
+
+
+def _fetch_json(url: str, timeout: float = 3.0) -> dict:
+    target = urlsplit(url)
+    cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+    conn = cls(target.netloc, timeout=timeout)
+    try:
+        path = target.path or "/"
+        if target.query:
+            path = f"{path}?{target.query}"
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        body = resp.read()
+        if resp.status >= 400:
+            raise RuntimeError(f"upstream {url} returned {resp.status}")
+        return json.loads(body.decode("utf-8"))
+    finally:
+        conn.close()
+
+
+def _read_dashboard_html() -> bytes:
+    if DASHBOARD_HTML_PATH:
+        p = Path(DASHBOARD_HTML_PATH)
+        if p.is_file():
+            return p.read_bytes()
+    for candidate in [
+        Path(__file__).resolve().parent.parent / "share" / "dashboard.html",
+        Path.home() / ".local" / "share" / "apx" / "dashboard.html",
+    ]:
+        if candidate.is_file():
+            return candidate.read_bytes()
+    return b"<!doctype html><meta charset=utf-8><title>apx</title><h1>apx dashboard not installed</h1>"
+
+
+class GatewayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "apx-gateway/0.1"
+
+    def log_message(self, fmt: str, *args: object) -> None:
+        log(fmt % args)
+
+    def do_GET(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
+        if self.path in {"/livez", "/readyz", "/health"}:
+            self._json(200, {"ok": True, "target": TARGET_URL})
+            return
+        self._proxy()
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        if self.path in {"/", "/livez", "/readyz", "/health"}:
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", "0")
+            self.send_header("connection", "close")
+            self.end_headers()
+            return
+        self._proxy()
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._proxy()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        self._proxy()
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        self._proxy()
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        self._proxy()
+
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
+        self._proxy()
+
+    def _handle_dashboard_or_api(self) -> bool:
+        if not DASHBOARD_ENABLED:
+            return False
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+
+        if path in ("/", "/dashboard"):
+            body = _read_dashboard_html()
+            self._respond(200, body, content_type="text/html; charset=utf-8")
+            return True
+        if path == "/api/status":
+            self._respond_json(200, self._build_status_payload())
+            return True
+        if path == "/api/history":
+            n = min(int((query.get("n", ["100"])[0]) or 100), HISTORY_SIZE)
+            with _HISTORY_LOCK:
+                items = list(_HISTORY)[-n:]
+            self._respond_json(200, {"items": items, "size": HISTORY_SIZE})
+            return True
+        if path == "/api/headroom/stats":
+            try:
+                data = _fetch_json(HEADROOM_URL + "/stats")
+                self._respond_json(200, data)
+            except Exception as exc:  # noqa: BLE001
+                self._respond_json(502, {"error": str(exc)})
+            return True
+        if path == "/api/logs/stream":
+            service = (query.get("service", ["supervisor"])[0]) or "supervisor"
+            self._stream_log(service)
+            return True
+        return False
+
+    def _build_status_payload(self) -> dict:
+        cfg = _load_config_values()
+        mode = _current_mode(cfg)
+        hops = _chain_hops(cfg, mode)
+        with _STATS_LOCK:
+            req = _STATS["requests"]
+            avg = (_STATS["latency_sum_ms"] / req) if req else 0.0
+            stats_snapshot = dict(_STATS)
+        return {
+            "version": _read_version(),
+            "mode": mode,
+            "chain_hops": hops,
+            "chain_short": " -> ".join(hops),
+            "health": _health_map(cfg),
+            "request_count": req,
+            "avg_latency_ms": avg,
+            "uptime_seconds": int(time.time() - START_TIME),
+            "target_url": TARGET_URL,
+            "headroom_url": HEADROOM_URL,
+            "pxpipe_url": PXPIPE_URL,
+            "squeezr_url": SQUEEZR_URL,
+            "stats": stats_snapshot,
+        }
+
+    def _stream_log(self, service: str) -> None:
+        allowed = {
+            "supervisor": os.path.join(LOG_DIR, "supervisor.log"),
+            "gateway": os.path.join(LOG_DIR, "gateway.log"),
+            "headroom": os.path.join(LOG_DIR, "headroom.log"),
+            "headroom.proxy": HEADROOM_PROXY_LOG,
+            "pxpipe": os.path.join(LOG_DIR, "pxpipe.log"),
+            "squeezr": os.path.join(LOG_DIR, "squeezr.log"),
+            "launchd.out": os.path.join(LOG_DIR, "launchd.out.log"),
+            "launchd.err": os.path.join(LOG_DIR, "launchd.err.log"),
+        }
+        path = allowed.get(service)
+        if not path:
+            self._respond_json(400, {"error": f"unknown service: {service}"})
+            return
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "keep-alive")
+            self.send_header("x-accel-buffering", "no")
+            self.end_headers()
+        except Exception:
+            return
+
+        if not os.path.exists(path):
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).touch()
+            except OSError:
+                pass
+
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                start = max(0, size - 4096)
+                fh.seek(start)
+                if start > 0:
+                    fh.readline()
+                tail = fh.read()
+                for line in tail.splitlines():
+                    self._sse_write(line)
+                last_heartbeat = time.time()
+                while True:
+                    where = fh.tell()
+                    line = fh.readline()
+                    if not line:
+                        if time.time() - last_heartbeat > 15:
+                            try:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                                last_heartbeat = time.time()
+                            except Exception:
+                                return
+                        time.sleep(0.5)
+                        fh.seek(where)
+                        continue
+                    if line.endswith("\n"):
+                        line = line[:-1]
+                    if not self._sse_write(line):
+                        return
+                    last_heartbeat = time.time()
+        except Exception as exc:  # noqa: BLE001
+            log(f"log stream error for {service}: {exc}")
+
+    def _sse_write(self, line: str) -> bool:
+        try:
+            payload = f"data: {line}\n\n".encode("utf-8")
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+    def _respond_json(self, status: int, payload: dict) -> None:
+        body = json.dumps(payload, default=str).encode("utf-8")
+        self._respond(status, body, content_type="application/json")
+
+    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+        try:
+            self.send_response(status)
+            self.send_header("content-type", content_type)
+            self.send_header("content-length", str(len(body)))
+            self.send_header("cache-control", "no-store")
+            self.send_header("connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except Exception:
+            pass
+
+    def _json(self, status: int, payload: dict[str, object]) -> None:
+        self._respond_json(status, payload)
+
+    def _request_body(self) -> bytes:
+        length = self.headers.get("content-length")
+        if not length:
+            return b""
+        return self.rfile.read(int(length))
+
+    def _proxy_headers(self, target) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        for key, value in self.headers.items():
+            lower = key.lower()
+            if lower in HOP_BY_HOP_HEADERS or lower == "host":
+                continue
+            headers[key] = value
+        headers["Host"] = target.netloc
+        headers["X-Apx-Gateway-Target"] = TARGET_URL
+        return headers
+
+    def _proxy(self) -> None:
+        target = urlsplit(TARGET_URL)
+        if target.scheme not in {"http", "https"} or not target.netloc:
+            self._json(502, {"error": f"invalid gateway target: {TARGET_URL}"})
+            return
+
+        path = self.path if self.path.startswith("/") else f"/{self.path}"
+        upstream_path = f"{target.path.rstrip('/')}{path}"
+        if not upstream_path.startswith("/"):
+            upstream_path = f"/{upstream_path}"
+
+        body = self._request_body()
+        conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        started = time.time()
+        status = 0
+        conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
+        try:
+            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target))
+            resp = conn.getresponse()
+            status = resp.status
+            self.send_response(resp.status, resp.reason)
+            for key, value in resp.getheaders():
+                lower = key.lower()
+                if lower in HOP_BY_HOP_HEADERS:
+                    continue
+                self.send_header(key, value)
+            self.send_header("connection", "close")
+            self.end_headers()
+
+            if self.command != "HEAD":
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+            elapsed_ms = (time.time() - started) * 1000
+            log(f"{self.command} {self.path} -> {resp.status} via {TARGET_URL} ({int(elapsed_ms)}ms)")
+            _record_request(self.command, self.path, resp.status, elapsed_ms, TARGET_URL)
+        except BrokenPipeError:
+            log(f"client disconnected during {self.command} {self.path}")
+            _record_request(self.command, self.path, status or 499, (time.time() - started) * 1000, TARGET_URL)
+        except Exception as exc:  # noqa: BLE001
+            log(f"proxy error for {self.command} {self.path}: {exc}")
+            _record_request(self.command, self.path, 502, (time.time() - started) * 1000, TARGET_URL)
+            if not self.wfile.closed:
+                try:
+                    self._json(502, {"error": "gateway_proxy_error", "message": str(exc)})
+                except Exception:
+                    pass
+        finally:
+            conn.close()
+
+
+def main() -> int:
+    httpd = ThreadingHTTPServer((BIND_HOST, PORT), GatewayHandler)
+    httpd.daemon_threads = True
+
+    def _shutdown(_signum, _frame) -> None:
+        log("shutting down")
+        httpd.shutdown()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    log(
+        f"listening on http://{BIND_HOST}:{PORT} -> {TARGET_URL}"
+        f" (dashboard={'on' if DASHBOARD_ENABLED else 'off'})"
+    )
+    httpd.serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
