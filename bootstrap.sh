@@ -30,12 +30,18 @@ if [[ -d "$CLONE_DIR/.git" ]]; then
   log "updating existing clone at $CLONE_DIR"
   git -C "$CLONE_DIR" remote set-url origin "$REPO"
   git -C "$CLONE_DIR" fetch --tags --prune origin
-  git -C "$CLONE_DIR" checkout "$REF"
-  git -C "$CLONE_DIR" pull --ff-only origin "$REF" 2>/dev/null || log "note: could not fast-forward (detached ref or tag?)"
 else
   log "cloning $REPO into $CLONE_DIR"
   git clone "$REPO" "$CLONE_DIR"
-  git -C "$CLONE_DIR" checkout "$REF"
+fi
+
+if ! git -C "$CLONE_DIR" rev-parse --verify --quiet "$REF" >/dev/null; then
+  die "ref not found in $REPO: $REF"
+fi
+git -C "$CLONE_DIR" checkout "$REF"
+if git -C "$CLONE_DIR" symbolic-ref -q HEAD >/dev/null; then
+  git -C "$CLONE_DIR" pull --ff-only origin "$REF" 2>/dev/null \
+    || log "note: could not fast-forward $REF"
 fi
 
 INSTALLER="$CLONE_DIR/install.sh"

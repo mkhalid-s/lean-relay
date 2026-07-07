@@ -24,10 +24,12 @@ REQUEST_TIMEOUT = float(os.environ.get("GATEWAY_REQUEST_TIMEOUT_SECONDS", "600")
 DASHBOARD_ENABLED = os.environ.get("APX_DASHBOARD_ENABLED", "1") == "1"
 DASHBOARD_HTML_PATH = os.environ.get("APX_DASHBOARD_HTML", "")
 DASHBOARD_TOKEN = os.environ.get("APX_DASHBOARD_TOKEN", "").strip()
+METRICS_ENABLED = os.environ.get("APX_METRICS_ENABLED", "0") == "1"
 HISTORY_SIZE = int(os.environ.get("APX_HISTORY_SIZE", "500"))
 STATE_DIR = os.environ.get("APX_STATE_DIR", os.path.expanduser("~/.local/state/apx"))
 LOG_DIR = os.environ.get("APX_LOG_DIR", os.path.join(STATE_DIR, "logs"))
 CONFIG_FILE = os.environ.get("APX_CONFIG", os.path.expanduser("~/.config/apx/config.env"))
+PRICES_FILE = os.environ.get("APX_PRICES_FILE", os.path.join(os.path.dirname(CONFIG_FILE), "prices.env"))
 HEADROOM_URL = os.environ.get("APX_HEADROOM_URL", "http://127.0.0.1:8788").rstrip("/")
 PXPIPE_URL = os.environ.get("APX_PXPIPE_URL", "http://127.0.0.1:47821").rstrip("/")
 SQUEEZR_URL = os.environ.get("APX_SQUEEZR_URL", "http://127.0.0.1:18780").rstrip("/")
@@ -38,13 +40,24 @@ HISTORY_PERSIST = os.environ.get("APX_HISTORY_PERSIST", "1") == "1"
 HISTORY_DIR = os.environ.get("APX_HISTORY_DIR", os.path.join(STATE_DIR, "history"))
 HEALTH_INTERVAL_SECONDS = float(os.environ.get("APX_HEALTH_INTERVAL_SECONDS", "5"))
 MAX_LOG_STREAMS_PER_IP = int(os.environ.get("APX_MAX_LOG_STREAMS_PER_IP", "8"))
+MAX_REQUEST_BYTES = int(os.environ.get("APX_MAX_REQUEST_BYTES", str(64 * 1024 * 1024)))
 
 VERSION_FILE = os.path.join(STATE_DIR, "VERSION")
 
+# Service registry. Adding a new proxyable service means one entry here
+# (health path + label + default port) plus any needed env override.
+SERVICES: dict[str, dict[str, object]] = {
+    "headroom": {"url": HEADROOM_URL, "label": "Headroom", "health": "/livez"},
+    "pxpipe":   {"url": PXPIPE_URL,   "label": "pxpipe",   "health": "/"},
+    "squeezr":  {"url": SQUEEZR_URL,  "label": "Squeezr",  "health": "/squeezr/health"},
+}
+
 # Approximate USD costs per million tokens for common model bases.
 # Kept intentionally coarse; users should treat this as an estimate only.
-# Sources: Anthropic and OpenAI public pricing pages, rounded to nearest cent.
-MODEL_COSTS = {
+# Override at runtime with ~/.config/apx/prices.env:
+#   claude-opus-4-8=15.00,75.00
+#   claude-sonnet-5=3.00,15.00
+DEFAULT_MODEL_COSTS = {
     "claude-opus-4-8": (15.00, 75.00),
     "claude-opus-4-7": (15.00, 75.00),
     "claude-opus-4": (15.00, 75.00),
@@ -59,6 +72,30 @@ MODEL_COSTS = {
     "gpt-4o": (2.50, 10.00),
     "gpt-4o-mini": (0.15, 0.60),
 }
+
+
+def _load_model_costs() -> dict[str, tuple[float, float]]:
+    costs = dict(DEFAULT_MODEL_COSTS)
+    try:
+        with open(PRICES_FILE, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                parts = [p.strip() for p in value.split(",", 1)]
+                if len(parts) != 2:
+                    continue
+                try:
+                    costs[key.strip().lower()] = (float(parts[0]), float(parts[1]))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return costs
+
+
+MODEL_COSTS = _load_model_costs()
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -122,56 +159,68 @@ def _load_config_values() -> dict[str, str]:
     return out
 
 
-def _current_mode(cfg: dict[str, str]) -> str:
-    g = cfg.get("GATEWAY_ENABLED", "1")
+_PRESET_BY_CHAIN = {
+    "": "direct",
+    "headroom": "headroom",
+    "pxpipe": "pxpipe",
+    "squeezr": "squeezr",
+    "headroom,pxpipe": "headroom-pxpipe",
+    "pxpipe,headroom": "pxpipe-headroom",
+    "headroom,squeezr": "headroom-squeezr",
+}
+
+
+def _chain_from_config(cfg: dict[str, str]) -> list[str]:
+    raw = os.environ.get("APX_CHAIN", cfg.get("APX_CHAIN", "")).strip().strip('"').strip("'")
+    if raw:
+        return [p.strip() for p in raw.split(",") if p.strip()]
+    # Legacy inference for pre-chain configs.
+    bind = cfg.get("BIND_HOST", "127.0.0.1")
     h = cfg.get("HEADROOM_ENABLED", "0")
     p = cfg.get("PXPIPE_ENABLED", "0")
     s = cfg.get("SQUEEZR_ENABLED", "0")
-    if g != "1" and h != "1" and p != "1" and s != "1":
-        return "off"
     gt = cfg.get("GATEWAY_TARGET_API_URL", "")
     pt = cfg.get("PXPIPE_TARGET_API_URL", "")
-    bind = cfg.get("BIND_HOST", "127.0.0.1")
     pxp = f"http://{bind}:{cfg.get('PXPIPE_PORT', '47821')}"
     hdr = f"http://{bind}:{cfg.get('HEADROOM_PORT', '8788')}"
-    sqz = f"http://{bind}:{cfg.get('SQUEEZR_PORT', '18780')}"
     if h == "1" and p == "1" and gt == pxp and pt == hdr:
-        return "pxpipe-headroom"
+        return ["pxpipe", "headroom"]
     if h == "1" and p == "1":
-        return "headroom-pxpipe"
+        return ["headroom", "pxpipe"]
     if h == "1" and s == "1":
-        return "headroom-squeezr"
+        return ["headroom", "squeezr"]
     if h == "1":
-        return "headroom"
+        return ["headroom"]
     if p == "1":
-        return "pxpipe"
+        return ["pxpipe"]
     if s == "1":
-        return "squeezr"
-    return "direct"
+        return ["squeezr"]
+    return []
+
+
+def _current_mode(cfg: dict[str, str]) -> str:
+    if cfg.get("GATEWAY_ENABLED", "1") != "1":
+        return "off"
+    chain = _chain_from_config(cfg)
+    return _PRESET_BY_CHAIN.get(",".join(chain), "custom")
 
 
 def _chain_hops(cfg: dict[str, str], mode: str) -> list[str]:
-    bind = cfg.get("BIND_HOST", "127.0.0.1")
-    gw = f"Gateway:{cfg.get('GATEWAY_PORT', '8787')}"
-    hr = f"Headroom:{cfg.get('HEADROOM_PORT', '8788')}"
-    pxp = f"pxpipe:{cfg.get('PXPIPE_PORT', '47821')}"
-    sqz = f"Squeezr:{cfg.get('SQUEEZR_PORT', '18780')}"
-    up = "Anthropic"
     if mode == "off":
         return ["disabled"]
-    if mode == "headroom-pxpipe":
-        return ["Claude", gw, hr, pxp, up]
-    if mode == "pxpipe-headroom":
-        return ["Claude", gw, pxp, hr, up]
-    if mode == "headroom":
-        return ["Claude", gw, hr, up]
-    if mode == "headroom-squeezr":
-        return ["Claude", gw, hr, sqz, up]
-    if mode == "squeezr":
-        return ["Claude", gw, sqz, up]
-    if mode == "pxpipe":
-        return ["Claude", gw, pxp, up]
-    return ["Claude", gw, up]
+    hops = ["Claude", f"Gateway:{cfg.get('GATEWAY_PORT', '8787')}"]
+    port_by_service = {
+        "headroom": cfg.get("HEADROOM_PORT", "8788"),
+        "pxpipe":   cfg.get("PXPIPE_PORT", "47821"),
+        "squeezr":  cfg.get("SQUEEZR_PORT", "18780"),
+    }
+    label_by_service = {name: SERVICES[name]["label"] for name in SERVICES}
+    for svc in _chain_from_config(cfg):
+        label = label_by_service.get(svc, svc)
+        port = port_by_service.get(svc, "?")
+        hops.append(f"{label}:{port}")
+    hops.append("Anthropic")
+    return hops
 
 
 def _service_ok(url: str, path: str = "/livez", timeout: float = 1.5) -> bool:
@@ -191,17 +240,14 @@ def _service_ok(url: str, path: str = "/livez", timeout: float = 1.5) -> bool:
 
 
 def _health_map_uncached(cfg: dict[str, str]) -> dict[str, str]:
-    def state(enabled: str, ok: bool) -> str:
-        if enabled != "1":
-            return "disabled"
-        return "ok" if ok else "fail"
-
-    return {
-        "gateway": "ok",
-        "headroom": state(cfg.get("HEADROOM_ENABLED", "0"), _service_ok(HEADROOM_URL)),
-        "pxpipe": state(cfg.get("PXPIPE_ENABLED", "0"), _service_ok(PXPIPE_URL, path="/")),
-        "squeezr": state(cfg.get("SQUEEZR_ENABLED", "0"), _service_ok(SQUEEZR_URL, path="/squeezr/health")),
-    }
+    active = set(_chain_from_config(cfg))
+    out: dict[str, str] = {"gateway": "ok"}
+    for name, meta in SERVICES.items():
+        if name not in active:
+            out[name] = "disabled"
+            continue
+        out[name] = "ok" if _service_ok(str(meta["url"]), path=str(meta["health"])) else "fail"
+    return out
 
 
 def _health_snapshot(cfg: dict[str, str]) -> dict[str, str]:
@@ -324,6 +370,25 @@ def _record_request(
     _persist_history(entry)
 
 
+def _log_targets() -> dict[str, str]:
+    """Discover streamable log files at request time.
+
+    Every `*.log` in $LOG_DIR is exposed under its basename (minus the .log
+    extension). Special targets (headroom.proxy) are added if the underlying
+    file exists.
+    """
+    targets: dict[str, str] = {}
+    try:
+        for entry in os.listdir(LOG_DIR):
+            if entry.endswith(".log"):
+                targets[entry[:-4]] = os.path.join(LOG_DIR, entry)
+    except OSError:
+        pass
+    if os.path.exists(HEADROOM_PROXY_LOG):
+        targets["headroom.proxy"] = HEADROOM_PROXY_LOG
+    return targets
+
+
 def _fetch_json(url: str, timeout: float = 3.0) -> dict:
     target = urlsplit(url)
     cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
@@ -414,12 +479,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if not provided:
             parsed = urlsplit(self.path)
             provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
-        if not provided:
-            cookie = self.headers.get("cookie", "")
-            for part in cookie.split(";"):
-                if part.strip().startswith("apx_token="):
-                    provided = part.strip().split("=", 1)[1]
-                    break
         return secrets.compare_digest(provided, DASHBOARD_TOKEN)
 
     def _handle_dashboard_or_api(self) -> bool:
@@ -468,6 +527,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._stream_log(service)
             return True
         if path == "/metrics":
+            if not METRICS_ENABLED:
+                self._respond_json(404, {"error": "metrics disabled; set APX_METRICS_ENABLED=1"})
+                return True
             self._respond(200, self._build_metrics_payload(), content_type="text/plain; version=0.0.4; charset=utf-8")
             return True
         return False
@@ -582,16 +644,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return ("\n".join(lines) + "\n").encode("utf-8")
 
     def _stream_log(self, service: str) -> None:
-        allowed = {
-            "supervisor": os.path.join(LOG_DIR, "supervisor.log"),
-            "gateway": os.path.join(LOG_DIR, "gateway.log"),
-            "headroom": os.path.join(LOG_DIR, "headroom.log"),
-            "headroom.proxy": HEADROOM_PROXY_LOG,
-            "pxpipe": os.path.join(LOG_DIR, "pxpipe.log"),
-            "squeezr": os.path.join(LOG_DIR, "squeezr.log"),
-            "launchd.out": os.path.join(LOG_DIR, "launchd.out.log"),
-            "launchd.err": os.path.join(LOG_DIR, "launchd.err.log"),
-        }
+        allowed = _log_targets()
         path = allowed.get(service)
         if not path:
             self._respond_json(400, {"error": f"unknown service: {service}"})
@@ -691,7 +744,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _json(self, status: int, payload: dict[str, object]) -> None:
         self._respond_json(status, payload)
 
-    def _read_request_body_bytes(self, cap: int = 32 * 1024 * 1024) -> bytes:
+    def _read_request_body_bytes(self, cap: int | None = None) -> bytes:
+        if cap is None:
+            cap = MAX_REQUEST_BYTES
         length = self.headers.get("content-length")
         if length:
             try:
@@ -753,6 +808,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         return 0, 0
 
     def _extract_tokens_from_sse(self, body_bytes: bytes) -> tuple[int, int]:
+        """Extract usage from SSE frames.
+
+        Anthropic emits usage on `event: message_start` (input_tokens) and
+        `event: message_delta` (output_tokens). OpenAI streams a single
+        `data: {"usage": ...}` chunk when `stream_options.include_usage` is
+        set. We scan line-oriented rather than parsing full frames so we can
+        keep the response capture cheap.
+        """
         if not body_bytes:
             return 0, 0
         tokens_in = 0
@@ -773,10 +836,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 continue
             if not isinstance(obj, dict):
                 continue
-            usage = obj.get("usage") or (obj.get("message") or {}).get("usage")
+            usage = obj.get("usage")
+            if usage is None:
+                msg = obj.get("message")
+                if isinstance(msg, dict):
+                    usage = msg.get("usage")
             if isinstance(usage, dict):
-                tokens_in = int(usage.get("input_tokens", usage.get("prompt_tokens", tokens_in)) or tokens_in)
-                tokens_out = int(usage.get("output_tokens", usage.get("completion_tokens", tokens_out)) or tokens_out)
+                new_in = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+                new_out = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+                if new_in:
+                    tokens_in = new_in
+                if new_out:
+                    tokens_out = new_out
         return tokens_in, tokens_out
 
     def _proxy(self) -> None:
@@ -817,8 +888,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             if self.command != "HEAD":
+                is_stream = "text/event-stream" in content_type
+                capture_cap = 2 * 1024 * 1024 if is_stream else 512 * 1024
+                capture_size = 0
                 while True:
-                    chunk = resp.read(8192)
+                    chunk = resp.read1(65536) if is_stream else resp.read(8192)
                     if not chunk:
                         break
                     try:
@@ -827,8 +901,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     except (BrokenPipeError, ConnectionResetError):
                         break
                     bytes_out += len(chunk)
-                    if capture_response and len(response_chunks) * 8192 < 512 * 1024:
+                    if capture_response and capture_size < capture_cap:
                         response_chunks.append(chunk)
+                        capture_size += len(chunk)
 
             elapsed_ms = (time.time() - started) * 1000
 

@@ -8,6 +8,16 @@ All notable changes to apx are documented here. The format follows
 
 ### Added
 
+- Chain-based routing. `APX_CHAIN` in `config.env` is a comma-separated
+  ordered list of local services between the gateway and the upstream.
+  All `*_ENABLED` and `*_TARGET_API_URL` values are derived from it.
+  Presets in `apx mode` compile down to chains; new `apx chain get/set/
+  clear/ls/preset` subcommands expose the primitive for arbitrary orderings.
+  Legacy `apx mode` names remain valid aliases.
+- `~/.config/apx/prices.env` can override the built-in per-million-token
+  cost table without a version bump.
+- `APX_METRICS_ENABLED` gates the Prometheus `/metrics` endpoint (default 0).
+- `APX_MAX_REQUEST_BYTES` caps the proxied request body size (default 64 MiB).
 - Gateway now stamps `X-Apx-Request-Id` on every proxied request. The id is
   echoed back to the client, logged, persisted in history, and available on
   the dashboard.
@@ -36,13 +46,30 @@ All notable changes to apx are documented here. The format follows
 
 ### Changed
 
+- The gateway now discovers streamable log files by scanning `$LOG_DIR/*.log`
+  instead of using a hardcoded allowlist.
+- Dashboard auth accepts Bearer header or `?token=` query parameter only.
+  The undocumented cookie path was removed.
+- Streaming SSE responses use `resp.read1(65536)` so the first token from the
+  model reaches the client the moment the upstream emits it. Buffered JSON
+  responses still use blocking reads.
+- Token extraction now captures up to 2 MiB of the response body for SSE
+  streams so `message_delta` frames near the end of long completions are
+  reliably parsed.
 - Concurrent `/api/logs/stream` connections per client IP are capped by
   `APX_MAX_LOG_STREAMS_PER_IP` (default 8).
 - Response `x-frame-options` and `content-security-policy` headers are
   stripped on `/proxy/pxpipe/*` and `/proxy/squeezr/*` so the dashboard
   iframes render.
-- Legacy `AI_PROXY_STACK_*` environment variables are still honored as
-  fallbacks for one release cycle.
+- Legacy `AI_PROXY_STACK_*` environment variable fallbacks now only cover
+  the load-bearing paths (`APX_ROOT`, `APX_CONFIG`, `APX_STATE`). Tuning
+  knobs like `APX_LABEL`, `APX_REPO_URL`, etc. use the `APX_*` names only.
+
+### Removed
+
+- Hand-coded mode permutations in `bin/apx` (`set_mode` case statements)
+  and `bin/apx-gateway` (`_current_mode`, `_chain_hops`). Both now compute
+  routing from a single `APX_CHAIN` list plus a small service registry.
 
 ## [0.1.0] - 2026-07-07
 

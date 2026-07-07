@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-LABEL="${APX_LABEL:-${AI_PROXY_STACK_LABEL:-io.github.apx}}"
+# Load-bearing paths still honor the legacy AI_PROXY_STACK_* env names for one
+# release cycle so existing shells and cron jobs don't break during upgrade.
+# Non-load-bearing tuning knobs use the APX_* names only.
+LABEL="${APX_LABEL:-io.github.apx}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/../config" ]]; then
   DEFAULT_STACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -17,13 +20,13 @@ VERSION_FILE="$STATE_DIR/VERSION"
 DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$HOME/.local/share/apx/dashboard.html}"
 RUN_DIR="$STATE_DIR/run"
 LOG_DIR="$STATE_DIR/logs"
-UPDATE_REPO_URL="${APX_REPO_URL:-${AI_PROXY_STACK_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}}"
-UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-${AI_PROXY_STACK_REPO_BRANCH:-main}}"
+UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}"
+UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-main}"
 PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
-CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-${AI_PROXY_STACK_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}}"
-LEGACY_LABELS="${APX_LEGACY_LABELS:-${AI_PROXY_STACK_LEGACY_LABELS:-io.github.ai-proxy-stack}}"
+CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+LEGACY_LABELS="${APX_LEGACY_LABELS:-io.github.ai-proxy-stack}"
 DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-export PATH="${APX_PATH:-${AI_PROXY_STACK_PATH:-$DEFAULT_PATH}}:$PATH"
+export PATH="${APX_PATH:-$DEFAULT_PATH}:$PATH"
 
 mkdir -p "$RUN_DIR" "$LOG_DIR"
 
@@ -81,6 +84,28 @@ load_config() {
   : "${SQUEEZR_EXTRA_ARGS:=}"
   : "${APX_DASHBOARD_ENABLED:=1}"
   : "${APX_HISTORY_SIZE:=500}"
+  : "${APX_METRICS_ENABLED:=0}"
+  # APX_CHAIN is authoritative; if unset (legacy config), infer it from the
+  # ENABLED flags and TARGET_API_URL routing so upgrades don't break silently.
+  if [[ -z "${APX_CHAIN+x}" ]]; then
+    APX_CHAIN=""
+    if [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
+      if [[ "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" ]]; then
+        APX_CHAIN="pxpipe,headroom"
+      else
+        APX_CHAIN="headroom,pxpipe"
+      fi
+    elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
+      APX_CHAIN="headroom,squeezr"
+    elif [[ "$HEADROOM_ENABLED" == "1" ]]; then
+      APX_CHAIN="headroom"
+    elif [[ "$PXPIPE_ENABLED" == "1" ]]; then
+      APX_CHAIN="pxpipe"
+    elif [[ "$SQUEEZR_ENABLED" == "1" ]]; then
+      APX_CHAIN="squeezr"
+    fi
+  fi
+  export APX_CHAIN
 }
 
 now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -157,7 +182,7 @@ start_gateway() {
   fi
   existing="$(port_pid "$GATEWAY_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'apx-gateway|python.*apx-gateway|ai-proxy-gateway|python.*ai-proxy-gateway' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/gateway.adopted.pid"
@@ -173,6 +198,8 @@ start_gateway() {
     cd "$WORKDIR"
     export HOST="$BIND_HOST" GATEWAY_HOST="$BIND_HOST" GATEWAY_PORT="$GATEWAY_PORT" GATEWAY_TARGET_URL="$GATEWAY_TARGET_API_URL"
     export APX_DASHBOARD_ENABLED="$APX_DASHBOARD_ENABLED" APX_DASHBOARD_HTML="$DASHBOARD_HTML" APX_HISTORY_SIZE="$APX_HISTORY_SIZE"
+    export APX_METRICS_ENABLED="$APX_METRICS_ENABLED"
+    export APX_CHAIN="${APX_CHAIN:-}"
     export APX_STATE_DIR="$STATE_DIR" APX_LOG_DIR="$LOG_DIR" APX_CONFIG="$CONFIG_FILE"
     export APX_HEADROOM_URL="http://$BIND_HOST:$HEADROOM_PORT" APX_PXPIPE_URL="http://$BIND_HOST:$PXPIPE_PORT" APX_SQUEEZR_URL="http://$BIND_HOST:$SQUEEZR_PORT"
     exec bash -lc "exec $GATEWAY_CMD"
@@ -190,7 +217,7 @@ start_squeezr() {
   fi
   existing="$(port_pid "$SQUEEZR_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/squeezr.adopted.pid"
@@ -221,7 +248,7 @@ start_pxpipe() {
   fi
   existing="$(port_pid "$PXPIPE_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "pxpipe" "$PXPIPE_PORT" 'pxpipe|node .*/pxpipe' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/pxpipe.adopted.pid"
@@ -261,7 +288,7 @@ start_headroom() {
   fi
   existing="$(port_pid "$HEADROOM_PORT")"
   if [[ -n "$existing" ]]; then
-    if [[ "${APX_TAKEOVER:-${AI_PROXY_STACK_TAKEOVER:-0}}" == "1" ]]; then
+    if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "headroom" "$HEADROOM_PORT" 'headroom|Python' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
       echo "$existing" > "$RUN_DIR/headroom.adopted.pid"
@@ -474,44 +501,175 @@ set_config_var() {
   mv "$tmp" "$CONFIG_FILE"
 }
 
+# --- chain-based routing ----------------------------------------------------
+#
+# The chain is an ordered comma-separated list of service names (e.g.
+# "headroom,pxpipe") stored as APX_CHAIN in config.env. All ENABLED flags and
+# per-service TARGET_API_URLs are derived from it. Presets in `apx mode` are
+# thin sugar that compile to a chain via preset_to_chain().
+#
+# To add a new service in the future, extend service_port, service_label, and
+# UPSTREAM_URL_FOR_SERVICE below. No mode permutations need to change.
+
+APX_ANTHROPIC_UPSTREAM='"https://api.anthropic.com"'
+APX_KNOWN_SERVICES=(headroom pxpipe squeezr)
+
+service_port() {
+  case "$1" in
+    headroom) echo "$HEADROOM_PORT" ;;
+    pxpipe)   echo "$PXPIPE_PORT" ;;
+    squeezr)  echo "$SQUEEZR_PORT" ;;
+    *) echo "" ;;
+  esac
+}
+
+service_label() {
+  case "$1" in
+    headroom) echo "Headroom" ;;
+    pxpipe)   echo "pxpipe" ;;
+    squeezr)  echo "Squeezr" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+service_url() {
+  local port
+  port="$(service_port "$1")"
+  [[ -n "$port" ]] && echo "http://$BIND_HOST:$port"
+}
+
+service_known() {
+  local candidate="$1" svc
+  for svc in "${APX_KNOWN_SERVICES[@]}"; do
+    [[ "$svc" == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+# Parse APX_CHAIN into a bash array in the current shell. Empty when the chain
+# is unset or set to "direct".
+parse_chain() {
+  local raw="${APX_CHAIN:-}"
+  raw="${raw//[[:space:]]/}"
+  APX_CHAIN_ARR=()
+  [[ -z "$raw" || "$raw" == "direct" ]] && return 0
+  local IFS=,
+  local part
+  for part in $raw; do
+    [[ -n "$part" ]] && APX_CHAIN_ARR+=("$part")
+  done
+}
+
+# Given a chain, return its canonical preset name if one matches, else "custom".
+canonical_preset_for_chain() {
+  local chain="$1"
+  case "$chain" in
+    "")                  echo "direct" ;;
+    "headroom")          echo "headroom" ;;
+    "pxpipe")            echo "pxpipe" ;;
+    "squeezr")           echo "squeezr" ;;
+    "headroom,pxpipe")   echo "headroom-pxpipe" ;;
+    "pxpipe,headroom")   echo "pxpipe-headroom" ;;
+    "headroom,squeezr")  echo "headroom-squeezr" ;;
+    *)                   echo "custom" ;;
+  esac
+}
+
+preset_to_chain() {
+  case "$1" in
+    off)                     echo "" ;;
+    direct)                  echo "" ;;
+    headroom|no-pxpipe)      echo "headroom" ;;
+    pxpipe|no-headroom)      echo "pxpipe" ;;
+    squeezr|squeezr-only)    echo "squeezr" ;;
+    headroom-pxpipe|full)    echo "headroom,pxpipe" ;;
+    pxpipe-headroom|pxpipe-then-headroom) echo "pxpipe,headroom" ;;
+    headroom-squeezr|squeezr-headroom)    echo "headroom,squeezr" ;;
+    *) return 2 ;;
+  esac
+}
+
 current_mode() {
-  if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+  if [[ "$GATEWAY_ENABLED" != "1" ]]; then
     echo "off"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" && "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" && "$PXPIPE_TARGET_API_URL" == "http://$BIND_HOST:$HEADROOM_PORT" ]]; then
-    echo "pxpipe-headroom"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
-    echo "headroom-pxpipe"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
-    echo "headroom-squeezr"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
-    echo "headroom"
-  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" == "1" ]]; then
-    echo "pxpipe"
-  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
-    echo "squeezr"
-  else
-    echo "direct"
+    return
   fi
+  parse_chain
+  local joined
+  joined="$(IFS=,; echo "${APX_CHAIN_ARR[*]:-}")"
+  canonical_preset_for_chain "$joined"
 }
 
 chain_description() {
-  if [[ "$GATEWAY_ENABLED" != "1" && "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
+  if [[ "$GATEWAY_ENABLED" != "1" ]]; then
     echo "disabled (ANTHROPIC_BASE_URL removed)"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" && "$GATEWAY_TARGET_API_URL" == "http://$BIND_HOST:$PXPIPE_PORT" && "$PXPIPE_TARGET_API_URL" == "http://$BIND_HOST:$HEADROOM_PORT" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> upstream"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" == "1" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> upstream"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> Squeezr($BIND_HOST:$SQUEEZR_PORT) -> upstream"
-  elif [[ "$HEADROOM_ENABLED" == "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" != "1" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Headroom($BIND_HOST:$HEADROOM_PORT) -> $HEADROOM_TARGET_API_URL"
-  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" == "1" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> pxpipe($BIND_HOST:$PXPIPE_PORT) -> upstream"
-  elif [[ "$HEADROOM_ENABLED" != "1" && "$PXPIPE_ENABLED" != "1" && "$SQUEEZR_ENABLED" == "1" ]]; then
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> Squeezr($BIND_HOST:$SQUEEZR_PORT) -> upstream"
-  else
-    echo "Claude -> Gateway($BIND_HOST:$GATEWAY_PORT) -> upstream directly"
+    return
   fi
+  parse_chain
+  local parts=("Claude" "Gateway($BIND_HOST:$GATEWAY_PORT)") svc
+  if (( ${#APX_CHAIN_ARR[@]} > 0 )); then
+    for svc in "${APX_CHAIN_ARR[@]}"; do
+      parts+=("$(service_label "$svc")($BIND_HOST:$(service_port "$svc"))")
+    done
+  fi
+  parts+=("upstream")
+  local joined="" p
+  for p in "${parts[@]}"; do
+    if [[ -z "$joined" ]]; then joined="$p"; else joined="$joined -> $p"; fi
+  done
+  echo "$joined"
+}
+
+# Write APX_CHAIN plus derived ENABLED flags and TARGET_API_URLs from the
+# supplied chain string. The chain is a comma-separated ordered list; empty
+# means "direct to upstream".
+apply_chain() {
+  local chain="$1" gateway_enabled="${2:-1}"
+  chain="${chain//[[:space:]]/}"
+
+  if [[ -n "$chain" ]]; then
+    local IFS=, part
+    for part in $chain; do
+      if ! service_known "$part"; then
+        echo "error: unknown service in chain: $part" >&2
+        echo "known services: ${APX_KNOWN_SERVICES[*]}" >&2
+        return 2
+      fi
+    done
+  fi
+
+  set_config_var APX_CHAIN "\"$chain\""
+  set_config_var GATEWAY_ENABLED "$gateway_enabled"
+
+  local svc enabled_val gateway_target="$APX_ANTHROPIC_UPSTREAM"
+  local -a chain_arr=()
+  if [[ -n "$chain" ]]; then
+    IFS=, read -r -a chain_arr <<<"$chain"
+    gateway_target="\"$(service_url "${chain_arr[0]}")\""
+  fi
+
+  for svc in "${APX_KNOWN_SERVICES[@]}"; do
+    enabled_val=0
+    local idx=-1 i=0
+    for i in "${!chain_arr[@]}"; do
+      if [[ "${chain_arr[$i]}" == "$svc" ]]; then
+        idx=$i
+        enabled_val=1
+        break
+      fi
+    done
+    local target="$APX_ANTHROPIC_UPSTREAM"
+    if (( idx >= 0 )) && (( idx + 1 < ${#chain_arr[@]} )); then
+      target="\"$(service_url "${chain_arr[$((idx + 1))]}")\""
+    fi
+    case "$svc" in
+      headroom) set_config_var HEADROOM_ENABLED "$enabled_val"; set_config_var HEADROOM_TARGET_API_URL "$target" ;;
+      pxpipe)   set_config_var PXPIPE_ENABLED   "$enabled_val"; set_config_var PXPIPE_TARGET_API_URL   "$target" ;;
+      squeezr)  set_config_var SQUEEZR_ENABLED  "$enabled_val" ;;
+    esac
+  done
+
+  set_config_var GATEWAY_TARGET_API_URL "$gateway_target"
 }
 
 mode_hint() {
@@ -578,12 +736,7 @@ PY
 
 disable_stack() {
   load_config
-  set_config_var GATEWAY_ENABLED 0
-  set_config_var HEADROOM_ENABLED 0
-  set_config_var PXPIPE_ENABLED 0
-  set_config_var SQUEEZR_ENABLED 0
-  set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
-  set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
+  apply_chain "" 0
   load_config
   echo "mode set: $(current_mode)"
   echo "chain: $(chain_description)"
@@ -593,100 +746,8 @@ disable_stack() {
   status
 }
 
-set_mode() {
-  local mode="${1:-}" restart="1" sync_claude="1"
-  shift || true
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --no-restart) restart="0" ;;
-      --no-claude-sync) sync_claude="0" ;;
-      *) echo "usage: $0 mode [headroom-pxpipe|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2; return 2 ;;
-    esac
-    shift
-  done
-  load_config
-  case "$mode" in
-    headroom-pxpipe|full)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 1
-      set_config_var PXPIPE_ENABLED 1
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
-      ;;
-    pxpipe-headroom|pxpipe-then-headroom)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 1
-      set_config_var PXPIPE_ENABLED 1
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
-      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
-      ;;
-    headroom|no-pxpipe)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 1
-      set_config_var PXPIPE_ENABLED 0
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
-      ;;
-    pxpipe|no-headroom)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 0
-      set_config_var PXPIPE_ENABLED 1
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$PXPIPE_PORT\""
-      ;;
-    squeezr|squeezr-only)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 0
-      set_config_var PXPIPE_ENABLED 0
-      set_config_var SQUEEZR_ENABLED 1
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
-      ;;
-    headroom-squeezr|squeezr-headroom)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 1
-      set_config_var PXPIPE_ENABLED 0
-      set_config_var SQUEEZR_ENABLED 1
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var HEADROOM_TARGET_API_URL "\"http://$BIND_HOST:$SQUEEZR_PORT\""
-      set_config_var GATEWAY_TARGET_API_URL "\"http://$BIND_HOST:$HEADROOM_PORT\""
-      ;;
-    direct)
-      set_config_var GATEWAY_ENABLED 1
-      set_config_var HEADROOM_ENABLED 0
-      set_config_var PXPIPE_ENABLED 0
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
-      ;;
-    off)
-      set_config_var GATEWAY_ENABLED 0
-      set_config_var HEADROOM_ENABLED 0
-      set_config_var PXPIPE_ENABLED 0
-      set_config_var SQUEEZR_ENABLED 0
-      set_config_var PXPIPE_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var HEADROOM_TARGET_API_URL '"https://api.anthropic.com"'
-      set_config_var GATEWAY_TARGET_API_URL '"https://api.anthropic.com"'
-      ;;
-    current|status|"")
-      echo "mode: $(current_mode)"
-      echo "chain: $(chain_description)"
-      mode_hint
-      return 0
-      ;;
-    *)
-      echo "usage: $0 mode [headroom-pxpipe|pxpipe-headroom|headroom|headroom-squeezr|no-pxpipe|pxpipe|squeezr|direct|off|current] [--no-restart] [--no-claude-sync]" >&2
-      return 2
-      ;;
-  esac
+apply_mode_common() {
+  local sync_claude="$1" restart="$2"
   load_config
   echo "mode set: $(current_mode)"
   echo "chain: $(chain_description)"
@@ -701,6 +762,139 @@ set_mode() {
   else
     echo "not restarted; run: apx install"
   fi
+}
+
+set_mode() {
+  local mode="${1:-}" restart="1" sync_claude="1"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) restart="0" ;;
+      --no-claude-sync) sync_claude="0" ;;
+      *) mode_usage >&2; return 2 ;;
+    esac
+    shift
+  done
+  load_config
+
+  case "$mode" in
+    current|status|"")
+      echo "mode: $(current_mode)"
+      echo "chain: $(chain_description)"
+      mode_hint
+      return 0
+      ;;
+    off)
+      apply_chain "" 0
+      apply_mode_common "$sync_claude" "$restart"
+      return
+      ;;
+  esac
+
+  local chain
+  if ! chain="$(preset_to_chain "$mode")"; then
+    mode_usage >&2
+    return 2
+  fi
+  apply_chain "$chain" 1
+  apply_mode_common "$sync_claude" "$restart"
+}
+
+mode_usage() {
+  cat <<EOF
+usage: apx mode <preset> [--no-restart] [--no-claude-sync]
+
+Presets:
+  headroom-pxpipe    Claude -> Gateway -> Headroom -> pxpipe -> Anthropic (alias: full)
+  pxpipe-headroom    Claude -> Gateway -> pxpipe -> Headroom -> Anthropic
+  headroom           Claude -> Gateway -> Headroom -> Anthropic
+  pxpipe             Claude -> Gateway -> pxpipe -> Anthropic
+  squeezr            Claude -> Gateway -> Squeezr -> Anthropic
+  headroom-squeezr   Claude -> Gateway -> Headroom -> Squeezr -> Anthropic
+  direct             Claude -> Gateway -> Anthropic (no upstream tools)
+  off                Gateway disabled; ANTHROPIC_BASE_URL removed
+  current            Show the current mode without changing anything
+
+For arbitrary orderings use: apx chain set <a,b,...>
+EOF
+}
+
+chain_usage() {
+  cat <<EOF
+usage: apx chain <subcommand>
+
+  get                       Show APX_CHAIN and derived Gateway routing
+  set <a,b,...>             Set the chain to an ordered list of services
+  clear                     Alias for 'set ""' (equivalent to mode direct)
+  ls                        List services known to apx
+  preset ls                 List preset chains
+  preset use <name>         Apply a preset chain
+
+Known services: ${APX_KNOWN_SERVICES[*]}
+Presets: headroom-pxpipe, pxpipe-headroom, headroom, pxpipe, squeezr,
+         headroom-squeezr, direct, off
+EOF
+}
+
+chain_cli() {
+  local sub="${1:-}"
+  shift || true
+  local restart="1" sync_claude="1"
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) restart="0" ;;
+      --no-claude-sync) sync_claude="0" ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  load_config
+  case "$sub" in
+    ""|get|show|status)
+      local displayed="${APX_CHAIN-}"
+      if [[ -z "${APX_CHAIN+set}" ]]; then
+        displayed="<unset>"
+      elif [[ -z "$displayed" ]]; then
+        displayed="(empty; direct to upstream)"
+      fi
+      echo "chain: $displayed"
+      echo "mode:  $(current_mode)"
+      echo "hops:  $(chain_description)"
+      mode_hint
+      ;;
+    set)
+      local target="${positional[0]:-}"
+      if [[ -z "$target" ]]; then
+        echo "usage: apx chain set <a,b,...>" >&2
+        return 2
+      fi
+      apply_chain "$target" 1
+      apply_mode_common "$sync_claude" "$restart"
+      ;;
+    clear)
+      apply_chain "" 1
+      apply_mode_common "$sync_claude" "$restart"
+      ;;
+    ls|list)
+      printf '%s\n' "${APX_KNOWN_SERVICES[@]}"
+      ;;
+    preset)
+      case "${positional[0]:-}" in
+        ""|ls|list)
+          for name in headroom-pxpipe pxpipe-headroom headroom pxpipe squeezr headroom-squeezr direct off; do
+            printf '  %-18s %s\n' "$name" "$(preset_to_chain "$name" || echo "")"
+          done
+          ;;
+        use)
+          set_mode "${positional[1]:-}" ${restart:+$( ((restart==0)) && echo --no-restart )} ${sync_claude:+$( ((sync_claude==0)) && echo --no-claude-sync )}
+          ;;
+        *) chain_usage >&2; return 2 ;;
+      esac
+      ;;
+    -h|--help|help) chain_usage ;;
+    *) chain_usage >&2; return 2 ;;
+  esac
 }
 
 status() {
@@ -987,8 +1181,10 @@ EOF
 
 print_completions() {
   local shell="${1:-}"
-  local cmds="start stop disable restart status mode doctor install uninstall supervisor logs urls dashboard version check-updates update completions help"
+  local cmds="start stop disable restart status mode chain doctor install uninstall supervisor logs urls dashboard version check-updates update completions help"
   local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
+  local chain_subs="get set clear ls preset help"
+  local services="headroom pxpipe squeezr"
   local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
   case "$shell" in
     bash)
@@ -1007,6 +1203,7 @@ _apx_completions() {
   fi
   case "\${words[1]}" in
     mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
+    chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
     completions) COMPREPLY=( \$(compgen -W "bash zsh fish" -- "\$cur") ) ;;
     update)   COMPREPLY=( \$(compgen -W "--to --to-latest --force" -- "\$cur") ) ;;
@@ -1026,6 +1223,8 @@ _apx() {
 ZSH
       printf '  cmds=(%s)\n' "$cmds"
       printf '  modes=(%s)\n' "$modes"
+      printf '  chain_subs=(%s)\n' "$chain_subs"
+      printf '  services=(%s)\n' "$services"
       printf '  log_targets=(%s)\n' "$log_targets"
       cat <<'ZSH'
   if (( CURRENT == 2 )); then
@@ -1034,6 +1233,7 @@ ZSH
   fi
   case "$words[2]" in
     mode) _describe -t modes 'apx mode' modes ;;
+    chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
     completions) _values 'shell' 'bash' 'zsh' 'fish' ;;
     update) _values 'flag' '--to[git ref]' '--to-latest' '--force' ;;
@@ -1053,6 +1253,12 @@ FISH
       done
       for m in $modes; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from mode" -a "%s"\n' "$m"
+      done
+      for c in $chain_subs; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from chain" -a "%s"\n' "$c"
+      done
+      for s in $services; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from chain" -a "%s"\n' "$s"
       done
       for l in $log_targets; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from logs" -a "%s"\n' "$l"
@@ -1086,7 +1292,8 @@ Commands:
   disable              Stop stack/gateway and remove ANTHROPIC_BASE_URL
   restart [--takeover] Stop then start
   status               Show current health and pids
-  mode [name]          Show/set mode and sync Claude settings
+  mode [preset]        Show/set mode preset and sync Claude settings
+  chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
   doctor               Show status plus dependency diagnostics
   install              Install/start macOS LaunchAgent with KeepAlive
   uninstall            Stop and remove macOS LaunchAgent
@@ -1099,7 +1306,7 @@ Commands:
   update [--to REF]    git pull the recorded source repo and reinstall
   completions SHELL    Print shell completion script (bash, zsh, or fish)
 
-Mode options:
+Mode presets:
   headroom-pxpipe      Claude -> Headroom -> pxpipe -> Anthropic (alias: full)
   pxpipe-headroom      Claude -> pxpipe -> Headroom -> Anthropic
   headroom             Claude -> Headroom -> Anthropic directly
@@ -1108,6 +1315,14 @@ Mode options:
   pxpipe               Claude -> pxpipe -> upstream
   direct               Gateway pass-through to Anthropic
   off                  Disable local services in config
+
+For arbitrary orderings:
+  apx chain set headroom,pxpipe
+  apx chain set squeezr
+  apx chain clear
+
+Options:
+  --no-restart         Do not restart the LaunchAgent after mode/chain change
   --no-claude-sync     Do not update ~/.claude/settings.json
 
 Config: $CONFIG_FILE
@@ -1124,6 +1339,7 @@ case "$cmd" in
   restart) stop_service; start_bg "${1:-}" ;;
   status) status ;;
   mode) set_mode "${@:-current}" ;;
+  chain) chain_cli "$@" ;;
   doctor) doctor ;;
   install) install_service ;;
   uninstall) uninstall_service ;;

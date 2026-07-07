@@ -105,18 +105,31 @@ For host-only Claude sessions, `http://127.0.0.1:8787` also works.
 
 `apx mode ...` keeps this value synced in `~/.claude/settings.json`. Because the URL stays stable, switching modes does not require a Claude restart. Use `apx disable` if you want to remove the setting completely.
 
-## Modes
+## Modes and chains
+
+`apx` has one underlying routing model — an ordered chain of local services
+between the gateway and Anthropic. `apx mode` gives that model a small
+curated set of preset names; `apx chain` gives you the primitive directly
+for arbitrary orderings and future services.
 
 ```bash
 apx mode current
-apx mode headroom-pxpipe
-apx mode pxpipe-headroom
+apx mode headroom-pxpipe        # preset -> chain "headroom,pxpipe"
+apx mode pxpipe-headroom        # preset -> chain "pxpipe,headroom"
 apx mode headroom
 apx mode squeezr
 apx mode headroom-squeezr
 apx mode pxpipe
-apx mode direct
-apx disable
+apx mode direct                 # empty chain
+apx disable                     # gateway off; ANTHROPIC_BASE_URL removed
+
+# Freeform ordering / power user:
+apx chain get
+apx chain set headroom,pxpipe
+apx chain set squeezr,headroom,pxpipe
+apx chain clear                 # equivalent to `apx mode direct`
+apx chain ls                    # list known services
+apx chain preset ls             # list preset chains
 ```
 
 ```text
