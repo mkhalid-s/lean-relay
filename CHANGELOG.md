@@ -4,6 +4,49 @@ All notable changes to apx are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Manifest-backed dependency/cache uninstall cleanup.** `apx uninstall`
+  keeps plain `--purge` limited to apx-owned files, but now supports explicit
+  opt-in categories for resources the installer recorded creating or warming:
+  `--purge=deps`, `--purge=caches`, and `--purge=all,deps,caches`.
+  Dry-run prints the exact planned actions before anything is removed. The
+  recorded source clone is also explicit-only via `--purge=source`.
+
+### Changed
+
+- **`--purge=source` is now opt-in.** Plain `--purge` no longer removes the
+  recorded source clone. Pass `--purge=source` (or include it in the
+  comma-separated list) to remove it.
+
+### Fixed
+
+- **Uninstall path safety.** Directory purges now validate that recursive
+  delete targets are non-root children of the active `$HOME`, preventing
+  accidental broad deletes if path override environment variables are unsafe.
+- **Refuse non-default apx paths on `--purge`.** `apx uninstall --purge` now
+  refuses to run when `APX_SHARE`, `APX_STATE`, or `APX_CONFIG` point outside
+  the default `~/.local/share/apx`, `~/.local/state/apx`, `~/.config/apx`
+  layout, closing an env-override path that could target arbitrary directories
+  under `$HOME`.
+- **Validate `APX_LABEL` on startup.** `apx` rejects `APX_LABEL` values that
+  contain anything outside `[A-Za-z0-9._-]`, preventing traversal into other
+  LaunchAgents plists or arbitrary `*.plist` paths under `$HOME`.
+- **Nested source clone guard.** `--purge=share|state|config` now refuses to
+  remove a category directory when the recorded source clone (from
+  `~/.config/apx/source.path`) lives inside it, and instructs the user to run
+  `apx uninstall --purge=source` first or relocate the clone.
+- **Lazy runtime directory creation.** `~/.local/state/apx/run` and
+  `~/.local/state/apx/logs` are only created by commands that need them
+  (`start`, `install`, `supervisor`), not at every CLI invocation. `apx --help`
+  and `apx uninstall --dry-run` no longer touch the filesystem.
+- **Uninstall `state`-without-`deps,caches` note.** When `--purge=state` is
+  invoked without `deps`/`caches` and the install manifest still exists, apx
+  prints a note that the manifest is about to be removed and suggests the
+  combined form `--purge=all,deps,caches`.
+
 ## [0.1.0] - 2026-07-08
 
 _Initial public release. `v0.1` was never published; all pre-release work

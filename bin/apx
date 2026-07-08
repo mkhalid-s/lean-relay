@@ -2,6 +2,13 @@
 set -Eeuo pipefail
 
 LABEL="${APX_LABEL:-io.github.apx}"
+# LABEL is interpolated into filesystem paths (LaunchAgent plist), so refuse
+# anything that could traverse out of ~/Library/LaunchAgents.
+if [[ ! "$LABEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "apx: refusing invalid APX_LABEL: $LABEL" >&2
+  echo "apx:   allowed characters: A-Z a-z 0-9 . _ -" >&2
+  exit 2
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/../config" ]]; then
   DEFAULT_STACK_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -25,6 +32,7 @@ DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$SHARE_DIR/dashboard.html}"
 VERSIONS_DIR="$SHARE_DIR/versions"
 CURRENT_LINK="$SHARE_DIR/current"
 INSTALL_MODE_FILE="$CONFIG_DIR/install.mode"
+INSTALL_MANIFEST_FILE="$STATE_DIR/install-manifest.env"
 RELEASE_ASSET_URL="${APX_RELEASE_ASSET_URL:-https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh}"
 RELEASE_ASSET_SHA_URL="${APX_RELEASE_ASSET_SHA_URL:-${RELEASE_ASSET_URL}.sha256}"
 RUN_DIR="$STATE_DIR/run"
@@ -36,7 +44,12 @@ CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH="${APX_PATH:-$DEFAULT_PATH}:$PATH"
 
-mkdir -p "$RUN_DIR" "$LOG_DIR"
+# Create runtime dirs lazily. Doing this at script load leaked side effects to
+# read-only commands (help, version, uninstall --dry-run) and, combined with
+# APX_STATE override, could create directories under arbitrary $HOME subtrees.
+ensure_runtime_dirs() {
+  mkdir -p "$RUN_DIR" "$LOG_DIR"
+}
 
 load_config() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -350,6 +363,7 @@ stop_stale_supervisors() {
 
 supervisor() {
   load_config
+  ensure_runtime_dirs
   echo $$ > "$RUN_DIR/supervisor.pid"
   trap 'log "supervisor stopping"; stop_children; rm -f "$RUN_DIR/supervisor.pid"; exit 0' INT TERM
   log "supervisor starting"
@@ -401,6 +415,7 @@ supervisor() {
 
 start_bg() {
   load_config
+  ensure_runtime_dirs
   local takeover=0
   if [[ "${1:-}" == "--takeover" ]]; then takeover=1; fi
   local spid
@@ -449,6 +464,7 @@ EOF
 
 install_service() {
   load_config
+  ensure_runtime_dirs
   write_plist
   launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
   sleep 2
@@ -461,6 +477,11 @@ install_service() {
 }
 
 stop_service() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    load_config
+  else
+    : "${SQUEEZR_PORT:=18780}"
+  fi
   launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
   local spid
   spid="$(read_pid "$RUN_DIR/supervisor.pid")"
@@ -488,18 +509,42 @@ stop_service() {
 #   config      : ~/.config/apx/ (config.env, prices.env, source.path)
 #   claude      : remove ANTHROPIC_BASE_URL from ~/.claude/settings.json (file is preserved)
 #   completions : bash/zsh/fish completion files at their canonical paths
-#   source      : the git clone recorded in ~/.config/apx/source.path
+#   source      : the git clone recorded in ~/.config/apx/source.path (explicit only)
+#   deps        : manifest-recorded dependency installs (currently headroom-ai via pipx)
+#   caches      : manifest-recorded install/prewarm caches (Headroom helpers, npm/npx cache)
 #
 # Never touched: ~/.headroom, ~/.squeezr, ~/.certs, ~/.cache/tiktoken, and
-# everything else we don't own.
+# everything else we don't own. Plain --purge intentionally excludes deps/caches.
 
-APX_ALL_PURGE_CATEGORIES=(binaries share state config claude completions source)
+APX_ALL_PURGE_CATEGORIES=(binaries share state config claude completions)
+APX_EXTERNAL_PURGE_CATEGORIES=(deps caches)
+APX_EXPLICIT_PURGE_CATEGORIES=(source)
+
+purge_add_category() {
+  local new="$1" existing
+  for existing in "${APX_PURGE_CATS[@]:-}"; do
+    [[ "$existing" == "$new" ]] && return 0
+  done
+  APX_PURGE_CATS+=("$new")
+}
+
+purge_category_known() {
+  local cat="$1" known
+  [[ "$cat" == "all" ]] && return 0
+  for known in "${APX_ALL_PURGE_CATEGORIES[@]}" "${APX_EXTERNAL_PURGE_CATEGORIES[@]}" "${APX_EXPLICIT_PURGE_CATEGORIES[@]}"; do
+    [[ "$cat" == "$known" ]] && return 0
+  done
+  return 1
+}
 
 parse_purge_categories() {
   local input="$1"
   APX_PURGE_CATS=()
   if [[ "$input" == "1" || -z "$input" ]]; then
-    APX_PURGE_CATS=("${APX_ALL_PURGE_CATEGORIES[@]}")
+    local default_cat
+    for default_cat in "${APX_ALL_PURGE_CATEGORIES[@]}"; do
+      purge_add_category "$default_cat"
+    done
     return 0
   fi
   local IFS=,
@@ -507,18 +552,18 @@ parse_purge_categories() {
   for cat in $input; do
     cat="${cat// /}"
     [[ -z "$cat" ]] && continue
-    local found=0 known
-    for known in "${APX_ALL_PURGE_CATEGORIES[@]}"; do
-      if [[ "$cat" == "$known" ]]; then
-        APX_PURGE_CATS+=("$cat")
-        found=1
-        break
-      fi
-    done
-    if (( found == 0 )); then
+    if ! purge_category_known "$cat"; then
       echo "error: unknown purge category: $cat" >&2
-      echo "valid: ${APX_ALL_PURGE_CATEGORIES[*]}" >&2
+      echo "valid: all ${APX_ALL_PURGE_CATEGORIES[*]} ${APX_EXTERNAL_PURGE_CATEGORIES[*]} ${APX_EXPLICIT_PURGE_CATEGORIES[*]}" >&2
       return 2
+    fi
+    if [[ "$cat" == "all" ]]; then
+      local all_cat
+      for all_cat in "${APX_ALL_PURGE_CATEGORIES[@]}"; do
+        purge_add_category "$all_cat"
+      done
+    else
+      purge_add_category "$cat"
     fi
   done
 }
@@ -540,6 +585,123 @@ purge_action() {
   fi
   printf '[apx:uninstall] %s\n' "$desc"
   "$@"
+}
+
+manifest_get() {
+  local key="$1"
+  [[ -f "$INSTALL_MANIFEST_FILE" ]] || return 1
+  awk -F= -v key="$key" '
+    $1 == key {
+      sub(/^[^=]*=/, "")
+      print
+      found = 1
+    }
+    END { exit found ? 0 : 1 }
+  ' "$INSTALL_MANIFEST_FILE"
+}
+
+manifest_flag_is_one() {
+  local value
+  value="$(manifest_get "$1" 2>/dev/null || true)"
+  [[ "$value" == "1" ]]
+}
+
+safe_home_child() {
+  local path="$1" real_home real_path
+  case "$path" in
+    ""|"/"|"$HOME"|"$HOME/"|*/../*|*/..) return 1 ;;
+    "$HOME"/*) ;;
+    *) return 1 ;;
+  esac
+  real_home="$(realpath_of "$HOME")" || return 1
+  real_path="$(realpath_of "$path")" || return 1
+  [[ "$real_path" != "$real_home" && "$real_path" == "$real_home"/* ]]
+}
+
+realpath_of() {
+  python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null
+}
+
+path_has_no_symlink_ancestors() {
+  python3 - "$HOME" "$1" <<'PY'
+import os
+import sys
+
+home = os.path.abspath(sys.argv[1])
+path = os.path.abspath(sys.argv[2])
+try:
+    rel = os.path.relpath(path, home)
+except ValueError:
+    sys.exit(1)
+if rel == "." or rel.startswith(".." + os.sep) or rel == "..":
+    sys.exit(1)
+cur = home
+for part in rel.split(os.sep)[:-1]:
+    cur = os.path.join(cur, part)
+    if os.path.islink(cur):
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+safe_known_npm_cache_root() {
+  local path="$1"
+  case "$path" in
+    "$HOME/.npm"|"$HOME/.cache/npm"|"$HOME/Library/Caches/npm")
+      [[ ! -L "$path" ]]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+safe_rm_rf() {
+  local path="$1"
+  if ! safe_home_child "$path"; then
+    echo "[apx:uninstall] refusing unsafe path: $path" >&2
+    return 1
+  fi
+  if ! path_has_no_symlink_ancestors "$path"; then
+    echo "[apx:uninstall] refusing path with symlinked parent: $path" >&2
+    return 1
+  fi
+  rm -rf "$path"
+}
+
+safe_rm_file_under() {
+  local root="$1" path="$2" real_root real_path
+  if ! safe_home_child "$root" || ! safe_home_child "$path"; then
+    echo "[apx:uninstall] refusing unsafe path: $path" >&2
+    return 1
+  fi
+  if ! path_has_no_symlink_ancestors "$root"; then
+    echo "[apx:uninstall] refusing path with symlinked parent: $root" >&2
+    return 1
+  fi
+  real_root="$(realpath_of "$root")" || return 1
+  real_path="$(realpath_of "$path")" || return 1
+  case "$real_path" in
+    "$real_root"/*) rm -f "$path" ;;
+    *)
+      echo "[apx:uninstall] refusing path outside $root: $path" >&2
+      return 1
+      ;;
+  esac
+}
+
+safe_rm_rf_preserving_source() {
+  local path="$1" src="${2:-}" real_path real_src
+  if [[ -n "$src" ]]; then
+    real_path="$(realpath_of "$path")" || return 1
+    real_src="$(realpath_of "$src")" || return 1
+    case "$real_src" in
+      "$real_path"|"$real_path"/*)
+        echo "[apx:uninstall] refusing to remove $path because it contains recorded source clone $src" >&2
+        echo "[apx:uninstall]   run 'apx uninstall --purge=source' first or move the source clone" >&2
+        return 1
+        ;;
+    esac
+  fi
+  safe_rm_rf "$path"
 }
 
 confirm_purge() {
@@ -597,23 +759,23 @@ remove_completion_files() {
 source_clone_path() {
   [[ -f "$SOURCE_PATH_FILE" ]] || return 1
   local p
-  p="$(head -n 1 "$SOURCE_PATH_FILE" | tr -d '[:space:]')"
+  IFS= read -r p < "$SOURCE_PATH_FILE" || return 1
   [[ -n "$p" && -d "$p/.git" ]] || return 1
-  case "$p" in
-    "$HOME"/*) printf '%s\n' "$p" ;;
-    *) return 1 ;;
-  esac
+  safe_home_child "$p" || return 1
+  path_has_no_symlink_ancestors "$p" || return 1
+  printf '%s\n' "$p"
 }
 
 running_inside_dir() {
   # True if the currently executing apx binary (BASH_SOURCE[0]) lives under
   # the given directory. Used to refuse deleting the source clone we are
   # running from.
-  local dir="$1" real
+  local dir="$1" real real_dir
   real="$(python3 -c "import os,sys;print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}" 2>/dev/null)"
-  [[ -n "$real" ]] || return 1
+  real_dir="$(realpath_of "$dir")"
+  [[ -n "$real" && -n "$real_dir" ]] || return 1
   case "$real" in
-    "$dir"/*) return 0 ;;
+    "$real_dir"/*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -625,10 +787,105 @@ delete_source_clone() {
     echo "[apx:uninstall]   remove it manually after uninstall:  rm -rf $src"
     return 0
   fi
-  rm -rf "$src"
+  safe_rm_rf "$src"
+}
+
+stop_and_remove_plist() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    stop_service
+  else
+    launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
+  fi
+  rm -f "$PLIST_FILE"
+}
+
+pipx_uninstall_headroom_ai() {
+  command -v pipx >/dev/null 2>&1 || return 0
+  pipx uninstall headroom-ai >/dev/null 2>&1 || true
+}
+
+pipx_uninject_ast_grep() {
+  command -v pipx >/dev/null 2>&1 || return 0
+  pipx uninject headroom-ai ast-grep-cli >/dev/null 2>&1 || true
+}
+
+remove_recorded_deps() {
+  if manifest_flag_is_one HEADROOM_AI_INSTALLED; then
+    purge_action "uninstall pipx package headroom-ai" pipx_uninstall_headroom_ai
+  elif manifest_flag_is_one AST_GREP_CLI_INJECTED; then
+    # If apx injected ast-grep into a pre-existing Headroom venv, remove just
+    # that injected package rather than uninstalling the whole user-owned venv.
+    purge_action "uninject ast-grep-cli from pipx package headroom-ai" pipx_uninject_ast_grep
+  else
+    echo "[apx:uninstall] no manifest-recorded dependency installs to remove"
+  fi
+}
+
+remove_recorded_headroom_cache() {
+  local cache_dir
+  cache_dir="$(manifest_get HEADROOM_TOOLS_CACHE_DIR 2>/dev/null || true)"
+  [[ -n "$cache_dir" ]] || return 0
+  if [[ "$cache_dir" != "$HOME/Library/Caches/headroom/bin" ]]; then
+    echo "[apx:uninstall] refusing unexpected Headroom helper cache path: $cache_dir" >&2
+    return 1
+  fi
+  purge_action "remove Headroom helper cache $cache_dir" safe_rm_rf "$cache_dir"
+}
+
+remove_recorded_npm_tarball() {
+  local key="$1" desc="$2" npm_cache="$3" path
+  path="$(manifest_get "$key" 2>/dev/null || true)"
+  [[ -n "$path" ]] || return 0
+  case "$path" in
+    "$npm_cache/_cacache/content-v2/sha512/"*)
+      purge_action "remove cached npm tarball for $desc" safe_rm_file_under "$npm_cache/_cacache/content-v2/sha512" "$path"
+      ;;
+    *)
+      echo "[apx:uninstall] refusing unexpected npm cache path for $desc: $path" >&2
+      return 1
+      ;;
+  esac
+}
+
+remove_recorded_npx_dirs() {
+  local npm_cache="$1" package="$2" dir
+  [[ -d "$npm_cache/_npx" ]] || return 0
+  for dir in "$npm_cache/_npx"/*; do
+    [[ -d "$dir" ]] || continue
+    if [[ -d "$dir/node_modules/$package" ]]; then
+      purge_action "remove npx temp install for $package at $dir" safe_rm_rf "$dir"
+    fi
+  done
+}
+
+remove_recorded_npm_cache() {
+  local npm_cache
+  npm_cache="$(manifest_get NPM_CACHE_DIR 2>/dev/null || true)"
+  [[ -n "$npm_cache" ]] || return 0
+  if ! safe_known_npm_cache_root "$npm_cache"; then
+    echo "[apx:uninstall] refusing unsafe npm cache path: $npm_cache" >&2
+    return 1
+  fi
+  if manifest_flag_is_one NPM_WARMED_PXPIPE_PROXY || manifest_flag_is_one NPM_WARMED_SQUEEZR_AI; then
+    remove_recorded_npm_tarball NPM_PXPIPE_PROXY_CACHE_PATH pxpipe-proxy "$npm_cache"
+    remove_recorded_npm_tarball NPM_SQUEEZR_AI_CACHE_PATH squeezr-ai "$npm_cache"
+    remove_recorded_npx_dirs "$npm_cache" pxpipe-proxy
+    remove_recorded_npx_dirs "$npm_cache" squeezr-ai
+  else
+    echo "[apx:uninstall] no manifest-recorded npm prewarm cache to remove"
+  fi
+}
+
+remove_recorded_caches() {
+  remove_recorded_headroom_cache
+  remove_recorded_npm_cache
 }
 
 do_uninstall_service_only() {
+  if [[ "${APX_DRY_RUN:-0}" == "1" ]]; then
+    purge_action "stop LaunchAgent and remove $PLIST_FILE" :
+    return 0
+  fi
   # stop_service touches config-derived ports; the config may already be gone.
   if [[ -f "$CONFIG_FILE" ]]; then
     load_config
@@ -642,13 +899,48 @@ do_uninstall_service_only() {
   echo "Run 'apx uninstall --purge' to remove everything."
 }
 
-do_uninstall_purge() {
-  # Always stop the service first so nothing races the deletions.
-  if [[ -f "$CONFIG_FILE" ]]; then
-    purge_action "stop service and remove plist" bash -c "'$0' stop >/dev/null 2>&1 || true; rm -f '$PLIST_FILE'"
-  else
-    purge_action "bootout LaunchAgent (config missing)" bash -c "launchctl bootout '$(launchd_domain)' '$PLIST_FILE' >/dev/null 2>&1 || true; rm -f '$PLIST_FILE'"
+enforce_default_purge_roots() {
+  # Refuse env overrides that would let 'apx uninstall --purge' recursively
+  # delete arbitrary directories. The user must unset APX_SHARE/APX_STATE/
+  # APX_CONFIG for uninstall; they only affect discovery of apx's own paths.
+  local expected_share="$HOME/.local/share/apx"
+  local expected_state="$HOME/.local/state/apx"
+  local expected_config_dir="$HOME/.config/apx"
+  local bad=()
+  [[ "$SHARE_DIR" == "$expected_share" ]] || bad+=("SHARE_DIR=$SHARE_DIR (expected $expected_share)")
+  [[ "$STATE_DIR" == "$expected_state" ]] || bad+=("STATE_DIR=$STATE_DIR (expected $expected_state)")
+  [[ "$CONFIG_DIR" == "$expected_config_dir" ]] || bad+=("CONFIG_DIR=$CONFIG_DIR (expected $expected_config_dir)")
+  if (( ${#bad[@]} > 0 )); then
+    echo "[apx:uninstall] refusing purge: paths are not the default apx layout" >&2
+    local b
+    for b in "${bad[@]}"; do echo "[apx:uninstall]   $b" >&2; done
+    echo "[apx:uninstall] unset APX_SHARE / APX_STATE / APX_CONFIG and rerun" >&2
+    return 2
   fi
+  return 0
+}
+
+do_uninstall_purge() {
+  if ! enforce_default_purge_roots; then
+    return 2
+  fi
+
+  local recorded_src=""
+  recorded_src="$(source_clone_path 2>/dev/null || true)"
+
+  # The install manifest lives under $STATE_DIR. If the user purges state
+  # without also purging deps/caches, a follow-up 'apx uninstall
+  # --purge=deps,caches' will find no manifest and silently no-op.
+  if purge_has state && ! purge_has deps && ! purge_has caches; then
+    if [[ -f "$INSTALL_MANIFEST_FILE" ]]; then
+      echo "[apx:uninstall] note: --purge=state will remove $INSTALL_MANIFEST_FILE" >&2
+      echo "[apx:uninstall]   to also clean recorded dependency installs and caches, use:" >&2
+      echo "[apx:uninstall]   apx uninstall --purge=all,deps,caches --yes" >&2
+    fi
+  fi
+
+  # Always stop the service first so nothing races the deletions.
+  purge_action "stop service and remove plist" stop_and_remove_plist
 
   if purge_has claude; then
     purge_action "remove ANTHROPIC_BASE_URL from $CLAUDE_SETTINGS_FILE" remove_from_claude_settings
@@ -656,20 +948,23 @@ do_uninstall_purge() {
   if purge_has completions; then
     purge_action "remove installed shell completion files" remove_completion_files
   fi
+  if purge_has deps; then
+    remove_recorded_deps
+  fi
+  if purge_has caches; then
+    remove_recorded_caches
+  fi
   if purge_has share; then
-    purge_action "remove $SHARE_DIR" rm -rf "$SHARE_DIR"
+    purge_action "remove $SHARE_DIR" safe_rm_rf_preserving_source "$SHARE_DIR" "$recorded_src"
   fi
   if purge_has state; then
-    purge_action "remove $STATE_DIR" rm -rf "$STATE_DIR"
+    purge_action "remove $STATE_DIR" safe_rm_rf_preserving_source "$STATE_DIR" "$recorded_src"
   fi
   if purge_has config; then
-    purge_action "remove $CONFIG_DIR" rm -rf "$CONFIG_DIR"
+    purge_action "remove $CONFIG_DIR" safe_rm_rf_preserving_source "$CONFIG_DIR" "$recorded_src"
   fi
-  if purge_has source; then
-    local src
-    if src="$(source_clone_path)"; then
-      purge_action "remove source clone $src" delete_source_clone "$src"
-    fi
+  if purge_has source && [[ -n "$recorded_src" ]]; then
+    purge_action "remove source clone $recorded_src" delete_source_clone "$recorded_src"
   fi
   if purge_has binaries; then
     # Remove the CLI last so any prior category deletions can still shell out
@@ -682,7 +977,11 @@ do_uninstall_purge() {
 
   if [[ "${APX_DRY_RUN:-0}" != "1" ]]; then
     echo "apx uninstalled (categories: ${APX_PURGE_CATS[*]})."
-    echo "Anything owned by other tools (Headroom, pxpipe, Squeezr, CA bundle, tiktoken cache) was preserved."
+    if purge_has deps || purge_has caches; then
+      echo "Optional dependency/cache cleanup only used manifest-recorded resources."
+    else
+      echo "Dependency installs and caches were preserved. Add --purge=all,deps,caches to remove manifest-recorded extras."
+    fi
   fi
 }
 
@@ -726,13 +1025,20 @@ usage: apx uninstall [--purge[=cats]] [--dry-run] [--yes]
                           Binaries, config, state, and Claude settings stay.
   --purge                 Remove everything apx owns:
                             ${APX_ALL_PURGE_CATEGORIES[*]}
-  --purge=cats            Remove only the listed categories (comma-separated).
-                          Available: ${APX_ALL_PURGE_CATEGORIES[*]}
+  --purge=cats            Stop service/remove plist, then remove the listed
+                          categories (comma-separated).
+                          Available: all ${APX_ALL_PURGE_CATEGORIES[*]} ${APX_EXTERNAL_PURGE_CATEGORIES[*]} ${APX_EXPLICIT_PURGE_CATEGORIES[*]}
   --dry-run               Print planned actions; make no changes.
   --yes, -y               Skip the interactive confirmation.
 
-Never touched: ~/.headroom, ~/.squeezr, ~/.certs, ~/.cache/tiktoken, and
-everything else apx does not own.
+Plain --purge excludes dependency installs and caches. Add explicit categories:
+  --purge=deps            Remove manifest-recorded dependency installs.
+  --purge=caches          Remove manifest-recorded install/prewarm caches.
+  --purge=all,deps,caches Remove apx-owned files plus recorded extras.
+  --purge=source          Remove the recorded source clone when safe.
+
+Never removed: Homebrew, Node/npm/npx, pipx, uv, global npm packages,
+unrelated pipx apps, ~/.headroom, ~/.squeezr, ~/.certs, ~/.cache/tiktoken.
 EOF
 }
 
@@ -2043,6 +2349,7 @@ print_completions() {
   local chain_subs="get set clear ls preset help"
   local services="headroom pxpipe squeezr"
   local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
+  local purge_flags="--purge --purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches --dry-run --yes -y --help"
   case "$shell" in
     bash)
       cat <<BASH
@@ -2063,7 +2370,7 @@ _apx_completions() {
     chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
     completions) COMPREPLY=( \$(compgen -W "bash zsh fish install uninstall" -- "\$cur") ) ;;
-    uninstall) COMPREPLY=( \$(compgen -W "--purge --dry-run --yes" -- "\$cur") ) ;;
+    uninstall) COMPREPLY=( \$(compgen -W "$purge_flags" -- "\$cur") ) ;;
     update)   COMPREPLY=( \$(compgen -W "--to --to-latest --force --dry-run" -- "\$cur") ) ;;
   esac
 }
@@ -2094,7 +2401,7 @@ ZSH
     chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
     completions) _values 'action' 'bash' 'zsh' 'fish' 'install' 'uninstall' ;;
-    uninstall) _values 'flag' '--purge' '--dry-run' '--yes' ;;
+    uninstall) _values 'flag' '--purge' '--purge=all' '--purge=binaries' '--purge=share' '--purge=state' '--purge=config' '--purge=claude' '--purge=completions' '--purge=source' '--purge=deps' '--purge=caches' '--purge=all,deps,caches' '--dry-run' '--yes' '-y' '--help' ;;
     update) _values 'flag' '--to[git ref]' '--to-latest' '--force' '--dry-run' ;;
   esac
 }
@@ -2125,6 +2432,8 @@ FISH
       cat <<'FISH'
 complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install uninstall"
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -l purge -l dry-run -l yes
+complete -c apx -n "__fish_seen_subcommand_from uninstall" -s y -l help
+complete -c apx -n "__fish_seen_subcommand_from uninstall" -a "--purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches"
 complete -c apx -n "__fish_seen_subcommand_from update" -l to -l to-latest -l force -l dry-run
 FISH
       ;;
@@ -2259,7 +2568,7 @@ Commands:
   chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
   doctor               Show status plus dependency diagnostics
   install              Install/start macOS LaunchAgent with KeepAlive
-  uninstall [--purge]  Stop and remove LaunchAgent; --purge also removes files
+  uninstall [--purge]  Stop and remove LaunchAgent; --purge removes apx-owned files
   supervisor           Internal foreground supervisor for launchd
   logs [name]          Follow logs: all, supervisor, gateway, pxpipe, squeezr, headroom, headroom.proxy, launchd.*
   urls                 Print dashboard, health, and stats URLs
