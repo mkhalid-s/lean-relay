@@ -8,7 +8,7 @@ Claude Code -> apx Gateway :8787 -> Headroom / pxpipe / Squeezr / Anthropic
 
 Claude Code always talks to the Gateway. You can switch modes without changing Claude's base URL.
 
-> The CLI, gateway, and squeezr helper are named `apx`, `apx-gateway`, and `apx-squeezr`. Old `ai-proxy-stack` / `ai-proxy-gateway` / `ai-proxy-squeezr-foreground` commands remain installed as deprecation shims that forward to the new binaries.
+> The CLI, gateway, and squeezr helper are named `apx`, `apx-gateway`, and `apx-squeezr`. No legacy `ai-proxy-stack*` shims are installed.
 
 ## Quick Install
 
@@ -247,10 +247,19 @@ apx uninstall --purge --dry-run     # preview a full removal
 apx uninstall --purge --yes         # remove binaries, config, state, share,
                                     # completions, and ANTHROPIC_BASE_URL from
                                     # ~/.claude/settings.json
-apx uninstall --purge=state,logs    # remove selectively
+apx uninstall --purge=state         # remove selectively
+apx uninstall --purge=deps --dry-run
+apx uninstall --purge=caches --dry-run
+apx uninstall --purge=all,deps,caches --yes
 ```
 
-`--purge` categories: `binaries`, `share`, `state`, `config`, `claude`, `completions`, `source`. Anything owned by other tools (`~/.headroom`, `~/.squeezr`, `~/.certs`, `~/.cache/tiktoken`, ...) is never touched. `--purge=source` refuses to delete the source clone if the running `apx` binary lives inside it, and prints the exact `rm -rf` command to run manually.
+Any `--purge...` invocation first stops apx and removes its LaunchAgent plist, then removes the selected categories. Plain `--purge` removes apx-owned files: `binaries`, `share`, `state`, `config`, `claude`, and `completions`. The `source`, `deps`, and `caches` categories are explicit opt-ins.
+
+- `deps` removes dependency installs apx recorded creating, currently the `headroom-ai` pipx app and any apx-recorded `ast-grep-cli` injection.
+- `caches` removes manifest-gated install/prewarm caches, currently Headroom helper binaries, cached npm tarballs, and matching npx temp installs for `pxpipe-proxy` / `squeezr-ai`.
+- `source` removes the recorded source clone only when the path is safe and the running `apx` binary is not inside it.
+
+Run `--dry-run` first to see exact paths and commands. apx never removes Homebrew, Node/npm/npx, pipx, uv, global npm packages, unrelated pipx apps, `~/.headroom`, `~/.squeezr`, `~/.certs`, or `~/.cache/tiktoken`.
 
 Debug everything at once:
 
@@ -293,9 +302,6 @@ Source files live in this repository. The running LaunchAgent uses home-director
 ~/.local/bin/apx
 ~/.local/bin/apx-gateway
 ~/.local/bin/apx-squeezr
-~/.local/bin/ai-proxy-stack            # deprecation shim -> apx
-~/.local/bin/ai-proxy-gateway          # deprecation shim -> apx-gateway
-~/.local/bin/ai-proxy-squeezr-foreground   # deprecation shim -> apx-squeezr
 ~/.config/apx/config.env
 ~/.local/state/apx/
 ~/.local/share/apx/dashboard.html

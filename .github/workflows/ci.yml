@@ -194,13 +194,174 @@ jobs:
           count=$(ls "$FAKE_HOME/.local/share/apx/versions" | wc -l | tr -d ' ')
           test "$count" = "1"
 
+      - name: Uninstall deps/caches uses manifest and preserves plain purge safety
+        run: |
+          stub_dir="$RUNNER_TEMP/apx-stubs"
+          rm -rf "$stub_dir"
+          mkdir -p "$stub_dir" \
+                   "$FAKE_HOME/.local/state/apx" \
+                   "$FAKE_HOME/.local/pipx/venvs/headroom-ai" \
+                   "$FAKE_HOME/Library/Caches/headroom/bin" \
+                   "$FAKE_HOME/.npm/_npx/px/node_modules/pxpipe-proxy" \
+                   "$FAKE_HOME/.npm/_npx/sq/node_modules/squeezr-ai" \
+                   "$FAKE_HOME/.npm/_npx/keep/node_modules/other-package" \
+                   "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb" \
+                   "$FAKE_HOME/.npm/_logs"
+          touch "$FAKE_HOME/Library/Caches/headroom/bin/difft"
+          touch "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/pxpipe"
+          touch "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/squeezr"
+          touch "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/other"
+          touch "$FAKE_HOME/.npm/_logs/log"
+          echo keep > "$FAKE_HOME/.npm/keep"
+
+          cat > "$stub_dir/pipx" <<'SH'
+          #!/usr/bin/env bash
+          echo "$*" >> "$HOME/pipx.log"
+          if [ "${1:-}" = "uninstall" ] && [ "${2:-}" = "headroom-ai" ]; then
+            rm -rf "$HOME/.local/pipx/venvs/headroom-ai"
+          fi
+          if [ "${1:-}" = "uninject" ] && [ "${2:-}" = "headroom-ai" ] && [ "${3:-}" = "ast-grep-cli" ]; then
+            echo "uninject-ok" >> "$HOME/pipx.log"
+          fi
+          exit 0
+          SH
+          chmod +x "$stub_dir/pipx"
+
+          cat > "$FAKE_HOME/.local/state/apx/install-manifest.env" <<EOF
+          APX_INSTALL_MANIFEST_VERSION=1
+          HEADROOM_AI_INSTALLED=1
+          AST_GREP_CLI_INJECTED=1
+          HEADROOM_TOOLS_CACHE_DIR=$FAKE_HOME/Library/Caches/headroom/bin
+          NPM_CACHE_DIR=$FAKE_HOME/.npm
+          NPM_WARMED_PXPIPE_PROXY=1
+          NPM_WARMED_SQUEEZR_AI=1
+          NPM_PXPIPE_PROXY_CACHE_PATH=$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/pxpipe
+          NPM_SQUEEZR_AI_CACHE_PATH=$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/squeezr
+          EOF
+
+          APX_PATH="$stub_dir:$FAKE_HOME/.local/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+            HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge=deps,caches --dry-run
+          test -d "$FAKE_HOME/.local/pipx/venvs/headroom-ai"
+          test -d "$FAKE_HOME/Library/Caches/headroom/bin"
+          test -d "$FAKE_HOME/.npm/_npx"
+          test ! -f "$FAKE_HOME/pipx.log"
+
+          if APX_PATH="$stub_dir:$FAKE_HOME/.local/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+            HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge=bogus --dry-run; then
+            echo "unknown purge category unexpectedly succeeded" >&2
+            exit 1
+          fi
+
+          cat > "$FAKE_HOME/.local/state/apx/install-manifest.env" <<EOF
+          APX_INSTALL_MANIFEST_VERSION=1
+          AST_GREP_CLI_INJECTED=1
+          EOF
+          rm -f "$FAKE_HOME/pipx.log"
+          APX_PATH="$stub_dir:$FAKE_HOME/.local/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+            HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge=deps --yes
+          grep -q "uninject headroom-ai ast-grep-cli" "$FAKE_HOME/pipx.log"
+          ! grep -q "uninstall headroom-ai" "$FAKE_HOME/pipx.log"
+          test -d "$FAKE_HOME/.local/pipx/venvs/headroom-ai"
+
+          cat > "$FAKE_HOME/.local/state/apx/install-manifest.env" <<EOF
+          APX_INSTALL_MANIFEST_VERSION=1
+          HEADROOM_AI_INSTALLED=1
+          AST_GREP_CLI_INJECTED=1
+          HEADROOM_TOOLS_CACHE_DIR=$FAKE_HOME/Library/Caches/headroom/bin
+          NPM_CACHE_DIR=$FAKE_HOME/.npm
+          NPM_WARMED_PXPIPE_PROXY=1
+          NPM_WARMED_SQUEEZR_AI=1
+          NPM_PXPIPE_PROXY_CACHE_PATH=$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/pxpipe
+          NPM_SQUEEZR_AI_CACHE_PATH=$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/squeezr
+          EOF
+          rm -f "$FAKE_HOME/pipx.log"
+          APX_PATH="$stub_dir:$FAKE_HOME/.local/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+            HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge=deps,caches --yes
+          grep -q "uninstall headroom-ai" "$FAKE_HOME/pipx.log"
+          ! grep -q "uninject headroom-ai" "$FAKE_HOME/pipx.log"
+          test ! -d "$FAKE_HOME/.local/pipx/venvs/headroom-ai"
+          test ! -d "$FAKE_HOME/Library/Caches/headroom/bin"
+          test ! -d "$FAKE_HOME/.npm/_npx/px"
+          test ! -d "$FAKE_HOME/.npm/_npx/sq"
+          test -d "$FAKE_HOME/.npm/_npx/keep"
+          test ! -f "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/pxpipe"
+          test ! -f "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/squeezr"
+          test -f "$FAKE_HOME/.npm/_cacache/content-v2/sha512/aa/bb/other"
+          test -d "$FAKE_HOME/.npm/_logs"
+          test -f "$FAKE_HOME/.npm/keep"
+          test -L "$FAKE_HOME/.local/bin/apx"
+
+          mkdir -p "$FAKE_HOME/.local/state/apx" "$FAKE_HOME/elsewhere/bin"
+          rm -rf "$FAKE_HOME/Library/Caches/headroom"
+          ln -s "$FAKE_HOME/elsewhere" "$FAKE_HOME/Library/Caches/headroom"
+          cat > "$FAKE_HOME/.local/state/apx/install-manifest.env" <<EOF
+          APX_INSTALL_MANIFEST_VERSION=1
+          HEADROOM_TOOLS_CACHE_DIR=$FAKE_HOME/Library/Caches/headroom/bin
+          EOF
+          if APX_PATH="$stub_dir:$FAKE_HOME/.local/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin" \
+            HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge=caches --yes; then
+            echo "symlinked cache path unexpectedly succeeded" >&2
+            exit 1
+          fi
+          test -d "$FAKE_HOME/elsewhere/bin"
+
       - name: Uninstall --purge cleans the versioned layout
         run: |
+          mkdir -p "$FAKE_HOME/apx-src/.git"
+          echo "$FAKE_HOME/apx-src" > "$FAKE_HOME/.config/apx/source.path"
           HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge --yes
           test ! -e "$FAKE_HOME/.local/bin/apx"
           test ! -e "$FAKE_HOME/.local/share/apx/current"
           test ! -d "$FAKE_HOME/.local/share/apx/versions"
           test ! -f "$FAKE_HOME/.config/apx/install.mode"
+          test -d "$FAKE_HOME/apx-src/.git"
+
+      - name: Plain purge refuses to delete a recorded source clone inside apx roots
+        run: |
+          rm -rf "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME/.config/apx" "$FAKE_HOME/.local/share/apx/src/.git"
+          cp bin/apx "$FAKE_HOME/.local/bin-apx"
+          chmod +x "$FAKE_HOME/.local/bin-apx"
+          echo "$FAKE_HOME/.local/share/apx/src" > "$FAKE_HOME/.config/apx/source.path"
+          if HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin-apx" uninstall --purge --yes; then
+            echo "plain purge unexpectedly removed a root containing source clone" >&2
+            exit 1
+          fi
+          test -d "$FAKE_HOME/.local/share/apx/src/.git"
+
+      - name: Non-default APX_SHARE/APX_STATE/APX_CONFIG is refused by --purge
+        run: |
+          rm -rf "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME/Documents/precious" "$FAKE_HOME/.config/apx"
+          touch "$FAKE_HOME/Documents/precious/keep.txt"
+          cp bin/apx "$FAKE_HOME/.local/bin-apx"
+          chmod +x "$FAKE_HOME/.local/bin-apx"
+          set +e
+          HOME="$FAKE_HOME" APX_SHARE="$FAKE_HOME/Documents/precious" \
+            "$FAKE_HOME/.local/bin-apx" uninstall --purge=share --yes
+          rc=$?
+          set -e
+          test "$rc" = 2
+          test -f "$FAKE_HOME/Documents/precious/keep.txt"
+          # APX_STATE / APX_CONFIG rejected the same way
+          set +e
+          HOME="$FAKE_HOME" APX_STATE="$FAKE_HOME/Documents/precious" \
+            "$FAKE_HOME/.local/bin-apx" uninstall --purge=state --yes
+          rc=$?
+          set -e
+          test "$rc" = 2
+
+      - name: Invalid APX_LABEL is refused at load
+        run: |
+          rm -rf "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME"
+          cp bin/apx "$FAKE_HOME/.local/bin-apx"
+          chmod +x "$FAKE_HOME/.local/bin-apx"
+          set +e
+          HOME="$FAKE_HOME" APX_LABEL='../../.zshrc' "$FAKE_HOME/.local/bin-apx" help
+          rc=$?
+          set -e
+          test "$rc" = 2
 
   # ── 4) PR guard: if VERSION changed, require a CHANGELOG entry ──────────
   changelog:
