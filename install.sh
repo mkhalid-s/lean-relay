@@ -18,6 +18,7 @@ RUNTIME_CONFIG="$RUNTIME_CONFIG_DIR/config.env"
 RUNTIME_SOURCE_PATH_FILE="$RUNTIME_CONFIG_DIR/source.path"
 RUNTIME_STATE="$HOME/.local/state/apx"
 RUNTIME_VERSION_FILE="$RUNTIME_STATE/VERSION"
+RUNTIME_INSTALL_MANIFEST="$RUNTIME_STATE/install-manifest.env"
 RUNTIME_SHARE_DIR="$HOME/.local/share/apx"
 RUNTIME_DASHBOARD_HTML="$RUNTIME_SHARE_DIR/dashboard.html"
 
@@ -48,9 +49,11 @@ Options:
   --no-start     Sync runtime files but do not install/start the LaunchAgent
   --skip-deps    Skip dependency installation
   --check-only   Print checks/actions without changing anything
-  --uninstall    Stop the LaunchAgent and remove runtime binaries only
-  --purge        Uninstall service and delete config, state, and dashboard
-                 files. Preserves anything owned by other tools.
+  --uninstall    Delegate to 'apx uninstall' when available (service-only).
+  --purge        Delegate to 'apx uninstall --purge --yes' when available.
+                 Plain purge removes apx-owned files only; use
+                 'apx uninstall --purge=all,deps,caches --dry-run' for
+                 explicit dependency/cache cleanup while the CLI exists.
   --from-payload Internal: called by the self-extracting apx.sh installer.
                  Skips git-clone bookkeeping and points APX_ROOT at
                  ~/.local/share/apx/current.
@@ -171,6 +174,60 @@ install_if_missing() {
   run_step "install $desc" "$@"
 }
 
+pipx_has_package() {
+  local package="$1"
+  have pipx || return 1
+  pipx list --short 2>/dev/null | awk '{print $1}' | grep -qx "$package"
+}
+
+manifest_set() {
+  local key="$1" value="$2" tmp
+  [[ "$CHECK_ONLY" == "1" ]] && return 0
+  mkdir -p "$RUNTIME_STATE"
+  tmp="$(mktemp)"
+  if [[ -f "$RUNTIME_INSTALL_MANIFEST" ]]; then
+    awk -F= -v key="$key" -v value="$value" '
+      BEGIN { done = 0 }
+      $1 == key { print key "=" value; done = 1; next }
+      { print }
+      END { if (!done) print key "=" value }
+    ' "$RUNTIME_INSTALL_MANIFEST" > "$tmp"
+  else
+    {
+      printf 'APX_INSTALL_MANIFEST_VERSION=1\n'
+      printf '%s=%s\n' "$key" "$value"
+    } > "$tmp"
+  fi
+  mv "$tmp" "$RUNTIME_INSTALL_MANIFEST"
+}
+
+npm_cache_content_path() {
+  local cache_dir="$1" integrity="$2"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$cache_dir" "$integrity" <<'PY'
+import base64
+import os
+import sys
+
+cache_dir, integrity = sys.argv[1], sys.argv[2]
+if not integrity.startswith("sha512-"):
+    sys.exit(1)
+raw = base64.b64decode(integrity.split("-", 1)[1])
+digest = raw.hex()
+print(os.path.join(cache_dir, "_cacache", "content-v2", "sha512", digest[:2], digest[2:4], digest[4:]))
+PY
+}
+
+record_npm_cache_path() {
+  local spec="$1" key="$2" cache_dir="$3" integrity path
+  [[ -n "$cache_dir" ]] || return 0
+  integrity="$(npm view "$spec" dist.integrity 2>/dev/null | tr -d '[:space:]' || true)"
+  [[ -n "$integrity" ]] || return 0
+  path="$(npm_cache_content_path "$cache_dir" "$integrity" 2>/dev/null || true)"
+  [[ -n "$path" ]] || return 0
+  manifest_set "$key" "$path"
+}
+
 install_deps() {
   if [[ "$SKIP_DEPS" == "1" ]]; then
     log "skipping dependency installation"
@@ -178,6 +235,7 @@ install_deps() {
   fi
 
   require_brew_for_deps
+  manifest_set APX_INSTALL_MANIFEST_VERSION 1
 
   install_if_missing pipx "pipx" brew install pipx
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -188,8 +246,17 @@ install_deps() {
     log "Node.js/npm/npx already available"
   fi
 
-  if ! have headroom; then
+  local headroom_preexisting=0
+  if have headroom || pipx_has_package headroom-ai; then
+    headroom_preexisting=1
+  fi
+  if ! have headroom && ! pipx_has_package headroom-ai; then
     run_step "install headroom-ai proxy" pipx install "headroom-ai[proxy]"
+    if (( headroom_preexisting == 0 )) && pipx_has_package headroom-ai; then
+      manifest_set HEADROOM_AI_INSTALLED 1
+    fi
+  elif ! have headroom; then
+    log "headroom-ai already installed via pipx; run 'pipx ensurepath' if headroom is not on PATH"
   else
     log "Headroom already available: $(command -v headroom)"
   fi
@@ -198,6 +265,7 @@ install_deps() {
     run_step "ensure headroom-ai code extras" pipx runpip headroom-ai install "headroom-ai[code]"
     if ! have ast-grep && ! have sg; then
       run_step "install ast-grep-cli into headroom environment" pipx inject headroom-ai ast-grep-cli --include-apps --force
+      manifest_set AST_GREP_CLI_INJECTED 1
     else
       log "ast-grep already available"
     fi
@@ -205,13 +273,23 @@ install_deps() {
 
   if have headroom; then
     run_step "install Headroom helper tools" headroom tools install --tool difft --tool scc
+    manifest_set HEADROOM_TOOLS_CACHE_DIR "$HOME/Library/Caches/headroom/bin"
   else
     warn "headroom command is not on PATH yet; restart your shell or rerun after pipx ensurepath"
   fi
 
   if have npm; then
+    local npm_cache
+    npm_cache="$(npm config get cache 2>/dev/null || true)"
+    if [[ -n "$npm_cache" ]]; then
+      manifest_set NPM_CACHE_DIR "$npm_cache"
+    fi
     run_step "prewarm pxpipe-proxy npm cache" npm cache add pxpipe-proxy@0.8.0
+    manifest_set NPM_WARMED_PXPIPE_PROXY 1
+    record_npm_cache_path pxpipe-proxy@0.8.0 NPM_PXPIPE_PROXY_CACHE_PATH "$npm_cache"
     run_step "prewarm squeezr-ai npm cache" npm cache add squeezr-ai
+    manifest_set NPM_WARMED_SQUEEZR_AI 1
+    record_npm_cache_path squeezr-ai NPM_SQUEEZR_AI_CACHE_PATH "$npm_cache"
   else
     warn "npm is not available; pxpipe-proxy and squeezr-ai will be fetched by npx on first start"
   fi
