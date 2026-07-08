@@ -4,7 +4,11 @@ All notable changes to apx are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-07-08
+
+_Initial public release. `v0.1` was never published; all pre-release work
+(rebrand to `apx`, unified dashboard, gateway v0.2, chain routing, single-file
+distribution) ships together as `0.1.0`._
 
 ### Fixed (round-2 review swarm)
 
@@ -289,9 +293,7 @@ All notable changes to apx are documented here. The format follows
   and `bin/apx-gateway` (`_current_mode`, `_chain_hops`). Both now compute
   routing from a single `APX_CHAIN` list plus a small service registry.
 
-## [0.1.0] - 2026-07-07
-
-### Added
+### Added (foundational)
 
 - Rebranded to `apx`. Commands are `apx`, `apx-gateway`, `apx-squeezr`;
   legacy `ai-proxy-stack*` binaries remain as deprecation shims.
