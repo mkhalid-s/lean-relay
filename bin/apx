@@ -20,6 +20,13 @@ STATE_DIR="${APX_STATE:-$HOME/.local/state/apx}"
 VERSION_FILE="$STATE_DIR/VERSION"
 SHARE_DIR="${APX_SHARE:-$HOME/.local/share/apx}"
 DASHBOARD_HTML="${APX_DASHBOARD_HTML:-$SHARE_DIR/dashboard.html}"
+# Versioned release-mode layout produced by the self-extracting apx.sh
+# installer. In dev mode these paths do not exist.
+VERSIONS_DIR="$SHARE_DIR/versions"
+CURRENT_LINK="$SHARE_DIR/current"
+INSTALL_MODE_FILE="$CONFIG_DIR/install.mode"
+RELEASE_ASSET_URL="${APX_RELEASE_ASSET_URL:-https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh}"
+RELEASE_ASSET_SHA_URL="${APX_RELEASE_ASSET_SHA_URL:-${RELEASE_ASSET_URL}.sha256}"
 RUN_DIR="$STATE_DIR/run"
 LOG_DIR="$STATE_DIR/logs"
 UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}"
@@ -1300,18 +1307,25 @@ remote_version() {
 }
 
 show_version() {
-  local installed local_repo local_ver
+  local installed local_repo local_ver mode
   installed="$(read_installed_version)"
   local_repo="$(read_source_repo)"
+  mode="$(read_install_mode)"
   echo "installed version: $installed"
-  if [[ -n "$local_repo" && -d "$local_repo/.git" ]]; then
+  echo "install mode:      ${mode:-unknown}"
+  if [[ "$mode" == "release" ]]; then
+    local tag; tag="$(current_version_tag)"
+    echo "current symlink:   $CURRENT_LINK -> versions/${tag:-?}"
+    echo "update channel:    $RELEASE_ASSET_URL"
+  elif [[ -n "$local_repo" && -d "$local_repo/.git" ]]; then
     local_ver="$(git -C "$local_repo" describe --tags --always --dirty 2>/dev/null || echo unknown)"
     echo "source repo:       $local_repo"
     echo "source git rev:    $local_ver"
+    echo "update channel:    $UPDATE_REPO_URL ($UPDATE_REPO_BRANCH)"
   else
-    echo "source repo:       (unknown; set via reinstall from a git clone)"
+    echo "source repo:       (unknown; run install.sh from a git clone or install via apx.sh)"
+    echo "update channel:    $UPDATE_REPO_URL ($UPDATE_REPO_BRANCH)"
   fi
-  echo "update channel:    $UPDATE_REPO_URL ($UPDATE_REPO_BRANCH)"
 }
 
 check_updates() {
@@ -1329,6 +1343,39 @@ check_updates() {
 }
 
 do_update() {
+  # Peek at --help before deciding which branch to invoke so `apx update --help`
+  # gives a unified answer regardless of install mode.
+  local a
+  for a in "$@"; do
+    case "$a" in
+      -h|--help)
+        cat <<EOF
+Usage: apx update [--to <ref>|--to-latest] [--force] [--dry-run]
+
+Release-mode (apx.sh):
+  --to <tag>    Install a specific release tag (e.g. v0.2.0).
+  --to-latest   Install the latest release (default).
+  --force       Reinstall even if already at the latest version.
+  --dry-run     Fetch and verify; show version delta; do not install.
+
+Dev-mode (git clone):
+  --to <ref>    Check out a branch, tag, or SHA before reinstalling.
+  --to-latest   Alias for --to $UPDATE_REPO_BRANCH.
+  --force       git reset --hard the source clone; discards local edits.
+  --dry-run     Fetch and show what would change; do not modify anything.
+EOF
+        return 0
+        ;;
+    esac
+  done
+
+  local mode; mode="$(read_install_mode)"
+  if [[ "$mode" == "release" ]]; then
+    do_update_release "$@"
+    return $?
+  fi
+
+  # Fall through to dev-mode (git clone) update.
   local repo installer force=0 target_ref="" dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1337,18 +1384,6 @@ do_update() {
       --to=*) target_ref="${1#--to=}" ;;
       --to-latest) target_ref="$UPDATE_REPO_BRANCH" ;;
       --dry-run) dry_run=1 ;;
-      -h|--help)
-        cat <<EOF
-Usage: apx update [--to <ref>|--to-latest] [--force] [--dry-run]
-
-  --to <ref>    Check out a branch, tag, or SHA before reinstalling.
-  --to-latest   Alias for --to $UPDATE_REPO_BRANCH.
-  --force       git reset --hard the source clone before pulling; discards
-                any local changes made inside the source repo.
-  --dry-run     Fetch and show what would change; do not modify anything.
-EOF
-        return 0
-        ;;
       *) echo "unknown option: $1" >&2; return 2 ;;
     esac
     shift
@@ -1445,15 +1480,16 @@ EOF
   echo "  restart:      done (LaunchAgent reloaded)"
   if command -v apx >/dev/null 2>&1; then
     # Warn if any installed completion file is older than the CLI binary.
+    # `stat -c %Y` is GNU, `stat -f %m` is BSD; try both.
     local cli_time f stale=0
-    cli_time="$(stat -f %m "$HOME/.local/bin/apx" 2>/dev/null || echo 0)"
+    cli_time="$(mtime_of "$HOME/.local/bin/apx")"
     for f in \
       "$HOME/.local/share/bash-completion/completions/apx" \
       "$HOME/.zfunc/_apx" \
       "$HOME/.config/fish/completions/apx.fish"; do
       if [[ -f "$f" ]]; then
         local ft
-        ft="$(stat -f %m "$f" 2>/dev/null || echo 0)"
+        ft="$(mtime_of "$f")"
         if (( ft < cli_time )); then stale=1; fi
       fi
     done
@@ -1463,9 +1499,546 @@ EOF
   fi
 }
 
+mtime_of() {
+  # Portable epoch-seconds mtime lookup. GNU coreutils on Linux uses `-c %Y`,
+  # BSD stat on macOS uses `-f %m`. Try each and fall back to 0 so callers
+  # that arithmetic against the result don't blow up under `set -u`.
+  local path="$1"
+  stat -c %Y "$path" 2>/dev/null \
+    || stat -f %m "$path" 2>/dev/null \
+    || echo 0
+}
+
+# ── Release-mode versioning (self-extracting apx.sh) ────────────────────────
+# `apx use`, `apx versions`, `apx rollback`, `apx cleanup` operate on the
+# ~/.local/share/apx/versions/ layout the shar installer creates. In dev-mode
+# installs these commands emit a friendly notice and do nothing.
+
+read_install_mode() {
+  # Filesystem is the source of truth: if the versioned layout exists AND
+  # `current` resolves to a real dir, this is a release install regardless of
+  # whatever `install.mode` says. That prevents a stale `dev` file (e.g. from
+  # a previous install mode) from misrouting `apx update`.
+  if [[ -d "$VERSIONS_DIR" && -L "$CURRENT_LINK" && -d "$CURRENT_LINK" ]]; then
+    # Self-heal: rewrite `install.mode=release` when writable. Best-effort
+    # only; callers use the return value regardless of whether the file
+    # updated (e.g. read-only $HOME during a package-manager install).
+    if [[ ! -f "$INSTALL_MODE_FILE" ]] || ! grep -qx release "$INSTALL_MODE_FILE" 2>/dev/null; then
+      mkdir -p "$(dirname "$INSTALL_MODE_FILE")" 2>/dev/null || true
+      printf 'release\n' > "$INSTALL_MODE_FILE" 2>/dev/null || true
+    fi
+    echo "release"
+    return 0
+  fi
+  if [[ -f "$INSTALL_MODE_FILE" ]]; then
+    head -n 1 "$INSTALL_MODE_FILE" | tr -d '[:space:]'
+    return 0
+  fi
+  if [[ -f "$SOURCE_PATH_FILE" ]]; then
+    echo "dev"
+    return 0
+  fi
+  echo ""
+}
+
+require_release_mode() {
+  local mode; mode="$(read_install_mode)"
+  if [[ "$mode" != "release" ]]; then
+    cat >&2 <<EOF
+error: this command requires a release-mode install (apx.sh self-extracting installer).
+
+Detected install mode: ${mode:-unknown}
+
+To switch to release mode:
+  curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
+  bash apx.sh
+EOF
+    return 1
+  fi
+  if [[ ! -d "$VERSIONS_DIR" ]]; then
+    echo "error: versions directory missing: $VERSIONS_DIR" >&2
+    return 1
+  fi
+  return 0
+}
+
+current_version_tag() {
+  if [[ -L "$CURRENT_LINK" ]]; then
+    basename "$(readlink "$CURRENT_LINK")"
+  else
+    echo ""
+  fi
+}
+
+list_installed_versions() {
+  # Emits version-tag directory names, newest by semantic version first.
+  #
+  # We deliberately avoid `sort -V` here: GNU coreutils and BSD sort disagree
+  # on how pre-release tags order relative to their base (GNU puts
+  # v0.2.0-rc1 BEFORE v0.2.0, BSD puts it AFTER). We follow the semver spec
+  # (release > pre-release) by tokenising each tag in awk and sorting on
+  # composite numeric keys that behave identically everywhere.
+  [[ -d "$VERSIONS_DIR" ]] || return 0
+  local name
+  for name in "$VERSIONS_DIR"/*; do
+    [[ -d "$name" ]] || continue
+    name="$(basename "$name")"
+    case "$name" in
+      v[0-9]*) printf '%s\n' "$name" ;;
+    esac
+  done | awk '
+    {
+      tag=$0
+      raw=tag; sub(/^v/, "", raw)
+      # Strip build metadata (per semver: ignored for ordering).
+      p = index(raw, "+")
+      if (p > 0) raw = substr(raw, 1, p-1)
+      # Split off pre-release.
+      pre=""
+      p = index(raw, "-")
+      if (p > 0) { pre = substr(raw, p+1); raw = substr(raw, 1, p-1) }
+      n = split(raw, parts, ".")
+      major = (n>=1 && parts[1] ~ /^[0-9]+$/) ? parts[1]+0 : 0
+      minor = (n>=2 && parts[2] ~ /^[0-9]+$/) ? parts[2]+0 : 0
+      patch = (n>=3 && parts[3] ~ /^[0-9]+$/) ? parts[3]+0 : 0
+      # Semver: a release version has HIGHER precedence than a pre-release
+      # of the same base. Use "zzzzzz" for release so it sorts after any
+      # ASCII pre-release identifier in descending order.
+      pre_key = (pre == "" ? "zzzzzz" : pre)
+      printf("%010d %010d %010d %s %s\n", major, minor, patch, pre_key, tag)
+    }
+  ' | sort -k1,1nr -k2,2nr -k3,3nr -k4,4r | awk '{print $NF}'
+}
+
+version_dir_is_valid() {
+  # A version dir is considered installable if it has all the runtime files
+  # the CLI needs. Guards `apx use` and rollback against pointing at a
+  # half-extracted or manually mangled directory.
+  local dir="$1"
+  local f
+  for f in bin/apx bin/apx-gateway bin/apx-squeezr install.sh VERSION; do
+    [[ -e "$dir/$f" ]] || return 1
+  done
+  return 0
+}
+
+relink_local_bin() {
+  # Recreate the ~/.local/bin/apx* symlinks so a user who deleted them by hand
+  # can recover with `apx use vX.Y.Z` from within any versioned bin/apx.
+  local bin_dir="$HOME/.local/bin"
+  mkdir -p "$bin_dir"
+  local name
+  for name in apx apx-gateway apx-squeezr; do
+    local dst="$bin_dir/$name"
+    if [[ -e "$dst" && ! -L "$dst" ]]; then
+      mv -f "$dst" "$dst.bak.$(date +%Y%m%d%H%M%S)"
+    fi
+    ln -sfn "$CURRENT_LINK/bin/$name" "$dst"
+  done
+}
+
+flip_current_to() {
+  local target="$1"
+  local target_dir="$VERSIONS_DIR/$target"
+  if [[ ! -d "$target_dir" ]]; then
+    echo "error: version not installed: $target" >&2
+    return 1
+  fi
+  if ! version_dir_is_valid "$target_dir"; then
+    echo "error: version $target is missing required files (bin/apx*, install.sh, VERSION)" >&2
+    echo "       reinstall it or run: apx cleanup" >&2
+    return 1
+  fi
+  # Record the previous tag before flipping so `apx rollback` can undo the
+  # last switch precisely (rather than guessing by mtime).
+  local prev; prev="$(current_version_tag)"
+  if [[ -n "$prev" && "$prev" != "$target" ]]; then
+    printf '%s\n' "$prev" > "$STATE_DIR/previous.tag"
+  fi
+  # `ln -sfn NEW EXISTING` does unlink() + symlink() under the hood on both
+  # GNU coreutils and BSD userland. Not atomic in the rename() sense, but the
+  # window is microseconds and matches how nvm/rustup/stow handle version
+  # switching. We deliberately do NOT use `mv -f tmp existing_symlink` here:
+  # on macOS, mv follows the target-side symlink into the versioned dir and
+  # moves tmp INTO it, leaving `current` unchanged.
+  ln -sfn "versions/$target" "$CURRENT_LINK"
+  # state/VERSION mirrors what install.sh writes: the unprefixed X.Y.Z form.
+  # Storing "v0.2.0" here would break `apx check-updates` and the release
+  # update "already up to date" guard.
+  printf '%s\n' "${target#v}" > "$STATE_DIR/VERSION"
+  # Refresh the dashboard HTML at the well-known path so the gateway (which
+  # reads $SHARE_DIR/dashboard.html by default) serves the version we just
+  # flipped to. Best-effort; not fatal if the source is missing.
+  if [[ -f "$target_dir/share/dashboard.html" ]]; then
+    cp -f "$target_dir/share/dashboard.html" "$SHARE_DIR/dashboard.html" 2>/dev/null || true
+  fi
+  # Recover ~/.local/bin symlinks defensively.
+  relink_local_bin
+  echo "current -> versions/$target"
+}
+
+versions_command() {
+  require_release_mode || return 1
+  local current; current="$(current_version_tag)"
+  printf '%-14s  %s\n' "VERSION" "PATH"
+  local v marker
+  list_installed_versions | while read -r v; do
+    if [[ "$v" == "$current" ]]; then marker="* "; else marker="  "; fi
+    printf '%s%-12s  %s\n' "$marker" "$v" "$VERSIONS_DIR/$v"
+  done
+}
+
+use_command() {
+  require_release_mode || return 1
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    echo "usage: apx use <version>" >&2
+    return 2
+  fi
+  # Accept both "0.2.0" and "v0.2.0" for convenience.
+  case "$target" in
+    v*) : ;;
+    *) target="v$target" ;;
+  esac
+  flip_current_to "$target" || return $?
+  restart_service_if_managed
+}
+
+have_launchctl_managed() {
+  command -v launchctl >/dev/null 2>&1 && [[ -f "$PLIST_FILE" ]]
+}
+
+installed_plist_label() {
+  # Read the Label from the installed plist so we target whatever service
+  # actually runs on this machine, not whatever $LABEL happens to be in the
+  # caller's environment (which might be an override for a single command).
+  if [[ -f "$PLIST_FILE" ]] && command -v plutil >/dev/null 2>&1; then
+    local label
+    label="$(plutil -extract Label raw -o - -- "$PLIST_FILE" 2>/dev/null || true)"
+    if [[ -n "$label" && "$label" != "null" ]]; then
+      printf '%s\n' "$label"
+      return 0
+    fi
+  fi
+  # defaults(1) is the fallback for systems without plutil in $PATH.
+  if [[ -f "$PLIST_FILE" ]] && command -v defaults >/dev/null 2>&1; then
+    local label
+    label="$(defaults read "$PLIST_FILE" Label 2>/dev/null || true)"
+    if [[ -n "$label" ]]; then
+      printf '%s\n' "$label"
+      return 0
+    fi
+  fi
+  printf '%s\n' "$LABEL"
+}
+
+restart_service_if_managed() {
+  # Prefer `launchctl kickstart -k` over `apx restart` for two reasons:
+  #   1. Re-executing `$0 restart` goes through the ~/.local/bin/apx symlink,
+  #      which now points at the NEW version. Any renamed/removed subcommand
+  #      in the new version would wedge the switch.
+  #   2. `apx restart` calls bootout + a fresh spawn; `kickstart -k` asks
+  #      launchd to signal the current process and let KeepAlive relaunch it
+  #      cleanly, which is the semantic we want after flipping `current`.
+  #
+  # If the user has explicitly stopped the service (`apx stop` bootouts it
+  # but leaves the plist file on disk), we must NOT auto-start it just
+  # because they ran `apx use`. Check that the service is currently loaded
+  # first, and skip the restart otherwise.
+  if ! have_launchctl_managed; then
+    return 0
+  fi
+  local domain label
+  domain="$(launchd_domain 2>/dev/null || true)"
+  [[ -z "$domain" ]] && return 0
+  label="$(installed_plist_label)"
+  if ! launchctl print "${domain}/${label}" >/dev/null 2>&1; then
+    echo "note: service $label is stopped; run 'apx start' to load the new version"
+    return 0
+  fi
+  if launchctl kickstart -k "${domain}/${label}" >/dev/null 2>&1; then
+    echo "restarted service ($label)"
+  else
+    echo "warning: launchctl kickstart failed for $label; you may need 'apx restart'" >&2
+  fi
+}
+
+rollback_command() {
+  require_release_mode || return 1
+  local current previous_file previous
+  current="$(current_version_tag)"
+  previous_file="$STATE_DIR/previous.tag"
+
+  # First choice: the tag flip_current_to recorded last time.
+  if [[ -f "$previous_file" ]]; then
+    previous="$(head -n 1 "$previous_file" | tr -d '[:space:]')"
+    if [[ -n "$previous" && -d "$VERSIONS_DIR/$previous" && "$previous" != "$current" ]]; then
+      echo "rolling back: $current -> $previous"
+      flip_current_to "$previous" || return $?
+      restart_service_if_managed
+      return 0
+    fi
+    # `previous.tag` exists but points at something we can no longer honor
+    # (deleted by cleanup, same as current, or empty). Fall through to the
+    # heuristic and tell the user we did.
+    echo "note: recorded previous version ($previous) is unavailable; picking newest installed tag instead" >&2
+  fi
+
+  # Fallback: pick the highest-versioned tag that is not current. `|| true`
+  # is required because the grep pipeline exits non-zero when grep matches
+  # nothing, which under `set -Eeuo pipefail` would abort the whole CLI.
+  previous="$( { list_installed_versions | grep -v "^${current}\$" | head -n 1; } || true )"
+  if [[ -z "$previous" ]]; then
+    echo "error: no previous version to roll back to" >&2
+    return 1
+  fi
+  echo "rolling back: $current -> $previous"
+  flip_current_to "$previous" || return $?
+  restart_service_if_managed
+}
+
+cleanup_usage() {
+  cat <<EOF
+Usage: apx cleanup [--keep N] [--dry-run]
+
+  --keep N     Number of versions to retain (default 2). Includes current.
+  --dry-run    Show what would be deleted without removing anything.
+EOF
+}
+
+cleanup_command() {
+  require_release_mode || return 1
+  local keep=2 dry=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --keep) shift; keep="${1:-2}" ;;
+      --keep=*) keep="${1#--keep=}" ;;
+      --dry-run) dry=1 ;;
+      -h|--help) cleanup_usage; return 0 ;;
+      *) cleanup_usage >&2; return 2 ;;
+    esac
+    shift
+  done
+  if ! [[ "$keep" =~ ^[0-9]+$ ]] || (( keep < 1 )); then
+    echo "error: --keep must be a positive integer" >&2
+    return 2
+  fi
+
+  local current; current="$(current_version_tag)"
+  if [[ -z "$current" || ! -d "$VERSIONS_DIR/$current" ]]; then
+    cat >&2 <<EOF
+error: cannot run cleanup: the 'current' symlink is missing or dangling.
+       Refusing to delete versions when we don't know which one is active.
+
+Fix it first:
+  apx versions
+  apx use <one of the installed versions>
+EOF
+    return 1
+  fi
+  local all; all="$(list_installed_versions)"
+  # Retain current + (keep-1) most recent others.
+  local retain to_delete v count=0
+  retain="$current"
+  for v in $all; do
+    [[ "$v" == "$current" ]] && continue
+    if (( count < keep - 1 )); then
+      retain="$retain"$'\n'"$v"
+      count=$((count + 1))
+    fi
+  done
+
+  to_delete=""
+  for v in $all; do
+    if ! printf '%s\n' "$retain" | grep -qx "$v"; then
+      to_delete="$to_delete"$'\n'"$v"
+    fi
+  done
+  to_delete="${to_delete#$'\n'}"
+
+  if [[ -z "$to_delete" ]]; then
+    echo "nothing to clean up (retained: $(echo "$retain" | tr '\n' ' '))"
+    return 0
+  fi
+
+  echo "current:     $current"
+  echo "retaining:   $(echo "$retain" | tr '\n' ' ')"
+  echo "will delete: $(echo "$to_delete" | tr '\n' ' ')"
+  if [[ "$dry" == "1" ]]; then
+    echo "(dry run: nothing removed)"
+    return 0
+  fi
+  local prev_tag=""
+  if [[ -f "$STATE_DIR/previous.tag" ]]; then
+    prev_tag="$(head -n 1 "$STATE_DIR/previous.tag" | tr -d '[:space:]')"
+  fi
+  echo "$to_delete" | while read -r v; do
+    [[ -z "$v" ]] && continue
+    [[ "$v" == "$current" ]] && continue
+    rm -rf "${VERSIONS_DIR:?}/$v"
+    echo "removed $VERSIONS_DIR/$v"
+    # If we just deleted the version rollback would have targeted, drop the
+    # stale pointer so `apx rollback` falls back to the heuristic instead of
+    # trying to flip to a missing dir.
+    if [[ "$v" == "$prev_tag" ]]; then
+      rm -f "$STATE_DIR/previous.tag"
+    fi
+  done
+}
+
+# ── Release-mode self-update ────────────────────────────────────────────────
+
+release_installed_version() {
+  # Prefer state/VERSION; fall back to current symlink tag.
+  local v; v="$(read_installed_version)"
+  if [[ "$v" == "unknown" ]]; then
+    local tag; tag="$(current_version_tag)"
+    v="${tag#v}"
+  fi
+  printf '%s\n' "$v"
+}
+
+fetch_and_verify_apx_sh() {
+  # Downloads $RELEASE_ASSET_URL (optionally overridden by $1) and its .sha256
+  # into a temp dir, verifies, and echoes the temp file path.
+  local url="${1:-$RELEASE_ASSET_URL}"
+  local sha_url="${2:-$RELEASE_ASSET_SHA_URL}"
+  # Use an explicit template path: BSD `mktemp -d -t NAME.XXX` keeps the
+  # literal `.XXX` suffix, GNU replaces it, so the resulting dir name differs
+  # between platforms. Passing a full path template works identically on both.
+  local tmp; tmp="$(mktemp -d "${TMPDIR:-/tmp}/apx-update.XXXXXX")"
+  local sh="$tmp/apx.sh"
+  local sha="$tmp/apx.sh.sha256"
+
+  if ! curl -fsSL --max-time 60 -o "$sh" "$url"; then
+    echo "error: failed to download $url" >&2
+    rm -rf "$tmp"; return 1
+  fi
+  if ! curl -fsSL --max-time 30 -o "$sha" "$sha_url"; then
+    echo "error: failed to download $sha_url" >&2
+    rm -rf "$tmp"; return 1
+  fi
+
+  local expected actual
+  expected="$(awk '{print $1}' "$sha")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$sh" | awk '{print $1}')"
+  else
+    actual="$(shasum -a 256 "$sh" | awk '{print $1}')"
+  fi
+  if [[ "$expected" != "$actual" ]]; then
+    echo "error: sha256 mismatch for $url" >&2
+    echo "  expected: $expected" >&2
+    echo "  actual:   $actual" >&2
+    rm -rf "$tmp"; return 1
+  fi
+
+  chmod +x "$sh"
+  printf '%s\n' "$sh"
+}
+
+do_update_release() {
+  local target_ref="" force=0 dry_run=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1 ;;
+      --to) shift; target_ref="${1:-}" ;;
+      --to=*) target_ref="${1#--to=}" ;;
+      --to-latest) target_ref="" ;;
+      --dry-run) dry_run=1 ;;
+      *) echo "unknown option: $1" >&2; return 2 ;;
+    esac
+    shift
+  done
+
+  local url="$RELEASE_ASSET_URL"
+  local sha_url="$RELEASE_ASSET_SHA_URL"
+  if [[ -n "$target_ref" ]]; then
+    # target_ref is a tag like v0.2.0; rewrite /releases/latest/ to
+    # /releases/download/<tag>/. If the user overrode APX_RELEASE_ASSET_URL to
+    # something that doesn't contain /releases/latest/, the substitution is a
+    # silent no-op — meaning `apx update --to v0.2.0` would silently pull
+    # "latest" instead. Detect and refuse.
+    local new_url="${url//\/releases\/latest\//\/releases\/download\/${target_ref}\/}"
+    local new_sha_url="${sha_url//\/releases\/latest\//\/releases\/download\/${target_ref}\/}"
+    if [[ "$new_url" == "$url" || "$new_sha_url" == "$sha_url" ]]; then
+      cat >&2 <<EOF
+error: --to $target_ref cannot be applied to the configured release URL:
+  $url
+
+The URL does not contain /releases/latest/, so we do not know how to point it
+at a specific tag. Set APX_RELEASE_ASSET_URL and APX_RELEASE_ASSET_SHA_URL
+explicitly, or drop --to and use the default channel.
+EOF
+      return 2
+    fi
+    url="$new_url"
+    sha_url="$new_sha_url"
+  fi
+
+  echo "release channel: $url"
+  local pre_version; pre_version="$(release_installed_version)"
+  echo "installed:       $pre_version"
+
+  local downloaded
+  if ! downloaded="$(fetch_and_verify_apx_sh "$url" "$sha_url")"; then
+    return 1
+  fi
+
+  # We want cleanup on EVERY exit path — success, `return`, or bash abort
+  # under `set -Eeuo pipefail`. A `trap ... RETURN` in the enclosing shell
+  # would be skipped on abort, and an EXIT trap here would clobber whatever
+  # the caller had. Isolate the work in a subshell so its EXIT trap fires
+  # even on abnormal termination, and the outer function still sees the
+  # subshell's exit status.
+  local download_dir; download_dir="$(dirname "$downloaded")"
+  (
+    # shellcheck disable=SC2064
+    trap "rm -rf '$download_dir'" EXIT
+
+    local new_version
+    new_version="$(bash "$downloaded" --print-version 2>/dev/null || echo unknown)"
+    echo "latest:          $new_version"
+
+    if [[ "$new_version" == "$pre_version" && "$force" != "1" ]]; then
+      echo "already up to date"
+      exit 0
+    fi
+
+    if [[ "$dry_run" == "1" ]]; then
+      echo "(dry run) would install $new_version by running: bash $downloaded"
+      exit 0
+    fi
+
+    echo "installing $new_version..."
+    # Run the fetched apx.sh; it will extract, flip current, and re-run
+    # install.sh. We branch instead of building an array because bash 3.2
+    # (macOS default) blows up on `${arr[@]}` for empty arrays under
+    # `set -u`, and we want zero cross-shell surprises here.
+    if (( force == 1 )); then
+      bash "$downloaded" --force
+    else
+      bash "$downloaded"
+    fi
+  ) || return $?
+
+  local post_version; post_version="$(release_installed_version)"
+  echo
+  echo "=== apx update summary ==="
+  if [[ "$post_version" == "$pre_version" ]]; then
+    echo "  version:      unchanged ($post_version)"
+    echo "  note:         the installer reported the requested version was already active"
+  else
+    echo "  version:      $pre_version -> $post_version"
+  fi
+  echo "  channel:      $url"
+  echo "  layout:       $VERSIONS_DIR/v$post_version"
+  echo "  current:      $(current_version_tag)"
+}
+
 print_completions() {
   local shell="${1:-}"
-  local cmds="start stop disable restart status mode chain doctor install uninstall supervisor logs urls dashboard version check-updates update completions help"
+  local cmds="start stop disable restart status mode chain doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
   local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
   local chain_subs="get set clear ls preset help"
   local services="headroom pxpipe squeezr"
@@ -1693,8 +2266,13 @@ Commands:
   dashboard [--open]   Print URLs; with --open, open the pxpipe dashboard
   version              Print installed and source-repo version
   check-updates        Compare installed version against origin/main
-  update [--to REF]    git pull the recorded source repo and reinstall
-                       (--dry-run to preview; --to REF to change branch/tag)
+  update [--to REF]    Update to a newer version.
+                       release mode: fetch verified apx.sh from GitHub Releases.
+                       dev mode: git pull the recorded source clone and reinstall.
+  versions             Release mode: list installed versions (current marked *)
+  use <version>        Release mode: switch to an installed version
+  rollback             Release mode: switch to the previous installed version
+  cleanup [--keep N]   Release mode: prune older versions (default keep 2)
   completions <sub>    Print or install shell completions (bash|zsh|fish|install|uninstall)
 
 Mode presets:
@@ -1740,6 +2318,10 @@ case "$cmd" in
   version|--version|-V) show_version ;;
   check-updates|check-update) check_updates ;;
   update|upgrade) do_update "$@" ;;
+  versions) versions_command ;;
+  use) use_command "$@" ;;
+  rollback) rollback_command ;;
+  cleanup) cleanup_command "$@" ;;
   completions) completions_command "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 2 ;;

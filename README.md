@@ -12,6 +12,35 @@ Claude Code always talks to the Gateway. You can switch modes without changing C
 
 ## Quick Install
 
+apx ships two install modes. Pick whichever matches how you work.
+
+### Release mode (single-file installer, no git required)
+
+Download the self-extracting `apx.sh` and its checksum from a GitHub Release, verify, and run:
+
+```bash
+curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
+curl -fsSL  https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh.sha256 | shasum -a 256 -c -
+bash apx.sh
+```
+
+`apx.sh` is a ~60 KB self-extracting bash installer that carries the runtime as an embedded base64 tarball. It installs into a versioned layout at `~/.local/share/apx/versions/vX.Y.Z/` and flips `~/.local/share/apx/current` to point at it. `~/.local/bin/apx*` are symlinks into `current/bin/`, so `apx use vX.Y.Z` and `apx rollback` are atomic.
+
+Options:
+
+```bash
+bash apx.sh --print-version       # print embedded apx version and exit
+bash apx.sh --no-service          # extract and set up files without starting launchd
+bash apx.sh --skip-deps           # skip Homebrew/pipx dependency install
+bash apx.sh --dry-run             # show what would happen; make no changes
+bash apx.sh --force               # reinstall over an existing version
+bash apx.sh --extract-to <dir>    # extract payload into <dir> and exit
+```
+
+Release-mode installs use `~/.config/apx/install.mode = release`, which switches `apx update` onto the release channel (verified download, no git clone required).
+
+### Dev mode (git clone, hackable)
+
 One-line install (clones into `~/.local/share/apx-src` and runs the installer):
 
 ```bash
@@ -42,8 +71,6 @@ The installer copies runtime files to launchd-safe paths, installs safe dependen
 
 Existing runtime config is preserved on reinstall. The installer backs it up and appends any new default keys, so local port/mode experiments are not overwritten.
 
-If you previously installed as `ai-proxy-stack`, the installer stops the old LaunchAgent (`io.github.ai-proxy-stack`), migrates `~/.config/ai-proxy-stack/config.env` → `~/.config/apx/config.env`, migrates state to `~/.local/state/apx/`, and installs a deprecation shim at `~/.local/bin/ai-proxy-stack` that forwards to `apx`.
-
 ## Dashboard
 
 Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/) after installing to see a single pane that aggregates every component:
@@ -68,17 +95,34 @@ Disable the dashboard entirely by setting `APX_DASHBOARD_ENABLED=0` in `~/.confi
 
 ## Updating
 
-Once installed, upgrade in place from the recorded source clone:
+`apx update` picks the right update channel automatically based on how you installed:
+
+- **Release mode** (`apx.sh` installer): downloads the newest `apx.sh` from GitHub Releases, verifies its SHA256 against the co-published `.sha256` file, and re-extracts into a fresh `~/.local/share/apx/versions/vX.Y.Z/`. The old version stays on disk so rollback is instant.
+- **Dev mode** (git clone): `git fetch` and fast-forward the recorded source clone, then rerun `install.sh --yes`.
+
+Common commands (work in both modes):
 
 ```bash
 apx check-updates             # compare installed vs origin/main
-apx update                    # git pull + rerun install.sh --yes
-apx update --dry-run          # preview commits and installer actions
-apx update --to v0.2.0        # move to a specific tag or branch
-apx version                   # show installed version and source repo
+apx update                    # update in place using the appropriate channel
+apx update --dry-run          # release mode: fetch + verify; dev mode: preview git changes
+apx update --to v0.2.0        # release mode: install a specific release tag
+apx update --to-latest        # release mode: latest release (default)
+apx update --force            # reinstall even if already at latest
+apx version                   # show installed version, mode, and channel
 ```
 
-`update` fast-forwards the source clone, then reinstalls binaries into `~/.local/bin/`, merges any new default keys into `~/.config/apx/config.env` (backing up the existing file), refreshes the dashboard HTML, and reloads the LaunchAgent. Local port/mode/PXPIPE_MODELS customizations are preserved. Binaries are copied via `install -m 0755`, which writes to a temp file and renames atomically, so an interrupted upgrade never leaves a half-written executable.
+Release-mode users get atomic version management:
+
+```bash
+apx versions                  # list installed versions (current marked *)
+apx use v0.2.0                # switch to a previously-installed version (atomic)
+apx rollback                  # switch to the previous version
+apx cleanup --keep 2          # prune older versions, keep current + one previous
+apx cleanup --keep 2 --dry-run
+```
+
+Version switches are a single `ln -sfn` on the `~/.local/share/apx/current` symlink. The LaunchAgent survives the swap because `APX_ROOT` is set to `~/.local/share/apx/current`, so restarting the service after `apx use` picks up the new binaries automatically.
 
 After an update, if you had installed shell completions with `apx completions install`, `apx update` warns you when they look stale so you can refresh them:
 
@@ -88,7 +132,7 @@ apx completions install --shell zsh
 apx completions uninstall     # remove installed completion files
 ```
 
-If you installed with the curl bootstrap, the source clone lives at `~/.local/share/apx-src` and `apx update` handles the pull for you. If you cloned somewhere else and moved the directory, either:
+Dev-mode-specific: if you cloned somewhere non-default and moved the directory, either:
 
 ```bash
 echo /new/path/to/apx-source > ~/.config/apx/source.path
@@ -97,7 +141,7 @@ apx update
 
 or just rerun `./install.sh --yes` from the new clone.
 
-Releases are cut with git tags of the form `vMAJOR.MINOR.PATCH` matching the `VERSION` file at the repo root. Tagged builds also publish a tarball at [Releases](https://github.com/mkhalid-s/ai-proxy-stack/releases).
+Releases are cut with git tags of the form `vMAJOR.MINOR.PATCH` matching the `VERSION` file at the repo root. Every tagged build publishes both a source tarball and a self-extracting `apx.sh` (plus `apx.sh.sha256`) at [Releases](https://github.com/mkhalid-s/ai-proxy-stack/releases).
 
 ## Claude Code Setting
 

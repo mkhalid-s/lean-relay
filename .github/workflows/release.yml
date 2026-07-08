@@ -8,27 +8,62 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  # ── 1) Sanity: tag matches VERSION, and the code passes lint + pack. ─────
+  #      We deliberately re-run the CI-equivalent checks in the release
+  #      pipeline so a tag push can never publish an artifact that would fail
+  #      CI on main.
+  verify:
+    name: Verify tag and lint
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Verify tag matches VERSION file
+        id: v
         run: |
           tag="${GITHUB_REF##refs/tags/}"
-          version="v$(head -n 1 VERSION | tr -d '[:space:]')"
-          if [ "$tag" != "$version" ]; then
-            echo "Tag $tag does not match VERSION file ($version)" >&2
+          version="$(head -n 1 VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "v$version" ]; then
+            echo "Tag $tag does not match VERSION file (v$version)" >&2
             exit 1
           fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
-      - name: Build release tarball
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint
         run: |
-          version="$(head -n 1 VERSION | tr -d '[:space:]')"
+          bash -n install.sh bootstrap.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh
+          shellcheck --severity=warning \
+            install.sh bootstrap.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh
+          python -m py_compile bin/apx-gateway
+
+  # ── 2) Build all artifacts: source tarball + self-extracting apx.sh ──────
+  build:
+    name: Build release artifacts
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build source tarball
+        run: |
+          version="${{ needs.verify.outputs.version }}"
           pkg="apx-${version}"
           mkdir -p "dist/${pkg}"
           rsync -a \
@@ -38,14 +73,106 @@ jobs:
             --exclude='state' \
             --exclude='bin/__pycache__' \
             --exclude='*.pyc' \
+            --exclude='.smoke-home' \
             ./ "dist/${pkg}/"
           tar -C dist -czf "dist/${pkg}.tar.gz" "${pkg}"
-          ( cd dist && shasum -a 256 "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
+          # Ubuntu runners have sha256sum by default; keep the whole workflow
+          # consistent instead of mixing shasum/sha256sum.
+          ( cd dist && sha256sum "${pkg}.tar.gz" > "${pkg}.tar.gz.sha256" )
+
+      - name: Build self-extracting apx.sh installer
+        run: |
+          bash build/pack.sh
+          embedded="$(bash dist/apx.sh --print-version)"
+          expected="${{ needs.verify.outputs.version }}"
+          if [ "$embedded" != "$expected" ]; then
+            echo "apx.sh embedded version $embedded does not match tag v$expected" >&2
+            exit 1
+          fi
+          ( cd dist && sha256sum -c apx.sh.sha256 )
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            dist/apx.sh
+            dist/apx.sh.sha256
+            dist/apx-*.tar.gz
+            dist/apx-*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  # ── 3) Defensive install smoke on both platforms before publishing ───────
+  smoke:
+    name: Release smoke (${{ matrix.os }})
+    needs: build
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      FAKE_HOME: ${{ github.workspace }}/.smoke-home
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
+
+      - name: Verify checksum before install
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c apx.sh.sha256
+          else
+            shasum -a 256 -c apx.sh.sha256
+          fi
+
+      - name: Install into isolated HOME (no service, skip deps)
+        run: |
+          rm -rf "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME"
+          HOME="$FAKE_HOME" bash dist/apx.sh --no-service --skip-deps
+
+      - name: Verify install layout
+        run: |
+          test -L "$FAKE_HOME/.local/bin/apx"
+          test -L "$FAKE_HOME/.local/share/apx/current"
+          test "$(cat "$FAKE_HOME/.config/apx/install.mode")" = "release"
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" version
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" versions
+
+      - name: Uninstall --purge leaves no residue
+        run: |
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge --yes
+          test ! -e "$FAKE_HOME/.local/bin/apx"
+          test ! -d "$FAKE_HOME/.local/share/apx/versions"
+
+  # ── 4) Publish the GitHub Release only after every check passes. ─────────
+  publish:
+    name: Publish GitHub Release
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*.tar.gz
-            dist/*.sha256
+            dist/apx.sh
+            dist/apx.sh.sha256
+            dist/apx-*.tar.gz
+            dist/apx-*.tar.gz.sha256
           generate_release_notes: true
+          fail_on_unmatched_files: true

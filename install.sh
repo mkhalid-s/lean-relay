@@ -29,6 +29,15 @@ SKIP_DEPS=0
 CHECK_ONLY=0
 UNINSTALL=0
 PURGE=0
+FROM_PAYLOAD=0
+
+# When invoked from the apx.sh self-extracting installer, STACK_ROOT points at
+# the extracted version directory (e.g. ~/.local/share/apx/versions/v0.2.0),
+# but the LaunchAgent must run out of ~/.local/share/apx/current so rollbacks
+# and upgrades survive without editing the plist. APX_INSTALL_MODE_ROOT is the
+# override the self-extractor sets; APX_INSTALL_MODE=release enables the
+# release-mode branch inside `apx update`.
+RUNTIME_APX_ROOT="${APX_INSTALL_MODE_ROOT:-}"
 
 usage() {
   cat <<EOF
@@ -42,6 +51,9 @@ Options:
   --uninstall    Stop the LaunchAgent and remove runtime binaries only
   --purge        Uninstall service and delete config, state, and dashboard
                  files. Preserves anything owned by other tools.
+  --from-payload Internal: called by the self-extracting apx.sh installer.
+                 Skips git-clone bookkeeping and points APX_ROOT at
+                 ~/.local/share/apx/current.
   -h, --help     Show this help
 
 This package keeps source files in:
@@ -62,6 +74,7 @@ while [[ $# -gt 0 ]]; do
     --check-only) CHECK_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --purge) UNINSTALL=1; PURGE=1 ;;
+    --from-payload) FROM_PAYLOAD=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -105,7 +118,19 @@ confirm() {
 }
 
 require_macos() {
-  [[ "$(uname -s)" == "Darwin" ]] || die "this installer currently supports macOS LaunchAgents only"
+  # macOS is only strictly required when we actually manage the LaunchAgent.
+  # Release-mode installs (apx.sh) on Linux skip service management (they set
+  # --no-start) so binaries, config, and dashboard still sync correctly; the
+  # user just doesn't get a supervisor. CI relies on this for its Linux smoke
+  # test. Users can bypass explicitly with APX_SKIP_MACOS_GATE=1.
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    return 0
+  fi
+  if [[ "$NO_START" == "1" ]] || [[ "${APX_SKIP_MACOS_GATE:-0}" == "1" ]]; then
+    warn "not running on macOS; LaunchAgent management is disabled (Linux best-effort)"
+    return 0
+  fi
+  die "this installer currently supports macOS LaunchAgents only. Pass --no-start to sync files without launchd."
 }
 
 require_sources() {
@@ -266,9 +291,17 @@ sync_runtime() {
     mkdir -p "$RUNTIME_BIN_DIR" "$RUNTIME_CONFIG_DIR" "$RUNTIME_STATE/logs" "$RUNTIME_STATE/run" "$RUNTIME_SHARE_DIR"
   fi
 
-  install_bin "$SRC_BIN"         "$RUNTIME_BIN"         "runtime command"
-  install_bin "$SRC_GATEWAY_BIN" "$RUNTIME_GATEWAY_BIN" "runtime gateway"
-  install_bin "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN" "runtime Squeezr helper"
+  if [[ "$FROM_PAYLOAD" == "1" ]]; then
+    # In release mode the apx.sh header already created symlinks in
+    # ~/.local/bin/apx* that point at the versioned bin dir. Trying to
+    # `install -m 0755 SRC DST` where DST is a symlink to SRC fails, so we
+    # skip the binary sync entirely here.
+    log "from-payload: binaries already symlinked by apx.sh"
+  else
+    install_bin "$SRC_BIN"         "$RUNTIME_BIN"         "runtime command"
+    install_bin "$SRC_GATEWAY_BIN" "$RUNTIME_GATEWAY_BIN" "runtime gateway"
+    install_bin "$SRC_SQUEEZR_BIN" "$RUNTIME_SQUEEZR_BIN" "runtime Squeezr helper"
+  fi
 
   sync_dashboard
 
@@ -277,9 +310,25 @@ sync_runtime() {
     log "recorded installed version: $STACK_VERSION"
   fi
 
-  if [[ "$CHECK_ONLY" != "1" && -d "$STACK_ROOT/.git" ]]; then
-    printf '%s\n' "$STACK_ROOT" > "$RUNTIME_SOURCE_PATH_FILE"
-    log "recorded source repo path for future updates: $STACK_ROOT"
+  if [[ "$CHECK_ONLY" != "1" ]]; then
+    local install_mode_file="$RUNTIME_CONFIG_DIR/install.mode"
+    if [[ "$FROM_PAYLOAD" == "1" ]]; then
+      # Release-mode installs come from an extracted payload, not a git clone.
+      # Remove any stale dev-mode source pointer so `apx update` uses the
+      # release channel instead of trying to git pull a directory that no
+      # longer exists.
+      rm -f "$RUNTIME_SOURCE_PATH_FILE"
+    elif [[ -d "$STACK_ROOT/.git" ]]; then
+      printf '%s\n' "$STACK_ROOT" > "$RUNTIME_SOURCE_PATH_FILE"
+      log "recorded source repo path for future updates: $STACK_ROOT"
+      # If a previous release-mode install left an install.mode=release file,
+      # clear it so `apx update` routes through the dev-mode git branch and
+      # doesn't try to fetch apx.sh from GitHub Releases on top of a git clone.
+      if [[ -f "$install_mode_file" ]] && grep -qx release "$install_mode_file" 2>/dev/null; then
+        log "removing stale install.mode=release (dev install detected)"
+        rm -f "$install_mode_file"
+      fi
+    fi
   fi
 
   sync_config
@@ -341,6 +390,11 @@ validate_health() {
   [[ "${HEADROOM_ENABLED:-0}" == "1" ]] && checks+=("http://$bind_host:$headroom_port/livez")
   [[ "${SQUEEZR_ENABLED:-0}" == "1" ]] && checks+=("http://$bind_host:$squeezr_port/squeezr/health")
 
+  if (( ${#checks[@]} == 0 )); then
+    log "no services enabled; skipping health probe"
+    return 0
+  fi
+
   until urls_ok "${checks[@]}"; do
     if (( SECONDS >= deadline )); then
       "$RUNTIME_BIN" status || true
@@ -357,7 +411,8 @@ install_service() {
     log "skipping LaunchAgent install/start because --no-start was set"
     return 0
   fi
-  run_step "install/start LaunchAgent" env APX_ROOT="$STACK_ROOT" "$RUNTIME_BIN" install
+  local agent_root="${RUNTIME_APX_ROOT:-$STACK_ROOT}"
+  run_step "install/start LaunchAgent" env APX_ROOT="$agent_root" "$RUNTIME_BIN" install
 }
 
 uninstall() {

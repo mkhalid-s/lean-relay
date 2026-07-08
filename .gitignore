@@ -16,3 +16,6 @@ state/**
 *.local
 .env
 .env.*
+
+# Build outputs (dist/apx.sh + sha256) are release artifacts, not committed.
+dist/

@@ -5,8 +5,18 @@ on:
     branches: [main]
   pull_request:
 
+# Cancel in-progress runs on the same branch/PR when new commits are pushed.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
+  # ── 1) Static checks: syntax, shellcheck, py_compile, help/completions ────
   lint:
+    name: Lint (shellcheck + syntax + Python compile)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +35,8 @@ jobs:
           bash -n bootstrap.sh
           bash -n bin/apx
           bash -n bin/apx-squeezr
+          bash -n build/pack.sh
+          bash -n build/header.sh
 
       - name: Shellcheck
         run: |
@@ -32,25 +44,190 @@ jobs:
             install.sh \
             bootstrap.sh \
             bin/apx \
-            bin/apx-squeezr
+            bin/apx-squeezr \
+            build/pack.sh \
+            build/header.sh
 
       - name: Python compile
-        run: |
-          python -m py_compile bin/apx-gateway
+        run: python -m py_compile bin/apx-gateway
 
       - name: Verify apx CLI help renders
         run: |
           chmod +x bin/apx
           ./bin/apx help
 
-      - name: Verify completions render
+      - name: Verify completions render for every shell
         run: |
           ./bin/apx completions bash > /tmp/apx.bash
           ./bin/apx completions zsh  > /tmp/apx.zsh
           ./bin/apx completions fish > /tmp/apx.fish
-          test -s /tmp/apx.bash && test -s /tmp/apx.zsh && test -s /tmp/apx.fish
+          test -s /tmp/apx.bash
+          test -s /tmp/apx.zsh
+          test -s /tmp/apx.fish
 
-      - name: Verify install.sh --help (macOS gate is bypassed via APX_SKIP_MACOS_GATE)
+      - name: Verify install.sh --help renders
+        run: ./install.sh --help
+
+  # ── 2) Pack apx.sh on both Linux and macOS to catch tool differences ─────
+  pack:
+    name: Pack apx.sh (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack self-extracting apx.sh
         run: |
-          # We only exercise --help since the installer requires Darwin.
-          ./install.sh --help
+          bash build/pack.sh
+          test -s dist/apx.sh
+          test -s dist/apx.sh.sha256
+
+      - name: Verify apx.sh --print-version matches VERSION file
+        run: |
+          embedded="$(bash dist/apx.sh --print-version)"
+          file_version="$(head -n1 VERSION | tr -d '[:space:]')"
+          test "$embedded" = "$file_version"
+
+      - name: Verify apx.sh checksum
+        run: |
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c apx.sh.sha256
+          else
+            # macOS lacks sha256sum by default; use shasum with the same file format.
+            shasum -a 256 -c apx.sh.sha256
+          fi
+
+      - name: Verify apx.sh extracts a complete payload
+        run: |
+          extract_dir="$RUNNER_TEMP/apx-extract"
+          rm -rf "$extract_dir"
+          mkdir -p "$extract_dir"
+          bash dist/apx.sh --extract-to "$extract_dir"
+          test -x "$extract_dir/bin/apx"
+          test -x "$extract_dir/bin/apx-gateway"
+          test -x "$extract_dir/bin/apx-squeezr"
+          test -f "$extract_dir/share/dashboard.html"
+          test -f "$extract_dir/config/config.env"
+          test -x "$extract_dir/install.sh"
+          test -f "$extract_dir/VERSION"
+          # Extracted VERSION must match embedded --print-version.
+          extracted_version="$(head -n1 "$extract_dir/VERSION" | tr -d '[:space:]')"
+          embedded="$(bash dist/apx.sh --print-version)"
+          test "$extracted_version" = "$embedded"
+
+      - name: Upload apx.sh artifact
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v4
+        with:
+          name: apx-sh
+          path: |
+            dist/apx.sh
+            dist/apx.sh.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── 3) End-to-end install + versioning smoke on macOS and Linux ─────────
+  #      macOS is the primary target (LaunchAgent). Linux is best-effort:
+  #      installs files but skips launchd.
+  smoke:
+    name: Smoke install (${{ matrix.os }})
+    needs: pack
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # Isolate the smoke install to a scratch HOME so we don't touch the runner's real one.
+      FAKE_HOME: ${{ github.workspace }}/.smoke-home
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack apx.sh
+        run: bash build/pack.sh
+
+      - name: Fresh install (release mode, no service, skip deps)
+        run: |
+          rm -rf "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME"
+          HOME="$FAKE_HOME" bash dist/apx.sh --no-service --skip-deps
+
+      - name: Verify layout after fresh install
+        run: |
+          test -L "$FAKE_HOME/.local/bin/apx"
+          test -L "$FAKE_HOME/.local/bin/apx-gateway"
+          test -L "$FAKE_HOME/.local/bin/apx-squeezr"
+          test -L "$FAKE_HOME/.local/share/apx/current"
+          test -f "$FAKE_HOME/.config/apx/install.mode"
+          test -f "$FAKE_HOME/.config/apx/config.env"
+          test "$(cat "$FAKE_HOME/.config/apx/install.mode")" = "release"
+          # apx CLI works via the ~/.local/bin symlink
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" version
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" versions
+
+      - name: Install a second version and verify current flip
+        run: |
+          orig_version="$(head -n1 VERSION | tr -d '[:space:]')"
+          echo "${orig_version}-test" > VERSION
+          bash build/pack.sh
+          HOME="$FAKE_HOME" bash dist/apx.sh --no-service --skip-deps
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" versions
+          # Restore VERSION for the next step
+          echo "$orig_version" > VERSION
+
+      - name: Rollback to the previous version
+        run: |
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" rollback
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" versions
+
+      - name: apx use / cleanup
+        run: |
+          orig_version="$(head -n1 VERSION | tr -d '[:space:]')"
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" use "v${orig_version}-test"
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" cleanup --keep 1 --dry-run
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" cleanup --keep 1
+          # After cleanup with keep=1, only the current version should remain.
+          count=$(ls "$FAKE_HOME/.local/share/apx/versions" | wc -l | tr -d ' ')
+          test "$count" = "1"
+
+      - name: Uninstall --purge cleans the versioned layout
+        run: |
+          HOME="$FAKE_HOME" "$FAKE_HOME/.local/bin/apx" uninstall --purge --yes
+          test ! -e "$FAKE_HOME/.local/bin/apx"
+          test ! -e "$FAKE_HOME/.local/share/apx/current"
+          test ! -d "$FAKE_HOME/.local/share/apx/versions"
+          test ! -f "$FAKE_HOME/.config/apx/install.mode"
+
+  # ── 4) PR guard: if VERSION changed, require a CHANGELOG entry ──────────
+  changelog:
+    name: CHANGELOG entry present
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check that VERSION bumps have a CHANGELOG entry
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if git diff --name-only "$base" "$head" | grep -qx VERSION; then
+            new_version="$(head -n1 VERSION | tr -d '[:space:]')"
+            # Escape regex metacharacters in the version so `0.2.0` does not
+            # accidentally match `0.2.0-rc1` (dots are regex "any char").
+            esc="$(printf '%s' "$new_version" | sed 's/[.[\*^$()+?{|]/\\&/g')"
+            # Anchor on the right side too: the heading must be exactly the
+            # target version, optionally wrapped in [] and/or prefixed with v.
+            if ! grep -Eq "^## \\[?v?${esc}\\]?([[:space:]]|\$)" CHANGELOG.md; then
+              echo "VERSION bumped to $new_version but no CHANGELOG.md heading for it." >&2
+              echo "Expected a line like '## [$new_version]' or '## v$new_version' or '## $new_version'." >&2
+              exit 1
+            fi
+          else
+            echo "VERSION unchanged; skipping CHANGELOG heading check."
+          fi

@@ -6,13 +6,199 @@ All notable changes to apx are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed (round-2 review swarm)
+
+- **`apx use` respects a stopped service.** After a version switch, we
+  used to unconditionally kickstart the LaunchAgent. If the user had
+  run `apx stop` we would auto-start it back up. Now we only restart
+  when `launchctl print` shows the service is currently loaded, and
+  otherwise emit a `run 'apx start' to load the new version` note.
+- **Launchd label read from the installed plist.** `apx use` and
+  `apx rollback` no longer trust `$LABEL` from the caller's env for
+  the `launchctl kickstart` target — they read the actual `Label` key
+  from `$PLIST_FILE` via `plutil` (or `defaults` as a fallback), so a
+  one-off `APX_LABEL=custom` invocation never mis-targets the wrong
+  service on subsequent switches.
+- **Semver-correct version ordering.** Replaced `sort -V` in
+  `list_installed_versions` with an in-CLI comparator (awk tokenises
+  each tag; sort uses numeric keys). GNU and BSD `sort -V` disagree
+  on pre-release ordering (`v0.2.0-rc1` vs `v0.2.0`); the new logic
+  follows the semver spec everywhere: release > pre-release within
+  the same base version.
+- **`apx.sh` upgrade seeds `previous.tag`.** The self-extracting
+  header now records the previously-active tag before flipping
+  `current`, so `apx rollback` immediately after an `apx.sh` upgrade
+  correctly undoes the upgrade instead of falling back to the
+  version-sort heuristic.
+- **Linux `apx update` no longer dies in `require_brew_for_deps`.**
+  The shar header auto-adds `--skip-deps` on Linux (in addition to
+  `--no-service`), so a release-channel update on WSL or a Linux dev
+  box completes without trying to install pipx/headroom/node via
+  Homebrew.
+- **`do_update_release` cleanup is now trap-guaranteed.** The
+  downloaded shar temp dir is cleaned up in a subshell whose `EXIT`
+  trap fires on every path, including bash abort under
+  `set -Eeuo pipefail`. Previous `RETURN`-only trap could leak the
+  temp dir on `bash "$downloaded"` failures.
+- **`cleanup` clears stale `previous.tag`.** If `apx cleanup` deletes
+  the version recorded in `state/previous.tag`, the pointer file is
+  removed so a subsequent `apx rollback` falls back cleanly instead
+  of erroring on a missing directory.
+- **`flip_current_to` refreshes the top-level `dashboard.html`.**
+  `~/.local/share/apx/dashboard.html` (which the gateway serves) is
+  overwritten with the target version's copy on every switch, so
+  `apx use vOLD` no longer leaves the newer dashboard in place.
+- **Filesystem-first `install.mode` inference.** `read_install_mode`
+  now checks `versions/` + `current` before consulting the
+  `install.mode` file, and self-heals a stale `dev` file when the
+  release layout is present. Prevents an old file from misrouting
+  `apx update` after a mode change.
+- **Rollback prints a note on fallback.** When `previous.tag` exists
+  but points at a missing or same-as-current version, we log a
+  "recorded previous version unavailable; picking newest installed
+  tag" line before flipping, so the heuristic pick is visible.
+- **CHANGELOG PR guard is strict.** The CI check now escapes regex
+  metacharacters in the version and right-anchors the heading, so a
+  `0.2.0` bump no longer false-matches `## [0.2.0-rc1]`,
+  `## [0.20.0]`, or `## [0.2.0.1]`.
+- **Comment and error hygiene.** Corrected the `ln -sfn` atomicity
+  comment (unlink+symlink, not `rename()`); replaced the stale
+  "array expansion" rationale in `do_update_release`; and added a
+  clear `die "no working base64 decoder found"` diagnostic in the
+  shar header when neither `-d` nor `-D` is supported.
+- **CI shasum consistency.** Release workflow now uses `sha256sum`
+  end-to-end on Ubuntu runners instead of mixing `shasum -a 256`.
+
+### Fixed (post-review swarm)
+
+- **state/VERSION mismatch after `apx use` / rollback.** `flip_current_to`
+  wrote `v0.2.0` while `install.sh` writes `0.2.0`, breaking
+  `apx check-updates` and the release-mode "already up to date" guard.
+  Both writers now use the unprefixed `X.Y.Z` form.
+- **Service reload after version switch.** `apx use` and `apx rollback`
+  used to re-exec `$0 restart` through the just-flipped symlink, which
+  could wedge if the new version renamed the `restart` subcommand. They
+  now call `launchctl kickstart -k` (with `bootstrap` fallback) directly.
+- **Rollback semantics.** `apx rollback` used to pick the highest
+  non-current tag by version sort, which meant rolling back from
+  `apx use vOLD` jumped forward instead of undoing the switch.
+  `flip_current_to` now records the previous tag in
+  `$STATE_DIR/previous.tag` and `apx rollback` uses that first, falling
+  back to version sort only when the pointer is absent.
+- **Prefix-tag false match in `apx.sh`.** The header's "already
+  installed" fast path used substring matching (`*"$VERSION_TAG"*`), so
+  `v0.2` would spuriously match `versions/v0.2.0-rc1`. Now compared for
+  exact equality.
+- **`apx update` misleading summary.** When the shar short-circuited
+  with "already installed", `do_update_release` still printed
+  `pre -> post`. It now prints an explicit "unchanged" line.
+- **bash 3.2 unbound arrays.** `${extra[@]}` in `do_update_release` and
+  `${checks[@]}` in `install.sh validate_health` blew up under
+  `set -Eeuo pipefail` on macOS's default bash when the array was
+  empty. Both are guarded now.
+- **BSD/GNU `stat` portability.** Completion-staleness check used
+  `stat -f %m` (BSD only). New `mtime_of` helper tries `stat -c %Y`
+  (GNU) first, then `stat -f %m`, so Linux CI and WSL work correctly.
+- **`set -e` swallowed rollback error path.** `list_installed_versions
+  | grep -v | head -n 1` aborted the whole CLI when `grep` matched
+  nothing. Wrapped in `{ ...; } || true`.
+- **VERSION templating in `pack.sh`.** `sed s/@@VERSION@@/${VERSION}/`
+  would break if VERSION ever contained `/`, `\`, `&`, or newline. Now
+  validated against a strict regex before packing.
+- **`bash apx.sh --dry-run` on fresh install.** The installer
+  executability check ran unconditionally, so dry-run died with
+  "installer missing in payload" before printing the preview. Skipped
+  in dry-run mode.
+- **`install.mode` inference and cleanup.** `read_install_mode` now
+  falls back to filesystem inspection when the file is missing but
+  `versions/` and `current` exist (and self-heals). Dev-mode
+  reinstalls now clear a stale `install.mode=release` so
+  `apx update` uses the right channel.
+- **`--to <ref>` on custom release URLs.** The URL rewrite from
+  `/releases/latest/` to `/releases/download/<tag>/` used to silently
+  no-op on non-GitHub URLs, fetching whatever "latest" resolved to.
+  It now errors out explicitly.
+- **`apx use` / `flip_current_to` validate the target.** New
+  `version_dir_is_valid` gate refuses to flip `current` to a directory
+  missing `bin/apx*`, `install.sh`, or `VERSION`.
+- **`apx cleanup` refuses on dangling current.** Refuses to delete
+  versions when the `current` symlink is missing or points at a
+  non-existent directory (previously would have deleted everything).
+- **Version ordering.** Sort by `sort -V` on tag names instead of
+  `ls -1t` mtime, which is fragile after restore-from-backup or rsync.
+- **`mktemp -d -t` naming drift.** Both `bin/apx` and `build/pack.sh`
+  now use `mktemp -d "${TMPDIR:-/tmp}/apx-*.XXXXXX"` for identical
+  behavior on BSD and GNU.
+- **`do_update_release` temp dir leak.** Uses `trap ... RETURN` so the
+  downloaded shar directory is cleaned up on every exit path, including
+  errors under `set -e`.
+- **Recovery.** `flip_current_to` now also recreates
+  `~/.local/bin/apx*` symlinks defensively so a user who deleted them
+  by hand can recover with `apx use vX.Y.Z`.
+- **`install.sh --from-payload` on Linux.** `require_macos` now
+  permits `--no-start` (or `APX_SKIP_MACOS_GATE=1`) so the release-mode
+  Linux path syncs files without gating on Darwin.
+
+### Added (CI/CD)
+
+- **CI split into named parallel jobs:** `lint`, `pack` (linux+macos
+  matrix), `smoke` (linux+macos install → 2nd version → rollback →
+  use → cleanup → uninstall), and a PR-only `changelog` guard that
+  fails when `VERSION` bumps without a matching heading in
+  `CHANGELOG.md`. Concurrency group cancels stale runs.
+- **Release pipeline gains stages:** `verify` (tag + lint) → `build`
+  (tarball + apx.sh + sha256) → `smoke` (install/uninstall the packed
+  artifact on Ubuntu and macOS) → `publish`. Cross-job artifact
+  upload/download ensures `publish` uses the exact same bytes that
+  passed smoke. `fail_on_unmatched_files: true` prevents publishing an
+  incomplete release.
+
 ### Added
 
+- **Single-file distribution.** `bash build/pack.sh` produces
+  `dist/apx.sh` (~60 KB), a self-extracting bash installer that carries
+  the runtime as an embedded base64 tarball plus `dist/apx.sh.sha256`.
+  Users can install with:
+  ```bash
+  curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
+  curl -fsSL  https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh.sha256 | shasum -a 256 -c -
+  bash apx.sh
+  ```
+  Supports `--print-version`, `--extract-to <dir>`, `--no-service`,
+  `--skip-deps`, `--force`, `--dry-run`.
+- **Versioned install layout.** Release-mode installs write to
+  `~/.local/share/apx/versions/vX.Y.Z/` and flip the
+  `~/.local/share/apx/current` symlink. `~/.local/bin/apx*` are symlinks
+  into `current/bin/`, so version swaps are one `ln -sfn` away.
+- **New CLI commands (release mode only):**
+  - `apx versions` lists installed versions with the current marked.
+  - `apx use <version>` atomically switches `current` to a version and
+    restarts the LaunchAgent.
+  - `apx rollback` switches to the previous version.
+  - `apx cleanup [--keep N] [--dry-run]` prunes older versions while
+    always retaining `current`.
+- **`apx update` release-mode channel.** When
+  `~/.config/apx/install.mode == release`, `apx update` fetches
+  `apx.sh` + `apx.sh.sha256` from GitHub Releases, verifies the
+  checksum, and re-runs the shar into a fresh versioned dir.
+  `--to v0.2.0` and `--to-latest` pin an exact tag; `--dry-run` fetches
+  and verifies without installing.
+- **`install.sh --from-payload`** internal flag used by the shar
+  header. Skips binary sync (already symlinked by the header) and
+  clears any stale `source.path` so `apx update` uses the release
+  channel.
+- **Release workflow** (`release.yml`) now attaches `apx.sh` and
+  `apx.sh.sha256` to every tagged build alongside the source tarball.
+- **CI checks** (`ci.yml`) now pack `apx.sh`, verify `--print-version`
+  matches the `VERSION` file, verify the `.sha256`, and extract into
+  a scratch dir to confirm the payload is complete.
 - `apx uninstall` grew a categorized `--purge` flag so users can fully
   remove apx. Categories: `binaries`, `share`, `state`, `config`, `claude`,
   `completions`, `source`. Combine with `--dry-run` to preview and
   `--yes` to skip the confirmation prompt. The default `apx uninstall`
-  (no flags) still just stops the LaunchAgent.
+  (no flags) still just stops the LaunchAgent. The `share` category
+  removes the entire versioned layout (`versions/`, `current`) in one
+  shot.
 - `apx uninstall --purge=claude` scrubs `ANTHROPIC_BASE_URL` from
   `~/.claude/settings.json` while preserving every other key.
 - `apx completions install [--shell bash|zsh|fish]` writes the completion
