@@ -129,6 +129,7 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import socket
           import sqlite3
           import subprocess
           import tempfile
@@ -137,6 +138,17 @@ jobs:
           import urllib.error
           import urllib.request
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          def free_port():
+              sock = socket.socket()
+              sock.bind(("127.0.0.1", 0))
+              port = sock.getsockname()[1]
+              sock.close()
+              return port
+
+          GATEWAY_PORT = free_port()
+          UPSTREAM_PORT = free_port()
+          TOOL_PORT = free_port()
 
           class Upstream(BaseHTTPRequestHandler):
               calls = 0
@@ -194,7 +206,7 @@ jobs:
               with open(cfg, "w", encoding="utf-8") as fh:
                   fh.write("\n".join([
                       "BIND_HOST=127.0.0.1",
-                      "GATEWAY_PORT=18787",
+                      f"GATEWAY_PORT={GATEWAY_PORT}",
                       "GATEWAY_ENABLED=1",
                       "APX_CHAIN=\"\"",
                       "HEADROOM_ENABLED=0",
@@ -204,8 +216,8 @@ jobs:
                   ]))
               env = os.environ.copy()
               env.update({
-                  "GATEWAY_TARGET_URL": "http://127.0.0.1:18788",
-                  "GATEWAY_PORT": "18787",
+                  "GATEWAY_TARGET_URL": f"http://127.0.0.1:{UPSTREAM_PORT}",
+                  "GATEWAY_PORT": str(GATEWAY_PORT),
                   "BIND_HOST": "127.0.0.1",
                   "APX_STATE_DIR": os.path.join(tmp, "state"),
                   "APX_CONFIG": cfg,
@@ -231,20 +243,20 @@ jobs:
               refused.wait(timeout=5)
               assert refused.returncode == 3, refused.stdout.read()
 
-          tool = ThreadingHTTPServer(("127.0.0.1", 18789), ToolProxy)
+          tool = ThreadingHTTPServer(("127.0.0.1", TOOL_PORT), ToolProxy)
           threading.Thread(target=tool.serve_forever, daemon=True).start()
           with tempfile.TemporaryDirectory() as tmp:
-              proc = start_gateway(tmp, token="secret-token", pxpipe_url="http://127.0.0.1:18789")
+              proc = start_gateway(tmp, token="secret-token", pxpipe_url=f"http://127.0.0.1:{TOOL_PORT}")
               try:
                   time.sleep(1)
                   try:
-                      urllib.request.urlopen("http://127.0.0.1:18787/proxy/pxpipe/", timeout=5)
+                      urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/proxy/pxpipe/", timeout=5)
                       raise AssertionError("unauthorized proxy path unexpectedly succeeded")
                   except urllib.error.HTTPError as e:
                       assert e.code == 401, e
                   try:
                       req = urllib.request.Request(
-                          "http://127.0.0.1:18787/proxy/pxpipe/api/toggle?token=secret-token&x=1",
+                          f"http://127.0.0.1:{GATEWAY_PORT}/proxy/pxpipe/api/toggle?token=secret-token&x=1",
                           data=b"{}",
                           headers={"content-type": "application/json"},
                           method="POST",
@@ -254,14 +266,14 @@ jobs:
                   except urllib.error.HTTPError as e:
                       assert e.code == 401, e
                   opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
-                  with opener.open("http://127.0.0.1:18787/?token=secret-token", timeout=5) as r:
+                  with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/?token=secret-token", timeout=5) as r:
                       assert "apx_dashboard_token" in r.headers.get("set-cookie", "")
                       r.read()
-                  with opener.open("http://127.0.0.1:18787/api/capture", timeout=5) as r:
+                  with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/api/capture", timeout=5) as r:
                       assert r.status == 200
                       r.read()
                   req = urllib.request.Request(
-                      "http://127.0.0.1:18787/proxy/pxpipe/api/toggle?token=secret-token&x=1",
+                      f"http://127.0.0.1:{GATEWAY_PORT}/proxy/pxpipe/api/toggle?token=secret-token&x=1",
                       data=b"{}",
                       headers={"content-type": "application/json"},
                       method="POST",
@@ -303,7 +315,7 @@ jobs:
               os.environ.clear()
               os.environ.update(old_env)
 
-          upstream = ThreadingHTTPServer(("127.0.0.1", 18788), Upstream)
+          upstream = ThreadingHTTPServer(("127.0.0.1", UPSTREAM_PORT), Upstream)
           threading.Thread(target=upstream.serve_forever, daemon=True).start()
           with tempfile.TemporaryDirectory() as tmp:
               proc = start_gateway(tmp, capture="metadata", max_request_bytes="16")
@@ -311,7 +323,7 @@ jobs:
                   time.sleep(1)
                   before = Upstream.calls
                   req = urllib.request.Request(
-                      "http://127.0.0.1:18787/v1/messages",
+                      f"http://127.0.0.1:{GATEWAY_PORT}/v1/messages",
                       data=json.dumps({"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "too large"}]}).encode(),
                       headers={"content-type": "application/json"},
                       method="POST",
@@ -341,17 +353,17 @@ jobs:
                       "/api/tool/detect",
                       "/api/tool/compare",
                   ):
-                      with urllib.request.urlopen("http://127.0.0.1:18787" + path, timeout=5) as r:
+                      with urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}" + path, timeout=5) as r:
                           assert r.status == 200, path
                           r.read()
-                  with urllib.request.urlopen("http://127.0.0.1:18787/", timeout=5) as r:
+                  with urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/", timeout=5) as r:
                       html = r.read().decode("utf-8")
                       assert "Tool Comparison" in html
                       assert "Squeezr iframe" in html
 
                   payload = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hello"}]}
                   req = urllib.request.Request(
-                      "http://127.0.0.1:18787/v1/messages?api_key=supersecret",
+                      f"http://127.0.0.1:{GATEWAY_PORT}/v1/messages?api_key=supersecret",
                       data=json.dumps(payload).encode(),
                       headers={"content-type": "application/json"},
                       method="POST",
