@@ -6,6 +6,14 @@ All notable changes to apx are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-09
+
+Safety-focused release. Adds opt-in cleanup for the extras apx installs on
+your behalf (pipx-installed `headroom-ai`, warmed npm caches, downloaded
+Headroom helper binaries) and hardens `apx uninstall --purge` against
+environment-variable and label-based path escapes. No changes to the
+runtime data plane; safe to upgrade from 0.1.0 in place.
+
 ### Added
 
 - **Manifest-backed dependency/cache uninstall cleanup.** `apx uninstall`
