@@ -332,7 +332,7 @@ jobs:
       - name: Non-default APX_SHARE/APX_STATE/APX_CONFIG is refused by --purge
         run: |
           rm -rf "$FAKE_HOME"
-          mkdir -p "$FAKE_HOME/Documents/precious" "$FAKE_HOME/.config/apx"
+          mkdir -p "$FAKE_HOME/Documents/precious" "$FAKE_HOME/.config/apx" "$FAKE_HOME/.local"
           touch "$FAKE_HOME/Documents/precious/keep.txt"
           cp bin/apx "$FAKE_HOME/.local/bin-apx"
           chmod +x "$FAKE_HOME/.local/bin-apx"
@@ -354,7 +354,7 @@ jobs:
       - name: Invalid APX_LABEL is refused at load
         run: |
           rm -rf "$FAKE_HOME"
-          mkdir -p "$FAKE_HOME"
+          mkdir -p "$FAKE_HOME/.local"
           cp bin/apx "$FAKE_HOME/.local/bin-apx"
           chmod +x "$FAKE_HOME/.local/bin-apx"
           set +e

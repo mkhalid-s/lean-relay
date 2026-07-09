@@ -124,7 +124,10 @@ now() { date '+%Y-%m-%dT%H:%M:%S%z'; }
 log() {
   local line
   line="[$(now)] $*"
-  printf '%s\n' "$line" >> "$LOG_DIR/supervisor.log"
+  # Self-heal so 'apx stop' (or any log-writer) doesn't die under set -Eeuo
+  # pipefail if $LOG_DIR was manually removed between the start and stop calls.
+  [[ -d "$LOG_DIR" ]] || mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s\n' "$line" >> "$LOG_DIR/supervisor.log" 2>/dev/null || true
   if [[ -t 2 ]]; then
     printf '%s\n' "$line" >&2
   fi
@@ -903,13 +906,14 @@ enforce_default_purge_roots() {
   # Refuse env overrides that would let 'apx uninstall --purge' recursively
   # delete arbitrary directories. The user must unset APX_SHARE/APX_STATE/
   # APX_CONFIG for uninstall; they only affect discovery of apx's own paths.
-  local expected_share="$HOME/.local/share/apx"
-  local expected_state="$HOME/.local/state/apx"
-  local expected_config_dir="$HOME/.config/apx"
+  # Strip trailing slashes so `APX_SHARE=$HOME/.local/share/apx/` still passes.
+  local expected_share="${HOME%/}/.local/share/apx"
+  local expected_state="${HOME%/}/.local/state/apx"
+  local expected_config_dir="${HOME%/}/.config/apx"
   local bad=()
-  [[ "$SHARE_DIR" == "$expected_share" ]] || bad+=("SHARE_DIR=$SHARE_DIR (expected $expected_share)")
-  [[ "$STATE_DIR" == "$expected_state" ]] || bad+=("STATE_DIR=$STATE_DIR (expected $expected_state)")
-  [[ "$CONFIG_DIR" == "$expected_config_dir" ]] || bad+=("CONFIG_DIR=$CONFIG_DIR (expected $expected_config_dir)")
+  [[ "${SHARE_DIR%/}" == "$expected_share" ]] || bad+=("SHARE_DIR=$SHARE_DIR (expected $expected_share)")
+  [[ "${STATE_DIR%/}" == "$expected_state" ]] || bad+=("STATE_DIR=$STATE_DIR (expected $expected_state)")
+  [[ "${CONFIG_DIR%/}" == "$expected_config_dir" ]] || bad+=("CONFIG_DIR=$CONFIG_DIR (expected $expected_config_dir)")
   if (( ${#bad[@]} > 0 )); then
     echo "[apx:uninstall] refusing purge: paths are not the default apx layout" >&2
     local b
@@ -920,17 +924,11 @@ enforce_default_purge_roots() {
   return 0
 }
 
-do_uninstall_purge() {
-  if ! enforce_default_purge_roots; then
-    return 2
-  fi
-
-  local recorded_src=""
-  recorded_src="$(source_clone_path 2>/dev/null || true)"
-
+warn_state_purge_without_extras() {
   # The install manifest lives under $STATE_DIR. If the user purges state
   # without also purging deps/caches, a follow-up 'apx uninstall
-  # --purge=deps,caches' will find no manifest and silently no-op.
+  # --purge=deps,caches' will find no manifest and silently no-op. Print
+  # the warning BEFORE confirm_purge so users can back out.
   if purge_has state && ! purge_has deps && ! purge_has caches; then
     if [[ -f "$INSTALL_MANIFEST_FILE" ]]; then
       echo "[apx:uninstall] note: --purge=state will remove $INSTALL_MANIFEST_FILE" >&2
@@ -938,6 +936,11 @@ do_uninstall_purge() {
       echo "[apx:uninstall]   apx uninstall --purge=all,deps,caches --yes" >&2
     fi
   fi
+}
+
+do_uninstall_purge() {
+  local recorded_src=""
+  recorded_src="$(source_clone_path 2>/dev/null || true)"
 
   # Always stop the service first so nothing races the deletions.
   purge_action "stop service and remove plist" stop_and_remove_plist
@@ -1010,6 +1013,10 @@ uninstall_command() {
   if ! parse_purge_categories "$purge_arg"; then
     return 2
   fi
+  if ! enforce_default_purge_roots; then
+    return 2
+  fi
+  warn_state_purge_without_extras
   if ! confirm_purge; then
     echo "aborted"
     return 1

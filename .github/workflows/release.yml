@@ -291,7 +291,7 @@ jobs:
       - name: Non-default APX_SHARE/APX_STATE/APX_CONFIG is refused by --purge
         run: |
           rm -rf "$FAKE_HOME"
-          mkdir -p "$FAKE_HOME/Documents/precious" "$FAKE_HOME/.config/apx"
+          mkdir -p "$FAKE_HOME/Documents/precious" "$FAKE_HOME/.config/apx" "$FAKE_HOME/.local"
           touch "$FAKE_HOME/Documents/precious/keep.txt"
           tarball="$(ls dist/apx-*.tar.gz | head -1)"
           extract_dir="$RUNNER_TEMP/apx-extract-env"
