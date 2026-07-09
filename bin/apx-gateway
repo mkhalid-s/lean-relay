@@ -13,6 +13,7 @@ import re
 import secrets
 import signal
 import sqlite3
+import sys
 import threading
 import time
 from datetime import date, datetime, timezone
@@ -1507,6 +1508,17 @@ class RequestBodyTooLarge(Exception):
     pass
 
 
+class ApxHTTPServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with quiet handling for normal browser disconnects."""
+
+    def handle_error(self, request, client_address) -> None:  # noqa: ANN001
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            log(f"client disconnected before request completed: {client_address[0]}:{client_address[1]}")
+            return
+        super().handle_error(request, client_address)
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "apx-gateway/0.1"
@@ -2489,7 +2501,7 @@ def main() -> int:
         else:
             log(f"metrics: SQLite disabled (open failed: {METRICS.error})")
 
-    httpd = ThreadingHTTPServer((BIND_HOST, PORT), GatewayHandler)
+    httpd = ApxHTTPServer((BIND_HOST, PORT), GatewayHandler)
     httpd.daemon_threads = True
 
     def _shutdown(_signum, _frame) -> None:
