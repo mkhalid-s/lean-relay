@@ -35,6 +35,31 @@ tool dashboards in one release.
 - **CI coverage for dashboard metrics.** CI now checks capture refusal,
   dashboard/API availability, proxy recording, token/cache extraction, and
   metadata-only SQLite writes.
+- **Configurable upstream target.** `apx target get|set|reset` manages the
+  final Anthropic-compatible API endpoint and re-derives the current chain's
+  `*_TARGET_API_URL` values, including Squeezr's target, without changing the
+  selected mode.
+
+### Fixed
+
+- **Installed service config propagation.** `apx start`/launchd now exports the
+  new 0.4 gateway settings from `config.env`, including capture level, full
+  capture acknowledgment, redaction keys, SQLite path/retention/backfill,
+  dashboard token, and request body cap.
+- **Dashboard auth coverage.** Native pxpipe/Squeezr proxy paths now require the
+  same dashboard auth as `/api/*`; a valid `?token=` dashboard open sets a
+  same-origin cookie so fetch/SSE calls continue to work without putting the
+  token on every URL.
+- **Capture and metadata privacy.** Full capture redacts JSON before truncating,
+  preventing key-based secrets from leaking when large JSON bodies are clipped.
+  Metadata paths now redact sensitive query parameters before logging or
+  persistence.
+- **Request body cap correctness.** Oversized fixed-length and chunked request
+  bodies are rejected with `413` instead of being partially forwarded with a
+  mismatched `Content-Length`.
+- **Dashboard live update stability.** The SSE fan-in stream now serializes all
+  writers, session IDs are URL-decoded before lookup, and full history refreshes
+  replace the recent table instead of duplicating rows.
 
 ## [0.3.0] - 2026-07-09
 

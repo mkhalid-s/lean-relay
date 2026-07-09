@@ -53,6 +53,77 @@ jobs:
       - name: Python compile
         run: python -m py_compile bin/apx-gateway
 
+      - name: Verify apx exports 0.4 gateway config
+        run: |
+          fake_home="$RUNNER_TEMP/apx-env-home"
+          rm -rf "$fake_home"
+          mkdir -p "$fake_home/.config/apx" "$fake_home/.local/state/apx" "$RUNNER_TEMP/apx-env-bin"
+          cat > "$RUNNER_TEMP/apx-env-bin/fake-gateway" <<'SH'
+          #!/usr/bin/env bash
+          env | sort > "$HOME/gateway.env"
+          python - <<'PY'
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import os
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  if self.path in ("/livez", "/readyz", "/health"):
+                      self.send_response(200)
+                      self.end_headers()
+                      self.wfile.write(b"ok")
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+              def log_message(self, *_args):
+                  pass
+          ThreadingHTTPServer(("127.0.0.1", int(os.environ["GATEWAY_PORT"])), H).serve_forever()
+          PY
+          SH
+          chmod +x "$RUNNER_TEMP/apx-env-bin/fake-gateway"
+          cat > "$fake_home/.config/apx/config.env" <<EOF
+          BIND_HOST=127.0.0.1
+          GATEWAY_PORT=18787
+          PXPIPE_PORT=18788
+          HEADROOM_PORT=18789
+          SQUEEZR_PORT=18790
+          GATEWAY_ENABLED=1
+          PXPIPE_ENABLED=0
+          HEADROOM_ENABLED=0
+          SQUEEZR_ENABLED=0
+          GATEWAY_CMD="$RUNNER_TEMP/apx-env-bin/fake-gateway"
+          GATEWAY_TARGET_API_URL="https://api.anthropic.com"
+          HEALTH_INTERVAL_SECONDS=30
+          APX_DASHBOARD_ENABLED=1
+          APX_DASHBOARD_TOKEN="secret-token"
+          APX_HISTORY_SIZE=123
+          APX_METRICS_ENABLED=1
+          APX_CAPTURE=full
+          APX_CAPTURE_FULL_ACK=i-understand
+          APX_CAPTURE_BODY_CAP=777
+          APX_REDACT_KEYS=internal_secret
+          APX_METRICS_DB="$fake_home/.local/state/apx/custom.db"
+          APX_METRICS_RETENTION_DAYS=9
+          APX_METRICS_BACKFILL=0
+          APX_MAX_REQUEST_BYTES=888
+          EOF
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" ./bin/apx supervisor &
+          supervisor_pid=$!
+          for _ in $(seq 1 50); do
+            test -s "$fake_home/gateway.env" && break
+            sleep 0.1
+          done
+          kill "$supervisor_pid" 2>/dev/null || true
+          wait "$supervisor_pid" 2>/dev/null || true
+          test -s "$fake_home/gateway.env"
+          grep -qx 'APX_CAPTURE=full' "$fake_home/gateway.env"
+          grep -qx 'APX_CAPTURE_FULL_ACK=i-understand' "$fake_home/gateway.env"
+          grep -qx 'APX_CAPTURE_BODY_CAP=777' "$fake_home/gateway.env"
+          grep -qx 'APX_REDACT_KEYS=internal_secret' "$fake_home/gateway.env"
+          grep -qx "APX_METRICS_DB=$fake_home/.local/state/apx/custom.db" "$fake_home/gateway.env"
+          grep -qx 'APX_METRICS_RETENTION_DAYS=9' "$fake_home/gateway.env"
+          grep -qx 'APX_METRICS_BACKFILL=0' "$fake_home/gateway.env"
+          grep -qx 'APX_MAX_REQUEST_BYTES=888' "$fake_home/gateway.env"
+          grep -qx 'APX_DASHBOARD_TOKEN=secret-token' "$fake_home/gateway.env"
+
       - name: Gateway metrics dashboard API smoke
         run: |
           python - <<'PY'
@@ -63,11 +134,14 @@ jobs:
           import tempfile
           import threading
           import time
+          import urllib.error
           import urllib.request
           from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
           class Upstream(BaseHTTPRequestHandler):
+              calls = 0
               def do_POST(self):
+                  Upstream.calls += 1
                   n = int(self.headers.get("content-length", "0") or "0")
                   self.rfile.read(n)
                   body = json.dumps({
@@ -89,7 +163,31 @@ jobs:
               def log_message(self, *_args):
                   pass
 
-          def start_gateway(tmp, capture="metadata", ack=""):
+          class ToolProxy(BaseHTTPRequestHandler):
+              last_path = ""
+              last_method = ""
+              def do_GET(self):
+                  self._reply()
+
+              def do_POST(self):
+                  self._reply()
+
+              def _reply(self):
+                  ToolProxy.last_path = self.path
+                  ToolProxy.last_method = self.command
+                  n = int(self.headers.get("content-length", "0") or "0")
+                  self.rfile.read(n)
+                  body = b"<html><script>fetch('/api/stats.json')</script></html>"
+                  self.send_response(200)
+                  self.send_header("content-type", "text/html; charset=utf-8")
+                  self.send_header("content-length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, *_args):
+                  pass
+
+          def start_gateway(tmp, capture="metadata", ack="", token="", body_cap="", max_request_bytes="67108864", pxpipe_url=""):
               os.makedirs(os.path.join(tmp, "state"), exist_ok=True)
               os.makedirs(os.path.join(tmp, "config"), exist_ok=True)
               cfg = os.path.join(tmp, "config", "config.env")
@@ -114,17 +212,122 @@ jobs:
                   "APX_METRICS_DB": os.path.join(tmp, "state", "metrics.db"),
                   "APX_CAPTURE": capture,
                   "APX_CAPTURE_FULL_ACK": ack,
+                  "APX_MAX_REQUEST_BYTES": max_request_bytes,
                   "APX_DASHBOARD_ENABLED": "1",
+                  "APX_DASHBOARD_TOKEN": token,
               })
+              if pxpipe_url:
+                  env["APX_PXPIPE_URL"] = pxpipe_url
+              if body_cap:
+                  env["APX_CAPTURE_BODY_CAP"] = body_cap
               return subprocess.Popen(["python", "bin/apx-gateway"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
           with tempfile.TemporaryDirectory() as tmp:
               refused = start_gateway(tmp, capture="full")
               refused.wait(timeout=5)
               assert refused.returncode == 3, refused.stdout.read()
+          with tempfile.TemporaryDirectory() as tmp:
+              refused = start_gateway(tmp, capture="metadata", body_cap="-1")
+              refused.wait(timeout=5)
+              assert refused.returncode == 3, refused.stdout.read()
+
+          tool = ThreadingHTTPServer(("127.0.0.1", 18789), ToolProxy)
+          threading.Thread(target=tool.serve_forever, daemon=True).start()
+          with tempfile.TemporaryDirectory() as tmp:
+              proc = start_gateway(tmp, token="secret-token", pxpipe_url="http://127.0.0.1:18789")
+              try:
+                  time.sleep(1)
+                  try:
+                      urllib.request.urlopen("http://127.0.0.1:18787/proxy/pxpipe/", timeout=5)
+                      raise AssertionError("unauthorized proxy path unexpectedly succeeded")
+                  except urllib.error.HTTPError as e:
+                      assert e.code == 401, e
+                  try:
+                      req = urllib.request.Request(
+                          "http://127.0.0.1:18787/proxy/pxpipe/api/toggle?token=secret-token&x=1",
+                          data=b"{}",
+                          headers={"content-type": "application/json"},
+                          method="POST",
+                      )
+                      urllib.request.urlopen(req, timeout=5)
+                      raise AssertionError("unauthorized proxy POST unexpectedly succeeded")
+                  except urllib.error.HTTPError as e:
+                      assert e.code == 401, e
+                  opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+                  with opener.open("http://127.0.0.1:18787/?token=secret-token", timeout=5) as r:
+                      assert "apx_dashboard_token" in r.headers.get("set-cookie", "")
+                      r.read()
+                  with opener.open("http://127.0.0.1:18787/api/capture", timeout=5) as r:
+                      assert r.status == 200
+                      r.read()
+                  req = urllib.request.Request(
+                      "http://127.0.0.1:18787/proxy/pxpipe/api/toggle?token=secret-token&x=1",
+                      data=b"{}",
+                      headers={"content-type": "application/json"},
+                      method="POST",
+                  )
+                  with opener.open(req, timeout=5) as r:
+                      html = r.read().decode("utf-8")
+                      assert "/proxy/pxpipe/api/stats.json" in html
+                  assert ToolProxy.last_method == "POST"
+                  assert ToolProxy.last_path == "/api/toggle?x=1", ToolProxy.last_path
+              finally:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=3)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                  tool.shutdown()
+
+          # Redaction must happen before capture truncation, otherwise key-based
+          # secrets in large JSON bodies can leak when the truncated prefix is
+          # not valid JSON.
+          import runpy
+          old_env = os.environ.copy()
+          try:
+              os.environ.update({
+                  "APX_CAPTURE": "full",
+                  "APX_CAPTURE_FULL_ACK": "i-understand",
+                  "APX_CAPTURE_BODY_CAP": "28",
+              })
+              mod = runpy.run_path("bin/apx-gateway", run_name="apx_gateway_redaction_test")
+              captured = mod["_capture_body"](
+                  json.dumps({"password": "hunter2", "messages": [{"role": "user", "content": "x" * 200}]}).encode(),
+                  "application/json",
+              )
+              assert "hunter2" not in captured, captured
+              nested = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": {"i": {"api_key": "deep-secret"}}}}}}}}}}
+              captured = mod["_capture_body"](json.dumps(nested).encode(), "application/json")
+              assert "deep-secret" not in captured, captured
+          finally:
+              os.environ.clear()
+              os.environ.update(old_env)
 
           upstream = ThreadingHTTPServer(("127.0.0.1", 18788), Upstream)
           threading.Thread(target=upstream.serve_forever, daemon=True).start()
+          with tempfile.TemporaryDirectory() as tmp:
+              proc = start_gateway(tmp, capture="metadata", max_request_bytes="16")
+              try:
+                  time.sleep(1)
+                  before = Upstream.calls
+                  req = urllib.request.Request(
+                      "http://127.0.0.1:18787/v1/messages",
+                      data=json.dumps({"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "too large"}]}).encode(),
+                      headers={"content-type": "application/json"},
+                      method="POST",
+                  )
+                  try:
+                      urllib.request.urlopen(req, timeout=5)
+                      raise AssertionError("oversized body unexpectedly succeeded")
+                  except urllib.error.HTTPError as e:
+                      assert e.code == 413, e
+                  assert Upstream.calls == before
+              finally:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=3)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
           with tempfile.TemporaryDirectory() as tmp:
               proc = start_gateway(tmp, capture="metadata")
               db = os.path.join(tmp, "state", "metrics.db")
@@ -148,7 +351,7 @@ jobs:
 
                   payload = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hello"}]}
                   req = urllib.request.Request(
-                      "http://127.0.0.1:18787/v1/messages",
+                      "http://127.0.0.1:18787/v1/messages?api_key=supersecret",
                       data=json.dumps(payload).encode(),
                       headers={"content-type": "application/json"},
                       method="POST",
@@ -159,10 +362,11 @@ jobs:
                       r.read()
                   time.sleep(0.3)
                   row = sqlite3.connect(db).execute(
-                      "select status,tokens_in,tokens_out,cache_read_tokens,cache_write_tokens,tool_call_count,request_body,response_body from requests"
+                      "select status,tokens_in,tokens_out,cache_read_tokens,cache_write_tokens,tool_call_count,request_body,response_body,path from requests"
                   ).fetchone()
                   assert row[:6] == (200, 123, 45, 10, 5, 1), row
                   assert row[6] is None and row[7] is None, row
+                  assert row[8].endswith("api_key=REDACTED"), row
               finally:
                   proc.terminate()
                   try:
@@ -176,6 +380,49 @@ jobs:
         run: |
           chmod +x bin/apx
           ./bin/apx help
+
+      - name: Verify apx target command rewrites derived routes
+        run: |
+          fake_home="$RUNNER_TEMP/apx-target-home"
+          rm -rf "$fake_home"
+          mkdir -p "$fake_home/.config/apx" "$fake_home/.local/state/apx"
+          cp config/config.env "$fake_home/.config/apx/config.env"
+
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx target set http://127.0.0.1:9999/anthropic --no-restart
+          grep -qx 'APX_TARGET_API_URL="http://127.0.0.1:9999/anthropic"' "$fake_home/.config/apx/config.env"
+          grep -qx 'GATEWAY_TARGET_API_URL="http://127.0.0.1:8788"' "$fake_home/.config/apx/config.env"
+          grep -qx 'HEADROOM_TARGET_API_URL="http://127.0.0.1:9999/anthropic"' "$fake_home/.config/apx/config.env"
+
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx chain set pxpipe,headroom --no-restart --no-claude-sync
+          grep -qx 'GATEWAY_TARGET_API_URL="http://127.0.0.1:47821"' "$fake_home/.config/apx/config.env"
+          grep -qx 'PXPIPE_TARGET_API_URL="http://127.0.0.1:8788"' "$fake_home/.config/apx/config.env"
+          grep -qx 'HEADROOM_TARGET_API_URL="http://127.0.0.1:9999/anthropic"' "$fake_home/.config/apx/config.env"
+
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx chain set headroom,squeezr --no-restart --no-claude-sync
+          grep -qx 'HEADROOM_TARGET_API_URL="http://127.0.0.1:18780"' "$fake_home/.config/apx/config.env"
+          grep -qx 'SQUEEZR_TARGET_API_URL="http://127.0.0.1:9999/anthropic"' "$fake_home/.config/apx/config.env"
+
+          set +e
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx target set ftp://example.com --no-restart >/tmp/apx-target-invalid.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          set +e
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx target set http://example.com:bad --no-restart >/tmp/apx-target-invalid-port.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+          set +e
+          HOME="$fake_home" APX_CONFIG="$fake_home/.config/apx/config.env" APX_STATE="$fake_home/.local/state/apx" \
+            ./bin/apx chain set headroom,headroom --no-restart --no-claude-sync >/tmp/apx-chain-dupe.log 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
 
       - name: Verify completions render for every shell
         run: |

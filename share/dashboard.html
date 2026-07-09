@@ -509,8 +509,10 @@
       }).join("\n\n") || "No requests in session.";
     }
 
-    function renderHistory(items) {
-      if (items) state.history = [...state.history, ...items].slice(-80);
+    function renderHistory(items, replace = false) {
+      if (items) {
+        state.history = replace ? items.slice(-80) : [...state.history, ...items].slice(-80);
+      }
       $("history-body").innerHTML = state.history.length ? state.history.slice().reverse().map(r => {
         const cls = r.status >= 500 ? "status-fail" : r.status >= 400 ? "status-warn" : "status-ok";
         return `<tr>
@@ -567,7 +569,7 @@
         renderDetect(detect);
         renderSummary(summary);
         renderSessions(sessions);
-        renderHistory(history.items || []);
+        renderHistory(history.items || [], true);
         renderCompare(compare);
         chartLine("latency-chart", series.series || [], "latency_p95_ms", "Gateway latency p95");
         chartLine("request-chart", series.series || [], "requests", "Requests per bucket");

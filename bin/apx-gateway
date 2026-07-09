@@ -19,7 +19,7 @@ from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 BIND_HOST = os.environ.get("GATEWAY_HOST") or os.environ.get("HOST") or "127.0.0.1"
 PORT = int(os.environ.get("GATEWAY_PORT", "8787"))
@@ -67,6 +67,7 @@ METRICS_BACKFILL = os.environ.get("APX_METRICS_BACKFILL", "1") == "1"
 DASHBOARD_STATIC_DIR = os.environ.get("APX_DASHBOARD_STATIC_DIR", "").strip()
 
 VERSION_FILE = os.path.join(STATE_DIR, "VERSION")
+DASHBOARD_COOKIE_NAME = "apx_dashboard_token"
 
 # Header names redacted from ever being persisted, even at APX_CAPTURE=full.
 _ALWAYS_REDACT_HEADERS = frozenset({
@@ -106,6 +107,21 @@ _SENSITIVE_TEXT_PATTERNS = tuple(
         r"AKIA[0-9A-Z]{16}",                    # AWS access key
     )
 )
+_SENSITIVE_QUERY_KEYS = frozenset({
+    "api_key",
+    "apikey",
+    "api-key",
+    "authorization",
+    "auth",
+    "token",
+    "access_token",
+    "refresh_token",
+    "session_token",
+    "id_token",
+    "password",
+    "secret",
+    "key",
+})
 
 # Service registry. Adding a new proxyable service means one entry here
 # (health path + label + default port) plus any needed env override.
@@ -187,6 +203,10 @@ def _validate_capture_level() -> str | None:
         return (
             f"invalid APX_CAPTURE={CAPTURE_LEVEL!r}; expected one of {_CAPTURE_LEVELS}"
         )
+    if CAPTURE_BODY_CAP < 0:
+        return "APX_CAPTURE_BODY_CAP must be >= 0"
+    if MAX_REQUEST_BYTES < 1:
+        return "APX_MAX_REQUEST_BYTES must be >= 1"
     if CAPTURE_LEVEL == "full" and CAPTURE_FULL_ACK != "i-understand":
         return (
             "APX_CAPTURE=full requires APX_CAPTURE_FULL_ACK=i-understand. "
@@ -216,7 +236,7 @@ def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
 
 def _redact_json_value(node: Any, depth: int = 0) -> Any:
     if depth > 8:
-        return node
+        return "[REDACTED_DEPTH_LIMIT]"
     if isinstance(node, dict):
         red: dict[str, Any] = {}
         redact_names = _ALWAYS_REDACT_JSON_KEYS | set(REDACT_KEYS_EXTRA)
@@ -242,6 +262,29 @@ def _redact_secrets_in_text(text: str) -> str:
     return out
 
 
+def _scrub_url_path(path: str) -> str:
+    """Redact sensitive query params before logging or persisting metadata."""
+    if not path or "?" not in path:
+        return path
+    parsed = urlsplit(path)
+    parts: list[str] = []
+    for raw in parsed.query.split("&"):
+        if not raw:
+            continue
+        key, sep, value = raw.partition("=")
+        lk = unquote(key).lower()
+        if lk in _SENSITIVE_QUERY_KEYS or lk.startswith("x-") and "key" in lk:
+            parts.append(f"{key}{sep}REDACTED" if sep else f"{key}=REDACTED")
+        else:
+            parts.append(raw)
+    out = parsed.path
+    if parts:
+        out += "?" + "&".join(parts)
+    if parsed.fragment:
+        out += "#" + parsed.fragment
+    return out
+
+
 def _capture_body(body: bytes, content_type: str) -> str | None:
     """Return a JSON-serializable string representation of the body, respecting
     APX_CAPTURE. Never returns raw bytes; always redacted.
@@ -252,8 +295,7 @@ def _capture_body(body: bytes, content_type: str) -> str | None:
     if CAPTURE_LEVEL != "full" or not body:
         return None
     try:
-        truncated = body[: CAPTURE_BODY_CAP]
-        text = truncated.decode("utf-8", errors="replace")
+        text = body.decode("utf-8", errors="replace")
     except Exception:  # noqa: BLE001
         return None
     ct = (content_type or "").lower()
@@ -263,8 +305,8 @@ def _capture_body(body: bytes, content_type: str) -> str | None:
             parsed = _redact_json_value(parsed)
             return json.dumps(parsed, separators=(",", ":"))[: CAPTURE_BODY_CAP]
         except Exception:  # noqa: BLE001
-            return _redact_secrets_in_text(text)
-    return _redact_secrets_in_text(text)
+            return _redact_secrets_in_text(text)[: CAPTURE_BODY_CAP]
+    return _redact_secrets_in_text(text)[: CAPTURE_BODY_CAP]
 
 
 def _derive_session_id(headers: Any, model: str | None, body: bytes) -> str:
@@ -1002,6 +1044,14 @@ def _bucket_seconds(bucket: str) -> int:
     return int(m.get(bucket, 60))
 
 
+def _bounded_int(value: str | None, default: int, lo: int, hi: int) -> int:
+    try:
+        n = int(value or default)
+    except (TypeError, ValueError):
+        n = default
+    return max(lo, min(n, hi))
+
+
 # --- API helpers for /api/metrics/* and /api/tool/* -------------------------
 _TOOL_CACHE: dict[str, dict[str, Any]] = {}
 _TOOL_CACHE_LOCK = threading.Lock()
@@ -1142,7 +1192,7 @@ def _api_metrics_timeseries(query: dict[str, list[str]]) -> dict[str, Any]:
 
 
 def _api_metrics_sessions(query: dict[str, list[str]]) -> dict[str, Any]:
-    limit = min(int(query.get("limit", ["50"])[0] or 50), 500)
+    limit = _bounded_int(query.get("limit", ["50"])[0], 50, 1, 500)
     window = (query.get("window", ["24h"])[0] or "24h").lower()
     since = time.time() - _window_seconds(window)
     if METRICS.enabled:
@@ -1453,12 +1503,18 @@ def _read_dashboard_html() -> bytes:
     return b"<!doctype html><meta charset=utf-8><title>apx</title><h1>apx dashboard not installed</h1>"
 
 
+class RequestBodyTooLarge(Exception):
+    pass
+
+
 class GatewayHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "apx-gateway/0.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        log(fmt % args)
+        msg = fmt % args
+        msg = re.sub(r"([?&](?:token|api_key|apikey|api-key|authorization|password|secret)=)[^&\s\"]+", r"\1REDACTED", msg, flags=re.I)
+        log(msg)
 
     def do_GET(self) -> None:  # noqa: N802
         if self._handle_dashboard_or_api():
@@ -1469,6 +1525,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def do_HEAD(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
         if self.path in {"/", "/livez", "/readyz", "/health"}:
             self.send_response(200)
             self.send_header("content-type", "application/json")
@@ -1479,15 +1537,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._proxy()
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
         self._proxy()
 
     def do_PUT(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
         self._proxy()
 
     def do_PATCH(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
         self._proxy()
 
     def do_DELETE(self) -> None:  # noqa: N802
+        if self._handle_dashboard_or_api():
+            return
         self._proxy()
 
     def do_OPTIONS(self) -> None:  # noqa: N802
@@ -1501,7 +1567,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return "unknown"
 
-    def _authorized_for_dashboard(self) -> bool:
+    def _authorized_for_dashboard(self, allow_query: bool = True) -> bool:
         if not DASHBOARD_TOKEN:
             return True
         provided = ""
@@ -1509,9 +1575,41 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if auth.lower().startswith("bearer "):
             provided = auth[7:].strip()
         if not provided:
+            cookie = self.headers.get("cookie", "")
+            for part in cookie.split(";"):
+                key, sep, value = part.strip().partition("=")
+                if sep and key == DASHBOARD_COOKIE_NAME:
+                    provided = unquote(value).strip()
+                    break
+        if allow_query and not provided:
             parsed = urlsplit(self.path)
             provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
         return secrets.compare_digest(provided, DASHBOARD_TOKEN)
+
+    def _dashboard_cookie_headers(self) -> dict[str, str]:
+        if not DASHBOARD_TOKEN:
+            return {}
+        parsed = urlsplit(self.path)
+        provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
+        if provided and secrets.compare_digest(provided, DASHBOARD_TOKEN):
+            return {
+                "set-cookie": (
+                    f"{DASHBOARD_COOKIE_NAME}={quote(provided, safe='')}; "
+                    "Path=/; HttpOnly; SameSite=Lax"
+                )
+            }
+        return {}
+
+    def _drop_dashboard_token_query(self, query: str) -> str:
+        if not query:
+            return ""
+        parts = []
+        for raw in query.split("&"):
+            key = raw.partition("=")[0]
+            if unquote(key).lower() == "token":
+                continue
+            parts.append(raw)
+        return "&".join(parts)
 
     def _handle_dashboard_or_api(self) -> bool:
         if not DASHBOARD_ENABLED:
@@ -1519,12 +1617,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        passthrough_query = self._drop_dashboard_token_query(parsed.query)
 
         if path.startswith("/proxy/pxpipe/") or path == "/proxy/pxpipe":
-            self._passthrough(PXPIPE_URL, path[len("/proxy/pxpipe"):] or "/", parsed.query)
+            if not self._authorized_for_dashboard(allow_query=False):
+                self._require_token()
+                return True
+            self._passthrough(PXPIPE_URL, path[len("/proxy/pxpipe"):] or "/", passthrough_query, prefix="/proxy/pxpipe")
             return True
         if path.startswith("/proxy/squeezr/") or path == "/proxy/squeezr":
-            self._passthrough(SQUEEZR_URL, path[len("/proxy/squeezr"):] or "/squeezr/dashboard", parsed.query)
+            if not self._authorized_for_dashboard(allow_query=False):
+                self._require_token()
+                return True
+            self._passthrough(SQUEEZR_URL, path[len("/proxy/squeezr"):] or "/squeezr/dashboard", passthrough_query, prefix="/proxy/squeezr")
             return True
 
         if path in ("/", "/dashboard"):
@@ -1532,7 +1637,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._require_token()
                 return True
             body = _read_dashboard_html()
-            self._respond(200, body, content_type="text/html; charset=utf-8")
+            self._respond(200, body, content_type="text/html; charset=utf-8", extra_headers=self._dashboard_cookie_headers())
             return True
         if path.startswith("/api/"):
             if not self._authorized_for_dashboard():
@@ -1542,7 +1647,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._respond_json(200, self._build_status_payload())
             return True
         if path == "/api/history":
-            n = min(int((query.get("n", ["100"])[0]) or 100), HISTORY_SIZE)
+            n = _bounded_int((query.get("n", ["100"])[0]), 100, 1, HISTORY_SIZE)
             with _HISTORY_LOCK:
                 items = list(_HISTORY)[-n:]
             self._respond_json(200, {"items": items, "size": HISTORY_SIZE})
@@ -1565,7 +1670,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._respond_json(200, _api_metrics_sessions(query))
             return True
         if path.startswith("/api/metrics/session/"):
-            sid = path[len("/api/metrics/session/") :]
+            sid = unquote(path[len("/api/metrics/session/") :])
             self._respond_json(200, _api_metrics_session_detail(sid, query))
             return True
         if path == "/api/tool/detect":
@@ -1618,7 +1723,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
         )
         self._respond(401, body, content_type="text/html; charset=utf-8")
 
-    def _passthrough(self, base_url: str, sub_path: str, query: str) -> None:
+    def _rewrite_proxied_html(self, body: bytes, prefix: str, content_type: str) -> bytes:
+        if not prefix or "text/html" not in (content_type or "").lower():
+            return body
+        try:
+            text = body.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            return body
+        replacements = {
+            'href="/': f'href="{prefix}/',
+            "href='/": f"href='{prefix}/",
+            'src="/': f'src="{prefix}/',
+            "src='/": f"src='{prefix}/",
+            'action="/': f'action="{prefix}/',
+            "action='/": f"action='{prefix}/",
+            'fetch("/': f'fetch("{prefix}/',
+            "fetch('/": f"fetch('{prefix}/",
+            'EventSource("/': f'EventSource("{prefix}/',
+            "EventSource('/": f"EventSource('{prefix}/",
+        }
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        return text.encode("utf-8")
+
+    def _passthrough(self, base_url: str, sub_path: str, query: str, prefix: str = "") -> None:
         target = urlsplit(base_url)
         if target.scheme not in {"http", "https"} or not target.netloc:
             self._respond_json(502, {"error": f"invalid passthrough target: {base_url}"})
@@ -1630,22 +1758,40 @@ class GatewayHandler(BaseHTTPRequestHandler):
         conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
         try:
             headers = {}
-            for key in ("accept", "accept-encoding", "user-agent"):
+            for key in ("accept", "user-agent"):
                 if key in self.headers:
                     headers[key] = self.headers[key]
+            headers["Accept-Encoding"] = "identity"
             headers["Host"] = target.netloc
-            body = self._read_request_body_bytes()
+            try:
+                body = self._read_request_body_bytes()
+            except RequestBodyTooLarge as exc:
+                self._respond_json(413, {"error": "request_body_too_large", "message": str(exc)})
+                return
             conn.request(self.command, path, body=body, headers=headers)
             resp = conn.getresponse()
+            content_type = resp.getheader("content-type", "") or ""
+            rewrite_body = bool(prefix and self.command != "HEAD" and "text/html" in content_type.lower())
+            body_out = b""
+            if rewrite_body:
+                body_out = self._rewrite_proxied_html(resp.read(), prefix, content_type)
             self.send_response(resp.status, resp.reason)
             for key, value in resp.getheaders():
                 lower = key.lower()
-                if lower in HOP_BY_HOP_HEADERS or lower == "x-frame-options" or lower == "content-security-policy":
+                if lower in HOP_BY_HOP_HEADERS or lower in {"x-frame-options", "content-security-policy"}:
                     continue
+                if rewrite_body and lower in {"content-length", "content-encoding"}:
+                    continue
+                if prefix and lower == "location" and value.startswith("/"):
+                    value = prefix + value
                 self.send_header(key, value)
+            if rewrite_body:
+                self.send_header("content-length", str(len(body_out)))
             self.send_header("connection", "close")
             self.end_headers()
-            if self.command != "HEAD":
+            if rewrite_body:
+                self.wfile.write(body_out)
+            elif self.command != "HEAD":
                 while True:
                     chunk = resp.read(8192)
                     if not chunk:
@@ -1802,7 +1948,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _sse_write_named(self, event: str, data: str) -> bool:
         try:
-            payload = f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+            lines = [f"event: {event}"]
+            for line in str(data).splitlines() or [""]:
+                lines.append(f"data: {line}")
+            payload = ("\n".join(lines) + "\n\n").encode("utf-8")
             self.wfile.write(payload)
             self.wfile.flush()
             return True
@@ -1826,15 +1975,38 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         stop = threading.Event()
+        write_lock = threading.Lock()
         squeezr_conn: http.client.HTTPConnection | None = None
         last_history_ts = 0.0
+
+        def _write_named(event: str, data: str) -> bool:
+            try:
+                lines = [f"event: {event}"]
+                for line in str(data).splitlines() or [""]:
+                    lines.append(f"data: {line}")
+                payload = ("\n".join(lines) + "\n\n").encode("utf-8")
+                with write_lock:
+                    self.wfile.write(payload)
+                    self.wfile.flush()
+                return True
+            except Exception:
+                return False
+
+        def _write_ping() -> bool:
+            try:
+                with write_lock:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                return True
+            except Exception:
+                return False
 
         def _pump_summary():
             nonlocal last_history_ts
             while not stop.is_set():
                 try:
                     payload = _api_metrics_summary({"window": ["5m"]})
-                    if not self._sse_write_named("summary", json.dumps(payload, default=str)):
+                    if not _write_named("summary", json.dumps(payload, default=str)):
                         stop.set()
                         return
                     # Also emit any new completed requests since last tick.
@@ -1842,7 +2014,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         new = [r for r in _HISTORY if r.get("ts", 0) > last_history_ts]
                     if new:
                         last_history_ts = max(r.get("ts", 0) for r in new)
-                        if not self._sse_write_named("history", json.dumps({"items": new[-25:]}, default=str)):
+                        if not _write_named("history", json.dumps({"items": new[-25:]}, default=str)):
                             stop.set()
                             return
                 except Exception:  # noqa: BLE001
@@ -1853,7 +2025,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             while not stop.is_set():
                 try:
                     payload = _api_tool_compare()
-                    if not self._sse_write_named("compare", json.dumps(payload, default=str)):
+                    if not _write_named("compare", json.dumps(payload, default=str)):
                         stop.set()
                         return
                 except Exception:  # noqa: BLE001
@@ -1890,7 +2062,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                             ]
                             if data_lines:
                                 data = "\n".join(data_lines)
-                                if not self._sse_write_named("squeezr", data):
+                                if not _write_named("squeezr", data):
                                     stop.set()
                                     return
                 except Exception:  # noqa: BLE001
@@ -1913,8 +2085,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         try:
             while not stop.is_set():
                 try:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
+                    if not _write_ping():
+                        raise RuntimeError("sse ping failed")
                 except Exception:
                     stop.set()
                     return
@@ -1926,12 +2098,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, default=str).encode("utf-8")
         self._respond(status, body, content_type="application/json")
 
-    def _respond(self, status: int, body: bytes, content_type: str) -> None:
+    def _respond(self, status: int, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None) -> None:
         try:
             self.send_response(status)
             self.send_header("content-type", content_type)
             self.send_header("content-length", str(len(body)))
             self.send_header("cache-control", "no-store")
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
             self.send_header("connection", "close")
             self.end_headers()
             if self.command != "HEAD":
@@ -1953,6 +2127,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return b""
             if n <= 0:
                 return b""
+            if n > cap:
+                raise RequestBodyTooLarge(f"content-length {n} exceeds APX_MAX_REQUEST_BYTES={cap}")
             return self.rfile.read(min(n, cap))
         if self.headers.get("transfer-encoding", "").lower() == "chunked":
             chunks: list[bytes] = []
@@ -1968,20 +2144,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 if size == 0:
                     self.rfile.readline()
                     break
+                if size > remaining:
+                    raise RequestBodyTooLarge(f"chunked body exceeds APX_MAX_REQUEST_BYTES={cap}")
                 read = self.rfile.read(min(size, remaining))
                 chunks.append(read)
                 self.rfile.readline()
                 remaining -= len(read)
-                if remaining <= 0:
-                    break
             return b"".join(chunks)
         return b""
 
-    def _proxy_headers(self, target, request_id: str, session_id: str = "") -> dict[str, str]:
+    def _proxy_headers(self, target, request_id: str, session_id: str = "", body_len: int | None = None) -> dict[str, str]:
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
             lower = key.lower()
-            if lower in HOP_BY_HOP_HEADERS or lower == "host":
+            if lower in HOP_BY_HOP_HEADERS or lower in {"host", "content-length"}:
                 continue
             headers[key] = value
         headers["Host"] = target.netloc
@@ -1989,6 +2165,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         headers["X-Apx-Request-Id"] = request_id
         if session_id:
             headers["X-Apx-Session-Id"] = session_id
+        if body_len is not None:
+            headers["Content-Length"] = str(body_len)
         return headers
 
     def _usage_from_dict(self, usage: Any) -> tuple[int, int, int, int]:
@@ -2108,11 +2286,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
         request_id = self.headers.get("x-apx-request-id") or _new_request_id()
         path = self.path if self.path.startswith("/") else f"/{self.path}"
+        safe_path = _scrub_url_path(path)
         upstream_path = f"{target.path.rstrip('/')}{path}"
         if not upstream_path.startswith("/"):
             upstream_path = f"/{upstream_path}"
 
-        body = self._read_request_body_bytes()
+        try:
+            body = self._read_request_body_bytes()
+        except RequestBodyTooLarge as exc:
+            self._respond_json(413, {"error": "request_body_too_large", "message": str(exc)})
+            return
         bytes_in = len(body)
         model = _model_from_path(path, body)
         session_id = _derive_session_id(self.headers, model, body)
@@ -2140,8 +2323,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
         conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
         err_class = ""
         is_stream = False
+        response_started = False
         try:
-            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id, session_id))
+            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id, session_id, body_len=len(body)))
             resp = conn.getresponse()
             status = resp.status
             content_type = resp.getheader("content-type", "").lower()
@@ -2166,6 +2350,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 st_entries.append(upstream_st)
             self.send_header("server-timing", ", ".join(st_entries))
             self.end_headers()
+            response_started = True
 
             if self.command != "HEAD":
                 capture_cap = 2 * 1024 * 1024 if is_stream else 512 * 1024
@@ -2206,12 +2391,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 err_class = "upstream_4xx"
 
             log(
-                f"{self.command} {self.path} -> {resp.status} via {TARGET_URL} "
+                f"{self.command} {safe_path} -> {resp.status} via {TARGET_URL} "
                 f"({int(elapsed_ms)}ms) req_id={request_id} session={session_id}"
             )
             _record_request(
                 self.command,
-                self.path,
+                safe_path,
                 resp.status,
                 elapsed_ms,
                 TARGET_URL,
@@ -2240,10 +2425,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 request_headers=cap_req_headers,
             )
         except BrokenPipeError:
-            log(f"client disconnected during {self.command} {self.path} req_id={request_id}")
+            log(f"client disconnected during {self.command} {safe_path} req_id={request_id}")
             _record_request(
                 self.command,
-                self.path,
+                safe_path,
                 status or 499,
                 (time.time() - started) * 1000,
                 TARGET_URL,
@@ -2260,10 +2445,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 request_headers=cap_req_headers,
             )
         except Exception as exc:  # noqa: BLE001
-            log(f"proxy error for {self.command} {self.path} req_id={request_id}: {exc}")
+            log(f"proxy error for {self.command} {safe_path} req_id={request_id}: {exc}")
             _record_request(
                 self.command,
-                self.path,
+                safe_path,
                 502,
                 (time.time() - started) * 1000,
                 TARGET_URL,
@@ -2279,7 +2464,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 request_body=cap_req_body,
                 request_headers=cap_req_headers,
             )
-            if not self.wfile.closed:
+            if not response_started and not self.wfile.closed:
                 try:
                     self._json(502, {"error": "gateway_proxy_error", "message": str(exc)})
                 except Exception:

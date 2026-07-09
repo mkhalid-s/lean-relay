@@ -260,6 +260,26 @@ disable           Stops services and removes ANTHROPIC_BASE_URL from Claude sett
 
 `full` is kept as a deprecated alias of `headroom-pxpipe` for backward compat.
 
+## Upstream Target
+
+By default, apx eventually forwards to Anthropic:
+
+```bash
+apx target get
+# target: https://api.anthropic.com
+```
+
+Use `apx target set` to point the current chain at another Anthropic-compatible API endpoint:
+
+```bash
+apx target set https://api.anthropic.com
+apx target set https://your-compatible-endpoint.example.com
+apx target set https://your-compatible-endpoint.example.com --no-restart
+apx target reset
+```
+
+`apx target set` writes `APX_TARGET_API_URL` to `~/.config/apx/config.env` and then re-derives `GATEWAY_TARGET_API_URL`, `HEADROOM_TARGET_API_URL`, `PXPIPE_TARGET_API_URL`, and `SQUEEZR_TARGET_API_URL` for the current `APX_CHAIN`. It validates the URL as `http(s)://host[:port][/base-path]`.
+
 Current useful fallbacks:
 
 ```bash

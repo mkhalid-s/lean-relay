@@ -76,6 +76,8 @@ load_config() {
   : "${HEADROOM_CMD:=headroom proxy}"
   : "${PXPIPE_TARGET_API_URL:=https://api.anthropic.com}"
   : "${HEADROOM_TARGET_API_URL:=http://$BIND_HOST:$PXPIPE_PORT}"
+  : "${APX_TARGET_API_URL:=https://api.anthropic.com}"
+  : "${SQUEEZR_TARGET_API_URL:=$APX_TARGET_API_URL}"
   : "${GATEWAY_TARGET_API_URL:=http://$BIND_HOST:$HEADROOM_PORT}"
   : "${HEADROOM_MODE:=token}"
   : "${HEADROOM_ENABLE_TOOL_SEARCH:=true}"
@@ -95,8 +97,17 @@ load_config() {
   : "${HEADROOM_EXTRA_ARGS:=}"
   : "${SQUEEZR_EXTRA_ARGS:=}"
   : "${APX_DASHBOARD_ENABLED:=1}"
+  : "${APX_DASHBOARD_TOKEN:=}"
   : "${APX_HISTORY_SIZE:=500}"
   : "${APX_METRICS_ENABLED:=0}"
+  : "${APX_CAPTURE:=metadata}"
+  : "${APX_CAPTURE_FULL_ACK:=}"
+  : "${APX_CAPTURE_BODY_CAP:=65536}"
+  : "${APX_REDACT_KEYS:=}"
+  : "${APX_METRICS_DB:=$STATE_DIR/metrics.db}"
+  : "${APX_METRICS_RETENTION_DAYS:=30}"
+  : "${APX_METRICS_BACKFILL:=1}"
+  : "${APX_MAX_REQUEST_BYTES:=67108864}"
   # APX_CHAIN is authoritative; if unset (legacy config), infer it from the
   # ENABLED flags and TARGET_API_URL routing so upgrades don't break silently.
   if [[ -z "${APX_CHAIN+x}" ]]; then
@@ -213,7 +224,10 @@ start_gateway() {
     cd "$WORKDIR"
     export HOST="$BIND_HOST" GATEWAY_HOST="$BIND_HOST" GATEWAY_PORT="$GATEWAY_PORT" GATEWAY_TARGET_URL="$GATEWAY_TARGET_API_URL"
     export APX_DASHBOARD_ENABLED="$APX_DASHBOARD_ENABLED" APX_DASHBOARD_HTML="$DASHBOARD_HTML" APX_HISTORY_SIZE="$APX_HISTORY_SIZE"
-    export APX_METRICS_ENABLED="$APX_METRICS_ENABLED"
+    export APX_DASHBOARD_TOKEN="$APX_DASHBOARD_TOKEN"
+    export APX_METRICS_ENABLED="$APX_METRICS_ENABLED" APX_METRICS_DB="$APX_METRICS_DB" APX_METRICS_RETENTION_DAYS="$APX_METRICS_RETENTION_DAYS" APX_METRICS_BACKFILL="$APX_METRICS_BACKFILL"
+    export APX_CAPTURE="$APX_CAPTURE" APX_CAPTURE_FULL_ACK="$APX_CAPTURE_FULL_ACK" APX_CAPTURE_BODY_CAP="$APX_CAPTURE_BODY_CAP" APX_REDACT_KEYS="$APX_REDACT_KEYS"
+    export APX_MAX_REQUEST_BYTES="$APX_MAX_REQUEST_BYTES" APX_HEALTH_INTERVAL_SECONDS="$HEALTH_INTERVAL_SECONDS"
     export APX_CHAIN="${APX_CHAIN:-}"
     export APX_STATE_DIR="$STATE_DIR" APX_LOG_DIR="$LOG_DIR" APX_CONFIG="$CONFIG_FILE"
     export APX_HEADROOM_URL="http://$BIND_HOST:$HEADROOM_PORT" APX_PXPIPE_URL="http://$BIND_HOST:$PXPIPE_PORT" APX_SQUEEZR_URL="http://$BIND_HOST:$SQUEEZR_PORT"
@@ -243,11 +257,12 @@ start_squeezr() {
       return 1
     fi
   fi
-  log "starting Squeezr on $BIND_HOST:$SQUEEZR_PORT"
+  log "starting Squeezr on $BIND_HOST:$SQUEEZR_PORT -> $SQUEEZR_TARGET_API_URL"
   (
     cd "$WORKDIR"
     export_ca_bundle
     export SQUEEZR_PORT="$SQUEEZR_PORT" SQUEEZR_MITM_PORT="$SQUEEZR_MITM_PORT" SQUEEZR_DAEMON=1
+    export SQUEEZR_TARGET_API_URL="$SQUEEZR_TARGET_API_URL" ANTHROPIC_UPSTREAM="$SQUEEZR_TARGET_API_URL" ANTHROPIC_BASE_URL="$SQUEEZR_TARGET_API_URL"
     exec bash -lc "exec $SQUEEZR_CMD $SQUEEZR_EXTRA_ARGS"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/squeezr.pid"
@@ -1071,8 +1086,42 @@ set_config_var() {
 # To add a new service in the future, extend service_port, service_label, and
 # UPSTREAM_URL_FOR_SERVICE below. No mode permutations need to change.
 
-APX_ANTHROPIC_UPSTREAM='"https://api.anthropic.com"'
 APX_KNOWN_SERVICES=(headroom pxpipe squeezr)
+
+config_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  printf '"%s"' "$value"
+}
+
+target_api_url() {
+  printf '%s\n' "${APX_TARGET_API_URL:-https://api.anthropic.com}"
+}
+
+validate_target_api_url() {
+  local url="$1"
+  if [[ ! "$url" =~ ^https?://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(:[0-9]+)?(/[^[:space:]?#]*)?$ ]]; then
+    echo "error: target API URL must be http(s)://host[:port][/base-path]" >&2
+    echo "got: $url" >&2
+    return 2
+  fi
+  local rest="${url#*://}" port=""
+  rest="${rest%%/*}"
+  if [[ "$rest" == *"@"* ]]; then
+    echo "error: target API URL must not include userinfo" >&2
+    return 2
+  fi
+  if [[ "$rest" =~ :([0-9]+)$ ]]; then
+    port="${BASH_REMATCH[1]}"
+    if (( port < 1 || port > 65535 )); then
+      echo "error: target API URL port out of range: $port" >&2
+      return 2
+    fi
+  fi
+}
 
 service_port() {
   case "$1" in
@@ -1186,6 +1235,7 @@ chain_description() {
 apply_chain() {
   local chain="$1" gateway_enabled="${2:-1}"
   chain="${chain//[[:space:]]/}"
+  local -a seen_parts=()
 
   if [[ -n "$chain" ]]; then
     local IFS=, part
@@ -1195,13 +1245,24 @@ apply_chain() {
         echo "known services: ${APX_KNOWN_SERVICES[*]}" >&2
         return 2
       fi
+      local seen
+      for seen in "${seen_parts[@]:-}"; do
+        if [[ "$seen" == "$part" ]]; then
+          echo "error: duplicate service in chain: $part" >&2
+          return 2
+        fi
+      done
+      seen_parts+=("$part")
     done
   fi
 
   set_config_var APX_CHAIN "\"$chain\""
   set_config_var GATEWAY_ENABLED "$gateway_enabled"
 
-  local svc enabled_val gateway_target="$APX_ANTHROPIC_UPSTREAM"
+  local upstream target_upstream
+  upstream="$(target_api_url)"
+  target_upstream="$(config_quote "$upstream")"
+  local svc enabled_val gateway_target="$target_upstream"
   local -a chain_arr=()
   if [[ -n "$chain" ]]; then
     IFS=, read -r -a chain_arr <<<"$chain"
@@ -1218,14 +1279,14 @@ apply_chain() {
         break
       fi
     done
-    local target="$APX_ANTHROPIC_UPSTREAM"
+    local target="$target_upstream"
     if (( idx >= 0 )) && (( idx + 1 < ${#chain_arr[@]} )); then
       target="\"$(service_url "${chain_arr[$((idx + 1))]}")\""
     fi
     case "$svc" in
       headroom) set_config_var HEADROOM_ENABLED "$enabled_val"; set_config_var HEADROOM_TARGET_API_URL "$target" ;;
       pxpipe)   set_config_var PXPIPE_ENABLED   "$enabled_val"; set_config_var PXPIPE_TARGET_API_URL   "$target" ;;
-      squeezr)  set_config_var SQUEEZR_ENABLED  "$enabled_val" ;;
+      squeezr)  set_config_var SQUEEZR_ENABLED  "$enabled_val"; set_config_var SQUEEZR_TARGET_API_URL "$target" ;;
     esac
   done
 
@@ -1454,6 +1515,84 @@ chain_cli() {
       ;;
     -h|--help|help) chain_usage ;;
     *) chain_usage >&2; return 2 ;;
+  esac
+}
+
+target_usage() {
+  cat <<EOF
+usage: apx target <subcommand> [options]
+
+  get                       Show the configured upstream API endpoint
+  set <url>                 Set upstream API endpoint and re-derive current chain routes
+  reset                     Reset upstream API endpoint to https://api.anthropic.com
+
+Options:
+  --no-restart              Update config only; do not restart the LaunchAgent
+
+The URL must be http(s)://host[:port][/base-path].
+EOF
+}
+
+target_show() {
+  echo "target: $(target_api_url)"
+  echo "Gateway target:  $GATEWAY_TARGET_API_URL"
+  echo "Headroom target: $HEADROOM_TARGET_API_URL"
+  echo "pxpipe target:   $PXPIPE_TARGET_API_URL"
+  echo "chain: $(chain_description)"
+}
+
+target_set() {
+  local url="$1" restart="${2:-1}" chain
+  validate_target_api_url "$url" || return $?
+  set_config_var APX_TARGET_API_URL "$(config_quote "$url")"
+  load_config
+  chain="${APX_CHAIN:-}"
+  apply_chain "$chain" "$GATEWAY_ENABLED"
+  load_config
+  echo "target set: $(target_api_url)"
+  echo "chain: $(chain_description)"
+  if [[ "$restart" == "1" ]]; then
+    APX_TAKEOVER=1 install_service
+    sleep 5
+    status
+  else
+    echo "not restarted; run: apx install"
+  fi
+}
+
+target_cli() {
+  local sub="${1:-get}" restart="1"
+  shift || true
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) restart="0" ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  load_config
+  case "$sub" in
+    ""|get|show|status)
+      target_show
+      ;;
+    set)
+      if [[ -z "${positional[0]:-}" ]]; then
+        target_usage >&2
+        return 2
+      fi
+      target_set "${positional[0]}" "$restart"
+      ;;
+    reset)
+      target_set "https://api.anthropic.com" "$restart"
+      ;;
+    -h|--help|help)
+      target_usage
+      ;;
+    *)
+      target_usage >&2
+      return 2
+      ;;
   esac
 }
 
@@ -2351,9 +2490,10 @@ EOF
 
 print_completions() {
   local shell="${1:-}"
-  local cmds="start stop disable restart status mode chain doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
+  local cmds="start stop disable restart status mode chain target doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
   local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
   local chain_subs="get set clear ls preset help"
+  local target_subs="get set reset help"
   local services="headroom pxpipe squeezr"
   local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
   local purge_flags="--purge --purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches --dry-run --yes -y --help"
@@ -2375,6 +2515,7 @@ _apx_completions() {
   case "\${words[1]}" in
     mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
     chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
+    target)   COMPREPLY=( \$(compgen -W "$target_subs --no-restart" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
     completions) COMPREPLY=( \$(compgen -W "bash zsh fish install uninstall" -- "\$cur") ) ;;
     uninstall) COMPREPLY=( \$(compgen -W "$purge_flags" -- "\$cur") ) ;;
@@ -2396,6 +2537,7 @@ ZSH
       printf '  cmds=(%s)\n' "$cmds"
       printf '  modes=(%s)\n' "$modes"
       printf '  chain_subs=(%s)\n' "$chain_subs"
+      printf '  target_subs=(%s)\n' "$target_subs"
       printf '  services=(%s)\n' "$services"
       printf '  log_targets=(%s)\n' "$log_targets"
       cat <<'ZSH'
@@ -2406,6 +2548,7 @@ ZSH
   case "$words[2]" in
     mode) _describe -t modes 'apx mode' modes ;;
     chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
+    target) _describe -t target 'apx target' target_subs ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
     completions) _values 'action' 'bash' 'zsh' 'fish' 'install' 'uninstall' ;;
     uninstall) _values 'flag' '--purge' '--purge=all' '--purge=binaries' '--purge=share' '--purge=state' '--purge=config' '--purge=claude' '--purge=completions' '--purge=source' '--purge=deps' '--purge=caches' '--purge=all,deps,caches' '--dry-run' '--yes' '-y' '--help' ;;
@@ -2430,6 +2573,9 @@ FISH
       for c in $chain_subs; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from chain" -a "%s"\n' "$c"
       done
+      for t in $target_subs; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from target" -a "%s"\n' "$t"
+      done
       for s in $services; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from chain" -a "%s"\n' "$s"
       done
@@ -2438,6 +2584,7 @@ FISH
       done
       cat <<'FISH'
 complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install uninstall"
+complete -c apx -n "__fish_seen_subcommand_from target" -l no-restart
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -l purge -l dry-run -l yes
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -s y -l help
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -a "--purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches"
@@ -2573,6 +2720,7 @@ Commands:
   status               Show current health and pids
   mode [preset]        Show/set mode preset and sync Claude settings
   chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
+  target <sub>         Get/set upstream API endpoint (get|set|reset)
   doctor               Show status plus dependency diagnostics
   install              Install/start macOS LaunchAgent with KeepAlive
   uninstall [--purge]  Stop and remove LaunchAgent; --purge removes apx-owned files
@@ -2606,6 +2754,11 @@ For arbitrary orderings:
   apx chain set squeezr
   apx chain clear
 
+For custom upstream-compatible APIs:
+  apx target get
+  apx target set https://api.anthropic.com
+  apx target set https://your-compatible-endpoint.example.com --no-restart
+
 Options:
   --no-restart         Do not restart the LaunchAgent after mode/chain change
   --no-claude-sync     Do not update ~/.claude/settings.json
@@ -2625,6 +2778,7 @@ case "$cmd" in
   status) status ;;
   mode) set_mode "${@:-current}" ;;
   chain) chain_cli "$@" ;;
+  target) target_cli "$@" ;;
   doctor) doctor ;;
   install) install_service ;;
   uninstall) uninstall_command "$@" ;;
