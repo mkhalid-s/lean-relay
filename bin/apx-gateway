@@ -4,16 +4,21 @@
 from __future__ import annotations
 
 import collections
+import hashlib
 import http.client
 import json
+import mimetypes
 import os
+import re
 import secrets
 import signal
+import sqlite3
 import threading
 import time
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, Iterable
 from urllib.parse import parse_qs, urlsplit
 
 BIND_HOST = os.environ.get("GATEWAY_HOST") or os.environ.get("HOST") or "127.0.0.1"
@@ -42,7 +47,65 @@ HEALTH_INTERVAL_SECONDS = float(os.environ.get("APX_HEALTH_INTERVAL_SECONDS", "5
 MAX_LOG_STREAMS_PER_IP = int(os.environ.get("APX_MAX_LOG_STREAMS_PER_IP", "8"))
 MAX_REQUEST_BYTES = int(os.environ.get("APX_MAX_REQUEST_BYTES", str(64 * 1024 * 1024)))
 
+# --- Metrics data plane (0.4.0+) ---------------------------------------------
+CAPTURE_LEVEL = (os.environ.get("APX_CAPTURE", "metadata") or "metadata").strip().lower()
+CAPTURE_FULL_ACK = (os.environ.get("APX_CAPTURE_FULL_ACK", "") or "").strip()
+CAPTURE_BODY_CAP = int(os.environ.get("APX_CAPTURE_BODY_CAP", str(64 * 1024)))
+REDACT_KEYS_EXTRA = tuple(
+    k.strip().lower()
+    for k in (os.environ.get("APX_REDACT_KEYS", "") or "").split(",")
+    if k.strip()
+)
+_METRICS_DB_ENV = os.environ.get("APX_METRICS_DB")
+METRICS_DB_PATH = (_METRICS_DB_ENV if _METRICS_DB_ENV is not None else os.path.join(STATE_DIR, "metrics.db")).strip()
+if _METRICS_DB_ENV is None:
+    METRICS_DB_PATH = os.path.join(STATE_DIR, "metrics.db")
+METRICS_DB_ENABLED = METRICS_DB_PATH.lower() not in ("", "off", "0", "false", "none", "disabled")
+METRICS_RETENTION_DAYS = int(os.environ.get("APX_METRICS_RETENTION_DAYS", "30") or "30")
+METRICS_BACKFILL = os.environ.get("APX_METRICS_BACKFILL", "1") == "1"
+
+DASHBOARD_STATIC_DIR = os.environ.get("APX_DASHBOARD_STATIC_DIR", "").strip()
+
 VERSION_FILE = os.path.join(STATE_DIR, "VERSION")
+
+# Header names redacted from ever being persisted, even at APX_CAPTURE=full.
+_ALWAYS_REDACT_HEADERS = frozenset({
+    "authorization",
+    "cookie",
+    "set-cookie",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "x-anthropic-api-key",
+    "openai-organization",
+    "x-goog-api-key",
+    "x-goog-user-project",
+    "x-amz-security-token",
+    "x-amz-signature",
+    "x-amz-access-token",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-content-sha256",
+    "x-forwarded-authorization",
+})
+# Body JSON keys that are always redacted.
+_ALWAYS_REDACT_JSON_KEYS = frozenset({
+    "api_key", "apikey", "api-key",
+    "authorization", "auth", "bearer",
+    "password", "passphrase", "secret",
+    "token", "access_token", "refresh_token", "session_token", "id_token",
+    "client_secret", "private_key",
+    "x-api-key",
+})
+_SENSITIVE_TEXT_PATTERNS = tuple(
+    re.compile(pat) for pat in (
+        r"sk-[A-Za-z0-9_\-]{20,}",              # OpenAI/Anthropic style keys
+        r"anthropic-[A-Za-z0-9_\-]{20,}",       # Anthropic explicit
+        r"AIza[0-9A-Za-z_\-]{30,}",             # Google API keys
+        r"ghp_[A-Za-z0-9]{30,}",                # GitHub PAT
+        r"AKIA[0-9A-Z]{16}",                    # AWS access key
+    )
+)
 
 # Service registry. Adding a new proxyable service means one entry here
 # (health path + label + default port) plus any needed env override.
@@ -96,6 +159,417 @@ def _load_model_costs() -> dict[str, tuple[float, float]]:
 
 
 MODEL_COSTS = _load_model_costs()
+
+# --- Session id derivation ---------------------------------------------------
+# We derive a stable session id from a small set of headers that CLI-based
+# clients (Claude Code, Codex, etc.) reuse across a chat, so we can group
+# requests without adding server-side state or trusting a client-supplied id.
+_SESSION_HEADER_CANDIDATES = (
+    "x-apx-session-id",
+    "x-session-id",
+    "x-request-session",
+    "x-anthropic-session-id",
+    "anthropic-session-id",
+    "x-conversation-id",
+    "conversation-id",
+    "x-chat-id",
+    "x-thread-id",
+    "openai-thread-id",
+)
+
+# --- Capture-level validation ------------------------------------------------
+_CAPTURE_LEVELS = ("metadata", "full")
+
+
+def _validate_capture_level() -> str | None:
+    """Return an error message if capture config is invalid, else None."""
+    if CAPTURE_LEVEL not in _CAPTURE_LEVELS:
+        return (
+            f"invalid APX_CAPTURE={CAPTURE_LEVEL!r}; expected one of {_CAPTURE_LEVELS}"
+        )
+    if CAPTURE_LEVEL == "full" and CAPTURE_FULL_ACK != "i-understand":
+        return (
+            "APX_CAPTURE=full requires APX_CAPTURE_FULL_ACK=i-understand. "
+            "Full capture writes redacted request/response bodies to a LOCAL SQLite "
+            "database; the JSONL audit log remains metadata-only. Data never leaves "
+            "this machine, but you must acknowledge the sensitivity before enabling it."
+        )
+    return None
+
+
+# --- Redaction helpers -------------------------------------------------------
+def _redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Return headers with sensitive values masked, safe to persist."""
+    if not headers:
+        return {}
+    out: dict[str, str] = {}
+    always = _ALWAYS_REDACT_HEADERS
+    extra = set(REDACT_KEYS_EXTRA)
+    for key, value in headers.items():
+        lk = key.lower()
+        if lk in always or lk in extra or lk.startswith("x-amz-"):
+            out[key] = "***"
+        else:
+            out[key] = value
+    return out
+
+
+def _redact_json_value(node: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return node
+    if isinstance(node, dict):
+        red: dict[str, Any] = {}
+        redact_names = _ALWAYS_REDACT_JSON_KEYS | set(REDACT_KEYS_EXTRA)
+        for k, v in node.items():
+            if isinstance(k, str) and k.lower() in redact_names:
+                red[k] = "***"
+            else:
+                red[k] = _redact_json_value(v, depth + 1)
+        return red
+    if isinstance(node, list):
+        return [_redact_json_value(x, depth + 1) for x in node[:2000]]
+    if isinstance(node, str):
+        return _redact_secrets_in_text(node)
+    return node
+
+
+def _redact_secrets_in_text(text: str) -> str:
+    if not text:
+        return text
+    out = text
+    for pat in _SENSITIVE_TEXT_PATTERNS:
+        out = pat.sub("[REDACTED]", out)
+    return out
+
+
+def _capture_body(body: bytes, content_type: str) -> str | None:
+    """Return a JSON-serializable string representation of the body, respecting
+    APX_CAPTURE. Never returns raw bytes; always redacted.
+
+    Metadata mode returns None (no body captured).
+    Full mode returns a redacted, truncated string.
+    """
+    if CAPTURE_LEVEL != "full" or not body:
+        return None
+    try:
+        truncated = body[: CAPTURE_BODY_CAP]
+        text = truncated.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        return None
+    ct = (content_type or "").lower()
+    if "application/json" in ct:
+        try:
+            parsed = json.loads(text)
+            parsed = _redact_json_value(parsed)
+            return json.dumps(parsed, separators=(",", ":"))[: CAPTURE_BODY_CAP]
+        except Exception:  # noqa: BLE001
+            return _redact_secrets_in_text(text)
+    return _redact_secrets_in_text(text)
+
+
+def _derive_session_id(headers: Any, model: str | None, body: bytes) -> str:
+    """Derive a stable session id. Prefer explicit headers; fall back to a
+    content-derived hash of the first-user-message contents (matching how
+    pxpipe and Squeezr internally group sessions).
+    """
+    if headers is not None:
+        for name in _SESSION_HEADER_CANDIDATES:
+            try:
+                val = headers.get(name) or headers.get(name.title())
+            except Exception:  # noqa: BLE001
+                val = None
+            if val:
+                return str(val)[:64]
+    # Content-derived fallback: hash first user text block.
+    try:
+        obj = json.loads((body or b"").decode("utf-8", errors="replace") or "{}")
+    except Exception:  # noqa: BLE001
+        obj = {}
+    seed = ""
+    if isinstance(obj, dict):
+        msgs = obj.get("messages") or obj.get("input") or []
+        if isinstance(msgs, list):
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                if m.get("role") not in ("user", None):
+                    continue
+                content = m.get("content")
+                if isinstance(content, str):
+                    seed = content
+                    break
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            t = part.get("text")
+                            if isinstance(t, str) and t:
+                                seed = t
+                                break
+                if seed:
+                    break
+    if not seed:
+        return f"m-{model or 'unknown'}-{int(time.time()) // 1800}"
+    digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()
+    return f"s-{digest[:12]}"
+
+
+# --- SQLite metrics store ---------------------------------------------------
+_METRICS_SCHEMA_VERSION = 1
+_METRICS_DDL = [
+    """
+    CREATE TABLE IF NOT EXISTS schema_version (
+      version INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      request_id TEXT,
+      session_id TEXT,
+      method TEXT,
+      path TEXT,
+      model TEXT,
+      status INTEGER,
+      latency_ms REAL,
+      first_byte_ms REAL,
+      tokens_in INTEGER,
+      tokens_out INTEGER,
+      cache_read_tokens INTEGER,
+      cache_write_tokens INTEGER,
+      cost_est_usd REAL,
+      bytes_in INTEGER,
+      bytes_out INTEGER,
+      chain_mode TEXT,
+      chain_hops TEXT,
+      hop_timings TEXT,
+      upstream TEXT,
+      is_stream INTEGER,
+      tool_call_count INTEGER,
+      err_class TEXT,
+      capture_level TEXT,
+      request_body TEXT,
+      response_body TEXT,
+      request_headers TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model, ts)",
+    "CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status, ts)",
+]
+
+
+class MetricsStore:
+    """Thread-safe SQLite writer for per-request metrics.
+
+    Uses a single connection guarded by a lock (the record volume is tiny
+    compared to the request throughput, so contention is minimal). WAL mode
+    is enabled so read queries from the dashboard never block writes.
+    """
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+        self._conn: sqlite3.Connection | None = None
+        self.enabled = False
+        self.error: str | None = None
+
+    def open(self) -> bool:
+        try:
+            Path(os.path.dirname(self.path) or ".").mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(
+                self.path,
+                timeout=5.0,
+                check_same_thread=False,
+                isolation_level=None,  # autocommit; we use explicit txns
+            )
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            for stmt in _METRICS_DDL:
+                conn.execute(stmt)
+            cur = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
+            row = cur.fetchone()
+            current = int(row[0]) if row else 0
+            if current < _METRICS_SCHEMA_VERSION:
+                conn.execute("DELETE FROM schema_version")
+                conn.execute("INSERT INTO schema_version(version) VALUES (?)", (_METRICS_SCHEMA_VERSION,))
+            self._conn = conn
+            self.enabled = True
+            return True
+        except Exception as exc:  # noqa: BLE001
+            self.error = str(exc)
+            self.enabled = False
+            self._conn = None
+            return False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._conn is not None:
+                try:
+                    self._conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._conn = None
+            self.enabled = False
+
+    def is_fresh(self) -> bool:
+        if not self.enabled or self._conn is None:
+            return False
+        with self._lock:
+            cur = self._conn.execute("SELECT COUNT(*) FROM requests")
+            return int(cur.fetchone()[0]) == 0
+
+    def insert(self, row: dict[str, Any]) -> None:
+        if not self.enabled or self._conn is None:
+            return
+        cols = (
+            "ts", "request_id", "session_id", "method", "path", "model", "status",
+            "latency_ms", "first_byte_ms", "tokens_in", "tokens_out",
+            "cache_read_tokens", "cache_write_tokens", "cost_est_usd",
+            "bytes_in", "bytes_out", "chain_mode", "chain_hops", "hop_timings",
+            "upstream", "is_stream", "tool_call_count", "err_class",
+            "capture_level", "request_body", "response_body", "request_headers",
+        )
+        values = tuple(row.get(c) for c in cols)
+        placeholders = ",".join(["?"] * len(cols))
+        try:
+            with self._lock:
+                self._conn.execute(
+                    f"INSERT INTO requests({','.join(cols)}) VALUES ({placeholders})",
+                    values,
+                )
+        except Exception as exc:  # noqa: BLE001
+            log(f"metrics insert failed: {exc}")
+
+    def bulk_insert(self, rows: Iterable[dict[str, Any]]) -> int:
+        if not self.enabled or self._conn is None:
+            return 0
+        cols = (
+            "ts", "request_id", "session_id", "method", "path", "model", "status",
+            "latency_ms", "first_byte_ms", "tokens_in", "tokens_out",
+            "cache_read_tokens", "cache_write_tokens", "cost_est_usd",
+            "bytes_in", "bytes_out", "chain_mode", "chain_hops", "hop_timings",
+            "upstream", "is_stream", "tool_call_count", "err_class",
+            "capture_level", "request_body", "response_body", "request_headers",
+        )
+        placeholders = ",".join(["?"] * len(cols))
+        stmt = f"INSERT INTO requests({','.join(cols)}) VALUES ({placeholders})"
+        count = 0
+        try:
+            with self._lock:
+                self._conn.execute("BEGIN")
+                for r in rows:
+                    self._conn.execute(stmt, tuple(r.get(c) for c in cols))
+                    count += 1
+                self._conn.execute("COMMIT")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                self._conn.execute("ROLLBACK")
+            except Exception:  # noqa: BLE001
+                pass
+            log(f"metrics bulk insert failed after {count}: {exc}")
+        return count
+
+    def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
+        if not self.enabled or self._conn is None:
+            return []
+        with self._lock:
+            cur = self._conn.execute(sql, params)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+    def prune_older_than(self, cutoff_ts: float) -> int:
+        if not self.enabled or self._conn is None:
+            return 0
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff_ts,))
+            return cur.rowcount or 0
+
+
+METRICS = MetricsStore(METRICS_DB_PATH)
+
+
+def _backfill_from_jsonl() -> None:
+    """Import existing history/*.jsonl into SQLite if the DB is fresh.
+
+    Rows without a capture_level are marked "metadata" (legacy pre-0.4.0 rows
+    are always metadata-only by definition). We do this once, on a fresh DB.
+    """
+    if not METRICS_BACKFILL or not METRICS.enabled:
+        return
+    if not METRICS.is_fresh():
+        return
+    if not os.path.isdir(HISTORY_DIR):
+        return
+    files = sorted(f for f in os.listdir(HISTORY_DIR) if f.endswith(".jsonl"))
+    if not files:
+        return
+    log(f"metrics: backfilling from {len(files)} JSONL file(s) in {HISTORY_DIR}")
+    total = 0
+    for fname in files:
+        rows: list[dict[str, Any]] = []
+        try:
+            with open(os.path.join(HISTORY_DIR, fname), "r", encoding="utf-8", errors="replace") as fh:
+                for raw in fh:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        entry = json.loads(raw)
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(entry, dict):
+                        continue
+                    rows.append({
+                        "ts": float(entry.get("ts") or 0.0),
+                        "request_id": entry.get("request_id") or "",
+                        "session_id": entry.get("session_id") or "",
+                        "method": entry.get("method") or "",
+                        "path": entry.get("path") or "",
+                        "model": entry.get("model") or "",
+                        "status": int(entry.get("status") or 0),
+                        "latency_ms": float(entry.get("latency_ms") or 0.0),
+                        "first_byte_ms": float(entry.get("first_byte_ms") or 0.0),
+                        "tokens_in": int(entry.get("tokens_in") or 0),
+                        "tokens_out": int(entry.get("tokens_out") or 0),
+                        "cache_read_tokens": int(entry.get("cache_read_tokens") or 0),
+                        "cache_write_tokens": int(entry.get("cache_write_tokens") or 0),
+                        "cost_est_usd": float(entry.get("cost_est_usd") or 0.0),
+                        "bytes_in": int(entry.get("bytes_in") or 0),
+                        "bytes_out": int(entry.get("bytes_out") or 0),
+                        "chain_mode": entry.get("chain_mode") or "",
+                        "chain_hops": entry.get("chain_hops") or "",
+                        "hop_timings": entry.get("hop_timings") or "",
+                        "upstream": entry.get("upstream") or "",
+                        "is_stream": int(bool(entry.get("is_stream"))),
+                        "tool_call_count": int(entry.get("tool_call_count") or 0),
+                        "err_class": entry.get("err_class") or "",
+                        "capture_level": entry.get("capture_level") or "metadata",
+                        "request_body": None,
+                        "response_body": None,
+                        "request_headers": None,
+                    })
+        except OSError:
+            continue
+        total += METRICS.bulk_insert(rows)
+    log(f"metrics: backfill complete, {total} rows imported")
+
+
+def _metrics_janitor_loop() -> None:
+    """Periodically prune old rows per retention policy."""
+    while True:
+        try:
+            if METRICS.enabled and METRICS_RETENTION_DAYS > 0:
+                cutoff = time.time() - METRICS_RETENTION_DAYS * 86400
+                deleted = METRICS.prune_older_than(cutoff)
+                if deleted:
+                    log(f"metrics: pruned {deleted} row(s) older than {METRICS_RETENTION_DAYS}d")
+        except Exception as exc:  # noqa: BLE001
+            log(f"metrics janitor error: {exc}")
+        time.sleep(3600)
+
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -337,25 +811,52 @@ def _record_request(
     latency_ms: float,
     upstream: str,
     request_id: str = "",
+    session_id: str = "",
     model: str | None = None,
     tokens_in: int = 0,
     tokens_out: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    bytes_in: int = 0,
     bytes_out: int = 0,
+    first_byte_ms: float = 0.0,
+    chain_mode: str = "",
+    chain_hops: str = "",
+    hop_timings: str = "",
+    is_stream: bool = False,
+    tool_call_count: int = 0,
+    err_class: str = "",
+    request_body: str | None = None,
+    response_body: str | None = None,
+    request_headers: str | None = None,
 ) -> None:
     cost = _cost_estimate(model, tokens_in, tokens_out)
+    ts = time.time()
     entry = {
-        "ts": time.time(),
+        "ts": ts,
         "request_id": request_id,
+        "session_id": session_id,
         "method": method,
         "path": path,
         "status": status,
         "latency_ms": round(latency_ms, 2),
+        "first_byte_ms": round(first_byte_ms, 2),
         "upstream": upstream,
         "model": model or "",
         "tokens_in": tokens_in,
         "tokens_out": tokens_out,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
         "cost_est_usd": cost,
+        "bytes_in": bytes_in,
         "bytes_out": bytes_out,
+        "chain_mode": chain_mode,
+        "chain_hops": chain_hops,
+        "hop_timings": hop_timings,
+        "is_stream": bool(is_stream),
+        "tool_call_count": tool_call_count,
+        "err_class": err_class,
+        "capture_level": CAPTURE_LEVEL,
     }
     with _HISTORY_LOCK:
         _HISTORY.append(entry)
@@ -367,7 +868,15 @@ def _record_request(
         _STATS["tokens_in"] += tokens_in
         _STATS["tokens_out"] += tokens_out
         _STATS["cost_est_usd"] += cost
+    # JSONL audit log (always metadata-only regardless of capture level).
     _persist_history(entry)
+    # Durable SQLite store. Body/headers captured only if CAPTURE_LEVEL=full.
+    sqlite_row = dict(entry)
+    sqlite_row["is_stream"] = int(bool(is_stream))
+    sqlite_row["request_body"] = request_body if CAPTURE_LEVEL == "full" else None
+    sqlite_row["response_body"] = response_body if CAPTURE_LEVEL == "full" else None
+    sqlite_row["request_headers"] = request_headers if CAPTURE_LEVEL == "full" else None
+    METRICS.insert(sqlite_row)
 
 
 def _log_targets() -> dict[str, str]:
@@ -405,6 +914,529 @@ def _fetch_json(url: str, timeout: float = 3.0) -> dict:
         return json.loads(body.decode("utf-8"))
     finally:
         conn.close()
+
+
+def _fetch_text(url: str, timeout: float = 3.0) -> tuple[int, str, str]:
+    """GET url and return (status, content_type, text). Never raises."""
+    try:
+        target = urlsplit(url)
+        cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+        conn = cls(target.netloc, timeout=timeout)
+        try:
+            path = target.path or "/"
+            if target.query:
+                path = f"{path}?{target.query}"
+            conn.request("GET", path)
+            resp = conn.getresponse()
+            ct = resp.getheader("content-type", "") or ""
+            body = resp.read()
+            return resp.status, ct, body.decode("utf-8", errors="replace")
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001
+        return 0, "", f"error: {exc}"
+
+
+def _parse_prometheus_metrics(text: str) -> dict[str, Any]:
+    """Parse a Prometheus exposition-format string into a compact JSON structure.
+
+    Preserves label sets. Histograms are folded into `{name: {"_buckets": {le: value}, "_sum": s, "_count": c}}`.
+    """
+    metrics: dict[str, dict[str, Any]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)(?:\s+\d+)?$", line)
+        if not m:
+            continue
+        name, labels_raw, value_raw = m.group(1), m.group(2) or "", m.group(3)
+        try:
+            value = float(value_raw)
+        except ValueError:
+            continue
+        labels: dict[str, str] = {}
+        for pair in re.findall(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"]*)"', labels_raw):
+            labels[pair[0]] = pair[1]
+        # Detect histogram folding
+        if name.endswith("_bucket") and "le" in labels:
+            base = name[: -len("_bucket")]
+            metrics.setdefault(base, {}).setdefault("_buckets", {})[labels["le"]] = value
+        elif name.endswith("_sum"):
+            base = name[: -len("_sum")]
+            metrics.setdefault(base, {})["_sum"] = value
+        elif name.endswith("_count"):
+            base = name[: -len("_count")]
+            metrics.setdefault(base, {})["_count"] = value
+        else:
+            entry = metrics.setdefault(name, {})
+            if labels:
+                entry.setdefault("_series", []).append({"labels": labels, "value": value})
+            else:
+                entry["_value"] = value
+    return metrics
+
+
+def _percentile(sorted_vals: list[float], pct: float) -> float:
+    if not sorted_vals:
+        return 0.0
+    if pct <= 0:
+        return sorted_vals[0]
+    if pct >= 100:
+        return sorted_vals[-1]
+    k = (len(sorted_vals) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+
+def _window_seconds(window: str) -> float:
+    m = {"5m": 300, "15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
+    return float(m.get(window, 3600))
+
+
+def _bucket_seconds(bucket: str) -> int:
+    m = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "6h": 21600, "1d": 86400}
+    return int(m.get(bucket, 60))
+
+
+# --- API helpers for /api/metrics/* and /api/tool/* -------------------------
+_TOOL_CACHE: dict[str, dict[str, Any]] = {}
+_TOOL_CACHE_LOCK = threading.Lock()
+
+
+def _tool_cached(key: str, ttl: float, fetch) -> dict[str, Any]:
+    now = time.time()
+    with _TOOL_CACHE_LOCK:
+        entry = _TOOL_CACHE.get(key)
+        if entry and now - entry.get("_ts", 0) < ttl:
+            return entry["_value"]
+    try:
+        value = fetch()
+    except Exception as exc:  # noqa: BLE001
+        value = {"error": str(exc)}
+    with _TOOL_CACHE_LOCK:
+        _TOOL_CACHE[key] = {"_ts": now, "_value": value}
+    return value
+
+
+def _api_metrics_summary(query: dict[str, list[str]]) -> dict[str, Any]:
+    window = (query.get("window", ["1h"])[0] or "1h").lower()
+    ws = _window_seconds(window)
+    since = time.time() - ws
+    if METRICS.enabled:
+        rows = METRICS.query(
+            "SELECT status, latency_ms, first_byte_ms, tokens_in, tokens_out, "
+            "cache_read_tokens, cache_write_tokens, cost_est_usd, bytes_in, "
+            "bytes_out, is_stream, tool_call_count, model FROM requests WHERE ts >= ?",
+            (since,),
+        )
+    else:
+        with _HISTORY_LOCK:
+            rows = [dict(r) for r in _HISTORY if r.get("ts", 0) >= since]
+    total = len(rows)
+    ok = sum(1 for r in rows if 200 <= (r.get("status") or 0) < 400)
+    warn = sum(1 for r in rows if 400 <= (r.get("status") or 0) < 500)
+    err = sum(1 for r in rows if (r.get("status") or 0) >= 500)
+    latencies = sorted(float(r.get("latency_ms") or 0) for r in rows if r.get("latency_ms"))
+    first_bytes = sorted(float(r.get("first_byte_ms") or 0) for r in rows if r.get("first_byte_ms"))
+    tokens_in = sum(int(r.get("tokens_in") or 0) for r in rows)
+    tokens_out = sum(int(r.get("tokens_out") or 0) for r in rows)
+    cache_read = sum(int(r.get("cache_read_tokens") or 0) for r in rows)
+    cache_write = sum(int(r.get("cache_write_tokens") or 0) for r in rows)
+    cost = sum(float(r.get("cost_est_usd") or 0) for r in rows)
+    bytes_in = sum(int(r.get("bytes_in") or 0) for r in rows)
+    bytes_out = sum(int(r.get("bytes_out") or 0) for r in rows)
+    tool_calls = sum(int(r.get("tool_call_count") or 0) for r in rows)
+    streams = sum(1 for r in rows if int(r.get("is_stream") or 0))
+    # Per-model rollup
+    by_model: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        m = (r.get("model") or "").strip() or "unknown"
+        e = by_model.setdefault(m, {"requests": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "latency_p50_ms": 0.0, "_lats": []})
+        e["requests"] += 1
+        e["tokens_in"] += int(r.get("tokens_in") or 0)
+        e["tokens_out"] += int(r.get("tokens_out") or 0)
+        e["cost_usd"] += float(r.get("cost_est_usd") or 0)
+        e["_lats"].append(float(r.get("latency_ms") or 0))
+    for e in by_model.values():
+        lats = sorted(e.pop("_lats"))
+        e["latency_p50_ms"] = round(_percentile(lats, 50), 2)
+        e["latency_p95_ms"] = round(_percentile(lats, 95), 2)
+        e["cost_usd"] = round(e["cost_usd"], 6)
+    return {
+        "window": window,
+        "since_ts": since,
+        "totals": {
+            "requests": total,
+            "ok": ok,
+            "warn_4xx": warn,
+            "err_5xx": err,
+            "streams": streams,
+            "tool_calls": tool_calls,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "cost_est_usd": round(cost, 6),
+            "bytes_in": bytes_in,
+            "bytes_out": bytes_out,
+        },
+        "latency_ms": {
+            "p50": round(_percentile(latencies, 50), 2),
+            "p95": round(_percentile(latencies, 95), 2),
+            "p99": round(_percentile(latencies, 99), 2),
+            "avg": round(sum(latencies) / len(latencies), 2) if latencies else 0.0,
+        },
+        "first_byte_ms": {
+            "p50": round(_percentile(first_bytes, 50), 2),
+            "p95": round(_percentile(first_bytes, 95), 2),
+        },
+        "by_model": by_model,
+    }
+
+
+def _api_metrics_timeseries(query: dict[str, list[str]]) -> dict[str, Any]:
+    window = (query.get("window", ["1h"])[0] or "1h").lower()
+    bucket = (query.get("bucket", ["1m"])[0] or "1m").lower()
+    ws = _window_seconds(window)
+    bs = _bucket_seconds(bucket)
+    since = time.time() - ws
+    if METRICS.enabled:
+        rows = METRICS.query(
+            "SELECT ts, status, latency_ms, tokens_in, tokens_out, cost_est_usd "
+            "FROM requests WHERE ts >= ? ORDER BY ts ASC",
+            (since,),
+        )
+    else:
+        with _HISTORY_LOCK:
+            rows = [dict(r) for r in _HISTORY if r.get("ts", 0) >= since]
+    buckets: dict[int, dict[str, float]] = {}
+    for r in rows:
+        b = int((r.get("ts") or 0) // bs) * bs
+        e = buckets.setdefault(b, {"requests": 0, "err": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "_lats": []})
+        e["requests"] += 1
+        if (r.get("status") or 0) >= 400:
+            e["err"] += 1
+        e["tokens_in"] += int(r.get("tokens_in") or 0)
+        e["tokens_out"] += int(r.get("tokens_out") or 0)
+        e["cost_usd"] += float(r.get("cost_est_usd") or 0)
+        e["_lats"].append(float(r.get("latency_ms") or 0))
+    series = []
+    for b in sorted(buckets.keys()):
+        e = buckets[b]
+        lats = sorted(e.pop("_lats"))
+        series.append({
+            "ts": b,
+            "requests": e["requests"],
+            "err": e["err"],
+            "tokens_in": e["tokens_in"],
+            "tokens_out": e["tokens_out"],
+            "cost_usd": round(e["cost_usd"], 6),
+            "latency_p50_ms": round(_percentile(lats, 50), 2),
+            "latency_p95_ms": round(_percentile(lats, 95), 2),
+        })
+    return {"window": window, "bucket": bucket, "since_ts": since, "series": series}
+
+
+def _api_metrics_sessions(query: dict[str, list[str]]) -> dict[str, Any]:
+    limit = min(int(query.get("limit", ["50"])[0] or 50), 500)
+    window = (query.get("window", ["24h"])[0] or "24h").lower()
+    since = time.time() - _window_seconds(window)
+    if METRICS.enabled:
+        rows = METRICS.query(
+            "SELECT session_id, MIN(ts) AS first_ts, MAX(ts) AS last_ts, COUNT(*) AS requests, "
+            "SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, "
+            "SUM(cost_est_usd) AS cost_usd, SUM(tool_call_count) AS tool_calls, "
+            "AVG(latency_ms) AS avg_latency_ms, MAX(chain_mode) AS chain_mode, "
+            "MAX(model) AS last_model "
+            "FROM requests WHERE ts >= ? AND session_id != '' "
+            "GROUP BY session_id ORDER BY last_ts DESC LIMIT ?",
+            (since, limit),
+        )
+    else:
+        # In-memory fallback: group history entries.
+        with _HISTORY_LOCK:
+            hist = [dict(r) for r in _HISTORY if r.get("ts", 0) >= since and r.get("session_id")]
+        grouped: dict[str, dict[str, Any]] = {}
+        for r in hist:
+            sid = r.get("session_id") or ""
+            e = grouped.setdefault(sid, {
+                "session_id": sid, "first_ts": r["ts"], "last_ts": r["ts"],
+                "requests": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0,
+                "tool_calls": 0, "_lat_sum": 0.0, "chain_mode": r.get("chain_mode", ""),
+                "last_model": r.get("model", ""),
+            })
+            e["requests"] += 1
+            e["tokens_in"] += int(r.get("tokens_in") or 0)
+            e["tokens_out"] += int(r.get("tokens_out") or 0)
+            e["cost_usd"] += float(r.get("cost_est_usd") or 0)
+            e["tool_calls"] += int(r.get("tool_call_count") or 0)
+            e["_lat_sum"] += float(r.get("latency_ms") or 0)
+            e["first_ts"] = min(e["first_ts"], r["ts"])
+            e["last_ts"] = max(e["last_ts"], r["ts"])
+            e["last_model"] = r.get("model") or e["last_model"]
+        rows = []
+        for e in grouped.values():
+            e["avg_latency_ms"] = e["_lat_sum"] / e["requests"] if e["requests"] else 0.0
+            del e["_lat_sum"]
+            rows.append(e)
+        rows.sort(key=lambda x: x["last_ts"], reverse=True)
+        rows = rows[:limit]
+    return {"window": window, "sessions": rows, "count": len(rows)}
+
+
+def _api_metrics_session_detail(session_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+    if not session_id:
+        return {"error": "session_id required", "requests": []}
+    if METRICS.enabled:
+        rows = METRICS.query(
+            "SELECT ts, request_id, method, path, model, status, latency_ms, first_byte_ms, "
+            "tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, cost_est_usd, "
+            "bytes_in, bytes_out, chain_mode, chain_hops, hop_timings, is_stream, "
+            "tool_call_count, err_class, capture_level "
+            "FROM requests WHERE session_id = ? ORDER BY ts ASC LIMIT 5000",
+            (session_id,),
+        )
+    else:
+        with _HISTORY_LOCK:
+            rows = [dict(r) for r in _HISTORY if r.get("session_id") == session_id]
+    # Include full bodies only when explicitly requested AND capture=full.
+    if query.get("include_body", ["0"])[0] in ("1", "true", "yes") and CAPTURE_LEVEL == "full" and METRICS.enabled:
+        detail = METRICS.query(
+            "SELECT request_id, request_body, response_body, request_headers "
+            "FROM requests WHERE session_id = ? ORDER BY ts ASC LIMIT 5000",
+            (session_id,),
+        )
+        detail_by_rid = {d.get("request_id"): d for d in detail}
+        for r in rows:
+            d = detail_by_rid.get(r.get("request_id")) or {}
+            r["request_body"] = d.get("request_body")
+            r["response_body"] = d.get("response_body")
+            r["request_headers"] = d.get("request_headers")
+    return {"session_id": session_id, "requests": rows, "count": len(rows)}
+
+
+# --- Tool proxy endpoints (feature-detect + per-tool aggregate) --------------
+def _cfg_now() -> dict[str, str]:
+    return _load_config_values()
+
+
+def _service_is_enabled(cfg: dict[str, str], name: str) -> bool:
+    active = set(_chain_from_config(cfg))
+    if name in active:
+        return True
+    flag = {"headroom": "HEADROOM_ENABLED", "pxpipe": "PXPIPE_ENABLED", "squeezr": "SQUEEZR_ENABLED"}.get(name)
+    return bool(flag and cfg.get(flag) == "1")
+
+
+def _api_tool_headroom() -> dict[str, Any]:
+    def _fetch():
+        stats_status, _, stats_body = _fetch_text(HEADROOM_URL + "/stats", timeout=2.5)
+        try:
+            stats = json.loads(stats_body) if stats_status == 200 else {"_error": f"stats status {stats_status}"}
+        except Exception:  # noqa: BLE001
+            stats = {"_error": "invalid json from /stats"}
+        prom_status, _, prom_body = _fetch_text(HEADROOM_URL + "/metrics", timeout=2.5)
+        prom = _parse_prometheus_metrics(prom_body) if prom_status == 200 else {}
+        # Extract normalized fields for the unified card.
+        lifetime = ((stats.get("persistent_savings") or {}).get("lifetime") or {}) if isinstance(stats, dict) else {}
+        tokens = (stats.get("tokens") or {}) if isinstance(stats, dict) else {}
+        cache = (stats.get("cache") or {}) if isinstance(stats, dict) else {}
+        requests = (stats.get("requests") or {}) if isinstance(stats, dict) else {}
+        normalized = {
+            "tokens_saved_lifetime": int(lifetime.get("tokens_saved") or 0),
+            "tokens_saved_session": int(tokens.get("saved") or 0),
+            "savings_pct_session": float(tokens.get("savings_percent") or 0),
+            "usd_saved_lifetime": float(lifetime.get("compression_savings_usd") or 0),
+            "cache_entries": int(cache.get("entries") or 0),
+            "cache_hits": int(cache.get("total_hits") or 0),
+            "requests_total": int(requests.get("total") or 0),
+            "requests_failed": int(requests.get("failed") or 0),
+        }
+        return {
+            "reachable": stats_status == 200,
+            "status": stats_status,
+            "normalized": normalized,
+            "stats": stats,
+            "prometheus": prom,
+        }
+    return _tool_cached("headroom", 2.0, _fetch)
+
+
+def _api_tool_pxpipe() -> dict[str, Any]:
+    def _fetch():
+        ps_status, _, ps_body = _fetch_text(PXPIPE_URL + "/proxy-stats", timeout=2.5)
+        try:
+            proxy_stats = json.loads(ps_body) if ps_status == 200 else {"_error": f"proxy-stats status {ps_status}"}
+        except Exception:  # noqa: BLE001
+            proxy_stats = {"_error": "invalid json from /proxy-stats"}
+        as_status, _, as_body = _fetch_text(PXPIPE_URL + "/api/stats.json", timeout=3.0)
+        try:
+            api_stats = json.loads(as_body) if as_status == 200 else {}
+        except Exception:  # noqa: BLE001
+            api_stats = {}
+        cs_status, _, cs_body = _fetch_text(PXPIPE_URL + "/api/current-session.json", timeout=2.0)
+        try:
+            current_session = json.loads(cs_body) if cs_status == 200 else {}
+        except Exception:  # noqa: BLE001
+            current_session = {}
+        summary = api_stats.get("summary") or {}
+        normalized = {
+            "requests_total": int(proxy_stats.get("requests") or 0),
+            "compressed_requests": int(proxy_stats.get("compressed_requests") or 0),
+            "saved_input_tokens": int(proxy_stats.get("saved_input_tokens") or 0),
+            "saved_pct_input_only": float(proxy_stats.get("saved_pct_input_only") or 0),
+            "saved_pct_of_all_spend": float(proxy_stats.get("saved_pct_of_all_spend") or 0),
+            "saved_usd": float(proxy_stats.get("saved_usd") or 0),
+            "compression_enabled": bool(proxy_stats.get("compression_enabled", True)),
+            "compressed_avg_usd_per_request": float(proxy_stats.get("compressed_avg_usd_per_request") or 0),
+            "passthrough_avg_usd_per_request": float(proxy_stats.get("passthrough_avg_usd_per_request") or 0),
+            "split_sufficient_sample": bool(proxy_stats.get("split_sufficient_sample", False)),
+            "cache_hit_rate": (
+                float(summary.get("cacheHitEvents") or 0) / float(summary.get("eventsWithUsage") or 1)
+                if summary.get("eventsWithUsage")
+                else 0.0
+            ),
+            "duration_p95_ms": int(summary.get("durationP95") or 0),
+            "first_byte_p95_ms": int(summary.get("firstByteP95") or 0),
+            "orig_chars_total": int(summary.get("origCharsTotal") or 0),
+            "image_bytes_total": int(summary.get("imageBytesTotal") or 0),
+            "uptime_sec": float(proxy_stats.get("uptime_sec") or 0),
+        }
+        return {
+            "reachable": ps_status == 200,
+            "status": ps_status,
+            "normalized": normalized,
+            "proxy_stats": proxy_stats,
+            "api_stats": api_stats,
+            "current_session": current_session,
+        }
+    return _tool_cached("pxpipe", 2.0, _fetch)
+
+
+def _api_tool_squeezr() -> dict[str, Any]:
+    def _fetch():
+        h_status, _, h_body = _fetch_text(SQUEEZR_URL + "/squeezr/health", timeout=2.0)
+        try:
+            health = json.loads(h_body) if h_status == 200 else {}
+        except Exception:  # noqa: BLE001
+            health = {}
+        s_status, _, s_body = _fetch_text(SQUEEZR_URL + "/squeezr/stats", timeout=2.5)
+        try:
+            stats = json.loads(s_body) if s_status == 200 else {"_error": f"stats status {s_status}"}
+        except Exception:  # noqa: BLE001
+            stats = {"_error": "invalid json from /squeezr/stats"}
+        l_status, _, l_body = _fetch_text(SQUEEZR_URL + "/squeezr/limits", timeout=2.0)
+        try:
+            limits = json.loads(l_body) if l_status == 200 else {}
+        except Exception:  # noqa: BLE001
+            limits = {}
+        is_squeezr = isinstance(health, dict) and health.get("identity") == "squeezr"
+        latency = (stats.get("latency") or {}).get("total") or {} if isinstance(stats, dict) else {}
+        breakdown = stats.get("breakdown") or {} if isinstance(stats, dict) else {}
+        expand = stats.get("expand") or {} if isinstance(stats, dict) else {}
+        normalized = {
+            "requests_total": int(stats.get("requests") or 0),
+            "compressions": int(stats.get("compressions") or 0),
+            "session_cache_hits": int(stats.get("session_cache_hits") or 0),
+            "total_saved_tokens": int(stats.get("total_saved_tokens") or 0),
+            "savings_pct": float(stats.get("savings_pct") or 0),
+            "latency_p50_ms": float(latency.get("p50") or 0),
+            "latency_p95_ms": float(latency.get("p95") or 0),
+            "latency_p99_ms": float(latency.get("p99") or 0),
+            "bypassed": bool(health.get("bypassed", False)) if isinstance(health, dict) else False,
+            "mode": (health.get("mode") if isinstance(health, dict) else "") or (stats.get("mode") if isinstance(stats, dict) else ""),
+            "circuit_breaker_state": ((health.get("circuit_breaker") or {}).get("state")
+                                       if isinstance(health, dict) else "unknown"),
+            "expand_rate_pct": float(expand.get("rate_pct") or 0),
+            "breakdown": breakdown,
+        }
+        return {
+            "reachable": is_squeezr,
+            "identity_ok": is_squeezr,
+            "status": s_status,
+            "normalized": normalized,
+            "health": health,
+            "stats": stats,
+            "limits": limits,
+        }
+    return _tool_cached("squeezr", 2.0, _fetch)
+
+
+def _api_tool_detect() -> dict[str, Any]:
+    cfg = _cfg_now()
+    out: dict[str, Any] = {"tools": {}, "capture": {"level": CAPTURE_LEVEL}}
+    for name in ("headroom", "pxpipe", "squeezr"):
+        enabled = _service_is_enabled(cfg, name)
+        entry: dict[str, Any] = {"enabled": enabled, "reachable": False, "doing_work": False, "note": ""}
+        if not enabled:
+            out["tools"][name] = entry
+            continue
+        try:
+            data = {"headroom": _api_tool_headroom, "pxpipe": _api_tool_pxpipe, "squeezr": _api_tool_squeezr}[name]()
+            entry["reachable"] = bool(data.get("reachable"))
+            n = data.get("normalized") or {}
+            if name == "headroom":
+                entry["doing_work"] = int(n.get("tokens_saved_session") or 0) > 0 or int(n.get("tokens_saved_lifetime") or 0) > 0
+            elif name == "pxpipe":
+                entry["doing_work"] = int(n.get("compressed_requests") or 0) > 0
+            elif name == "squeezr":
+                entry["doing_work"] = int(n.get("compressions") or 0) > 0
+            if not entry["reachable"]:
+                entry["note"] = "process not reachable on configured port"
+            elif not entry["doing_work"]:
+                entry["note"] = "reachable but no compression activity yet"
+        except Exception as exc:  # noqa: BLE001
+            entry["note"] = f"probe error: {exc}"
+        out["tools"][name] = entry
+    return out
+
+
+def _api_tool_compare() -> dict[str, Any]:
+    """Return normalized side-by-side rows for whichever tools are enabled."""
+    detect = _api_tool_detect()
+    rows: list[dict[str, Any]] = []
+    tools = detect.get("tools") or {}
+    if tools.get("headroom", {}).get("reachable"):
+        h = (_api_tool_headroom() or {}).get("normalized") or {}
+        rows.append({
+            "tool": "headroom",
+            "tokens_saved_lifetime": h.get("tokens_saved_lifetime", 0),
+            "tokens_saved_session": h.get("tokens_saved_session", 0),
+            "savings_pct": h.get("savings_pct_session", 0),
+            "usd_saved": h.get("usd_saved_lifetime", 0),
+            "cache_hit_rate": (h.get("cache_hits", 0) / max(h.get("requests_total", 1), 1)) if h.get("requests_total") else 0,
+            "requests_total": h.get("requests_total", 0),
+            "bypassed": False,
+        })
+    if tools.get("pxpipe", {}).get("reachable"):
+        p = (_api_tool_pxpipe() or {}).get("normalized") or {}
+        rows.append({
+            "tool": "pxpipe",
+            "tokens_saved_lifetime": p.get("saved_input_tokens", 0),
+            "tokens_saved_session": p.get("saved_input_tokens", 0),
+            "savings_pct": p.get("saved_pct_of_all_spend") or p.get("saved_pct_input_only", 0),
+            "usd_saved": p.get("saved_usd", 0),
+            "cache_hit_rate": p.get("cache_hit_rate", 0),
+            "requests_total": p.get("requests_total", 0),
+            "bypassed": not bool(p.get("compression_enabled", True)),
+        })
+    if tools.get("squeezr", {}).get("reachable"):
+        s = (_api_tool_squeezr() or {}).get("normalized") or {}
+        rows.append({
+            "tool": "squeezr",
+            "tokens_saved_lifetime": s.get("total_saved_tokens", 0),
+            "tokens_saved_session": s.get("total_saved_tokens", 0),
+            "savings_pct": s.get("savings_pct", 0),
+            "usd_saved": None,
+            "cache_hit_rate": (s.get("session_cache_hits", 0) / max(s.get("requests_total", 1), 1)) if s.get("requests_total") else 0,
+            "requests_total": s.get("requests_total", 0),
+            "bypassed": bool(s.get("bypassed", False)),
+        })
+    return {"rows": rows, "count": len(rows)}
 
 
 def _read_dashboard_html() -> bytes:
@@ -521,6 +1553,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._respond_json(200, data)
             except Exception as exc:  # noqa: BLE001
                 self._respond_json(502, {"error": str(exc)})
+            return True
+        # --- 0.4.0 metrics + tool APIs --------------------------------------
+        if path == "/api/metrics/summary":
+            self._respond_json(200, _api_metrics_summary(query))
+            return True
+        if path == "/api/metrics/timeseries":
+            self._respond_json(200, _api_metrics_timeseries(query))
+            return True
+        if path == "/api/metrics/sessions":
+            self._respond_json(200, _api_metrics_sessions(query))
+            return True
+        if path.startswith("/api/metrics/session/"):
+            sid = path[len("/api/metrics/session/") :]
+            self._respond_json(200, _api_metrics_session_detail(sid, query))
+            return True
+        if path == "/api/tool/detect":
+            self._respond_json(200, _api_tool_detect())
+            return True
+        if path == "/api/tool/headroom":
+            self._respond_json(200, _api_tool_headroom())
+            return True
+        if path == "/api/tool/pxpipe":
+            self._respond_json(200, _api_tool_pxpipe())
+            return True
+        if path == "/api/tool/squeezr":
+            self._respond_json(200, _api_tool_squeezr())
+            return True
+        if path == "/api/tool/compare":
+            self._respond_json(200, _api_tool_compare())
+            return True
+        if path == "/api/capture":
+            self._respond_json(200, {
+                "level": CAPTURE_LEVEL,
+                "ack_ok": (CAPTURE_LEVEL != "full") or (CAPTURE_FULL_ACK == "i-understand"),
+                "body_cap_bytes": CAPTURE_BODY_CAP,
+                "redact_extra": list(REDACT_KEYS_EXTRA),
+                "sqlite_enabled": METRICS.enabled,
+                "sqlite_error": METRICS.error,
+                "sqlite_path": METRICS.path if METRICS.enabled else None,
+                "retention_days": METRICS_RETENTION_DAYS,
+            })
+            return True
+        if path == "/api/events/stream":
+            self._stream_events()
             return True
         if path == "/api/logs/stream":
             service = (query.get("service", ["supervisor"])[0]) or "supervisor"
@@ -724,6 +1800,128 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
+    def _sse_write_named(self, event: str, data: str) -> bool:
+        try:
+            payload = f"event: {event}\ndata: {data}\n\n".encode("utf-8")
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+    def _stream_events(self) -> None:
+        """Fan-in SSE: emits `summary` (2s), `compare` (5s), and forwards
+        Squeezr's `/squeezr/events` SSE frames as `squeezr` events. This lets
+        the browser subscribe once and receive live updates for every enabled
+        tool without polling three endpoints itself.
+        """
+        try:
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.send_header("connection", "keep-alive")
+            self.send_header("x-accel-buffering", "no")
+            self.end_headers()
+        except Exception:
+            return
+
+        stop = threading.Event()
+        squeezr_conn: http.client.HTTPConnection | None = None
+        last_history_ts = 0.0
+
+        def _pump_summary():
+            nonlocal last_history_ts
+            while not stop.is_set():
+                try:
+                    payload = _api_metrics_summary({"window": ["5m"]})
+                    if not self._sse_write_named("summary", json.dumps(payload, default=str)):
+                        stop.set()
+                        return
+                    # Also emit any new completed requests since last tick.
+                    with _HISTORY_LOCK:
+                        new = [r for r in _HISTORY if r.get("ts", 0) > last_history_ts]
+                    if new:
+                        last_history_ts = max(r.get("ts", 0) for r in new)
+                        if not self._sse_write_named("history", json.dumps({"items": new[-25:]}, default=str)):
+                            stop.set()
+                            return
+                except Exception:  # noqa: BLE001
+                    pass
+                stop.wait(2.0)
+
+        def _pump_compare():
+            while not stop.is_set():
+                try:
+                    payload = _api_tool_compare()
+                    if not self._sse_write_named("compare", json.dumps(payload, default=str)):
+                        stop.set()
+                        return
+                except Exception:  # noqa: BLE001
+                    pass
+                stop.wait(5.0)
+
+        def _pump_squeezr():
+            nonlocal squeezr_conn
+            cfg = _cfg_now()
+            if not _service_is_enabled(cfg, "squeezr"):
+                return
+            target = urlsplit(SQUEEZR_URL + "/squeezr/events")
+            cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
+            while not stop.is_set():
+                try:
+                    squeezr_conn = cls(target.netloc, timeout=30)
+                    squeezr_conn.request("GET", target.path or "/", headers={"accept": "text/event-stream"})
+                    resp = squeezr_conn.getresponse()
+                    if resp.status != 200:
+                        stop.wait(5.0)
+                        continue
+                    buf = b""
+                    while not stop.is_set():
+                        chunk = resp.read1(4096)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b"\n\n" in buf:
+                            frame, buf = buf.split(b"\n\n", 1)
+                            data_lines = [
+                                line[5:].strip().decode("utf-8", errors="replace")
+                                for line in frame.splitlines()
+                                if line.startswith(b"data:")
+                            ]
+                            if data_lines:
+                                data = "\n".join(data_lines)
+                                if not self._sse_write_named("squeezr", data):
+                                    stop.set()
+                                    return
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    try:
+                        if squeezr_conn:
+                            squeezr_conn.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                stop.wait(5.0)
+
+        threads = [
+            threading.Thread(target=_pump_summary, daemon=True),
+            threading.Thread(target=_pump_compare, daemon=True),
+            threading.Thread(target=_pump_squeezr, daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        try:
+            while not stop.is_set():
+                try:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    stop.set()
+                    return
+                stop.wait(15.0)
+        finally:
+            stop.set()
+
     def _respond_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         self._respond(status, body, content_type="application/json")
@@ -779,7 +1977,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return b"".join(chunks)
         return b""
 
-    def _proxy_headers(self, target, request_id: str) -> dict[str, str]:
+    def _proxy_headers(self, target, request_id: str, session_id: str = "") -> dict[str, str]:
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
             lower = key.lower()
@@ -789,41 +1987,76 @@ class GatewayHandler(BaseHTTPRequestHandler):
         headers["Host"] = target.netloc
         headers["X-Apx-Gateway-Target"] = TARGET_URL
         headers["X-Apx-Request-Id"] = request_id
+        if session_id:
+            headers["X-Apx-Session-Id"] = session_id
         return headers
 
-    def _extract_tokens_from_json(self, payload_bytes: bytes) -> tuple[int, int]:
+    def _usage_from_dict(self, usage: Any) -> tuple[int, int, int, int]:
+        """Return (tokens_in, tokens_out, cache_read, cache_write) from a usage block."""
+        if not isinstance(usage, dict):
+            return 0, 0, 0, 0
+        tin = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
+        tout = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
+        cread = int(
+            usage.get("cache_read_input_tokens")
+            or usage.get("cached_tokens")
+            or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            or 0
+        )
+        cwrite = int(usage.get("cache_creation_input_tokens") or 0)
+        return tin, tout, cread, cwrite
+
+    def _tool_call_count_from_dict(self, data: Any) -> int:
+        """Count tool_use content blocks (Anthropic) or tool_calls (OpenAI)."""
+        if not isinstance(data, dict):
+            return 0
+        count = 0
+        content = data.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "tool_use":
+                    count += 1
+        choices = data.get("choices")
+        if isinstance(choices, list):
+            for ch in choices:
+                if not isinstance(ch, dict):
+                    continue
+                msg = ch.get("message") or {}
+                calls = msg.get("tool_calls") if isinstance(msg, dict) else None
+                if isinstance(calls, list):
+                    count += len(calls)
+        return count
+
+    def _extract_tokens_from_json(self, payload_bytes: bytes) -> tuple[int, int, int, int, int]:
+        """Returns (tokens_in, tokens_out, cache_read, cache_write, tool_calls)."""
         if not payload_bytes:
-            return 0, 0
+            return 0, 0, 0, 0, 0
         try:
             data = json.loads(payload_bytes.decode("utf-8", errors="replace"))
         except Exception:  # noqa: BLE001
-            return 0, 0
+            return 0, 0, 0, 0, 0
         if not isinstance(data, dict):
-            return 0, 0
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            tokens_in = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
-            tokens_out = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
-            return tokens_in, tokens_out
-        return 0, 0
+            return 0, 0, 0, 0, 0
+        tin, tout, cread, cwrite = self._usage_from_dict(data.get("usage"))
+        return tin, tout, cread, cwrite, self._tool_call_count_from_dict(data)
 
-    def _extract_tokens_from_sse(self, body_bytes: bytes) -> tuple[int, int]:
+    def _extract_tokens_from_sse(self, body_bytes: bytes) -> tuple[int, int, int, int, int]:
         """Extract usage from SSE frames.
 
         Anthropic emits usage on `event: message_start` (input_tokens) and
         `event: message_delta` (output_tokens). OpenAI streams a single
         `data: {"usage": ...}` chunk when `stream_options.include_usage` is
         set. We scan line-oriented rather than parsing full frames so we can
-        keep the response capture cheap.
+        keep the response capture cheap. Also counts `content_block_start`
+        frames with `type=tool_use`.
         """
         if not body_bytes:
-            return 0, 0
-        tokens_in = 0
-        tokens_out = 0
+            return 0, 0, 0, 0, 0
+        tokens_in = tokens_out = cache_read = cache_write = tool_calls = 0
         try:
             text = body_bytes.decode("utf-8", errors="replace")
         except Exception:  # noqa: BLE001
-            return 0, 0
+            return 0, 0, 0, 0, 0
         for line in text.splitlines():
             if not line.startswith("data:"):
                 continue
@@ -841,14 +2074,31 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 msg = obj.get("message")
                 if isinstance(msg, dict):
                     usage = msg.get("usage")
-            if isinstance(usage, dict):
-                new_in = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
-                new_out = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
-                if new_in:
-                    tokens_in = new_in
-                if new_out:
-                    tokens_out = new_out
-        return tokens_in, tokens_out
+            tin, tout, cread, cwrite = self._usage_from_dict(usage)
+            if tin:
+                tokens_in = tin
+            if tout:
+                tokens_out = tout
+            if cread:
+                cache_read = cread
+            if cwrite:
+                cache_write = cwrite
+            if obj.get("type") == "content_block_start":
+                block = obj.get("content_block") or {}
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_calls += 1
+            choices = obj.get("choices")
+            if isinstance(choices, list):
+                for ch in choices:
+                    if not isinstance(ch, dict):
+                        continue
+                    delta = ch.get("delta") or ch.get("message") or {}
+                    tcalls = delta.get("tool_calls") if isinstance(delta, dict) else None
+                    if isinstance(tcalls, list):
+                        for c in tcalls:
+                            if isinstance(c, dict) and c.get("id"):
+                                tool_calls += 1
+        return tokens_in, tokens_out, cache_read, cache_write, tool_calls
 
     def _proxy(self) -> None:
         target = urlsplit(TARGET_URL)
@@ -863,38 +2113,69 @@ class GatewayHandler(BaseHTTPRequestHandler):
             upstream_path = f"/{upstream_path}"
 
         body = self._read_request_body_bytes()
+        bytes_in = len(body)
         model = _model_from_path(path, body)
+        session_id = _derive_session_id(self.headers, model, body)
+        cfg_cache = _load_config_values()
+        chain_mode = _current_mode(cfg_cache)
+        chain_hops = ",".join(_chain_hops(cfg_cache, chain_mode))
+
+        # Capture request body/headers only if CAPTURE_LEVEL=full.
+        cap_req_body = _capture_body(body, self.headers.get("content-type", ""))
+        cap_req_headers: str | None = None
+        if CAPTURE_LEVEL == "full":
+            try:
+                headers_dict = {k: v for k, v in self.headers.items()}
+                cap_req_headers = json.dumps(_redact_headers(headers_dict), separators=(",", ":"))
+            except Exception:  # noqa: BLE001
+                cap_req_headers = None
 
         conn_cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
         started = time.time()
+        first_byte_at: float | None = None
         status = 0
         bytes_out = 0
         response_chunks: list[bytes] = []
         capture_response = self.command == "POST" and body
         conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
+        err_class = ""
+        is_stream = False
         try:
-            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id))
+            conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id, session_id))
             resp = conn.getresponse()
             status = resp.status
             content_type = resp.getheader("content-type", "").lower()
+            is_stream = "text/event-stream" in content_type
+            # Merge/append Server-Timing so we don't clobber upstream entries.
+            upstream_st = resp.getheader("server-timing") or ""
             self.send_response(resp.status, resp.reason)
             for key, value in resp.getheaders():
                 lower = key.lower()
-                if lower in HOP_BY_HOP_HEADERS:
+                if lower in HOP_BY_HOP_HEADERS or lower == "server-timing":
                     continue
                 self.send_header(key, value)
             self.send_header("x-apx-request-id", request_id)
+            self.send_header("x-apx-session-id", session_id)
             self.send_header("connection", "close")
+            # We can only send headers before streaming the body, so this
+            # header reports gateway time-to-first-upstream-headers. The full
+            # gateway duration is persisted in SQLite after the response ends.
+            gateway_ttfb_ms = int((time.time() - started) * 1000)
+            st_entries = [f'gateway_ttfb;dur={gateway_ttfb_ms}']
+            if upstream_st:
+                st_entries.append(upstream_st)
+            self.send_header("server-timing", ", ".join(st_entries))
             self.end_headers()
 
             if self.command != "HEAD":
-                is_stream = "text/event-stream" in content_type
                 capture_cap = 2 * 1024 * 1024 if is_stream else 512 * 1024
                 capture_size = 0
                 while True:
                     chunk = resp.read1(65536) if is_stream else resp.read(8192)
                     if not chunk:
                         break
+                    if first_byte_at is None:
+                        first_byte_at = time.time()
                     try:
                         self.wfile.write(chunk)
                         self.wfile.flush()
@@ -906,19 +2187,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         capture_size += len(chunk)
 
             elapsed_ms = (time.time() - started) * 1000
+            first_byte_ms = ((first_byte_at - started) * 1000) if first_byte_at else 0.0
 
-            tokens_in = 0
-            tokens_out = 0
+            tokens_in = tokens_out = cache_read = cache_write = tool_calls = 0
+            cap_resp_body: str | None = None
             if capture_response and 200 <= status < 300:
                 joined = b"".join(response_chunks)
-                if "text/event-stream" in content_type:
-                    tokens_in, tokens_out = self._extract_tokens_from_sse(joined)
+                if is_stream:
+                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_sse(joined)
                 elif "application/json" in content_type:
-                    tokens_in, tokens_out = self._extract_tokens_from_json(joined)
+                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_json(joined)
+                if CAPTURE_LEVEL == "full":
+                    cap_resp_body = _capture_body(joined, content_type)
+
+            if status >= 500:
+                err_class = "upstream_5xx"
+            elif status >= 400:
+                err_class = "upstream_4xx"
 
             log(
                 f"{self.command} {self.path} -> {resp.status} via {TARGET_URL} "
-                f"({int(elapsed_ms)}ms) req_id={request_id}"
+                f"({int(elapsed_ms)}ms) req_id={request_id} session={session_id}"
             )
             _record_request(
                 self.command,
@@ -927,10 +2216,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 elapsed_ms,
                 TARGET_URL,
                 request_id=request_id,
+                session_id=session_id,
                 model=model,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
+                cache_read_tokens=cache_read,
+                cache_write_tokens=cache_write,
+                bytes_in=bytes_in,
                 bytes_out=bytes_out,
+                first_byte_ms=first_byte_ms,
+                chain_mode=chain_mode,
+                chain_hops=chain_hops,
+                hop_timings=json.dumps({
+                    "gateway_total_ms": round(elapsed_ms, 2),
+                    "gateway_first_byte_ms": round(first_byte_ms, 2),
+                    "upstream_server_timing": upstream_st,
+                }, separators=(",", ":")),
+                is_stream=is_stream,
+                tool_call_count=tool_calls,
+                err_class=err_class,
+                request_body=cap_req_body,
+                response_body=cap_resp_body,
+                request_headers=cap_req_headers,
             )
         except BrokenPipeError:
             log(f"client disconnected during {self.command} {self.path} req_id={request_id}")
@@ -941,8 +2248,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 (time.time() - started) * 1000,
                 TARGET_URL,
                 request_id=request_id,
+                session_id=session_id,
                 model=model,
+                bytes_in=bytes_in,
                 bytes_out=bytes_out,
+                chain_mode=chain_mode,
+                chain_hops=chain_hops,
+                is_stream=is_stream,
+                err_class="client_disconnected",
+                request_body=cap_req_body,
+                request_headers=cap_req_headers,
             )
         except Exception as exc:  # noqa: BLE001
             log(f"proxy error for {self.command} {self.path} req_id={request_id}: {exc}")
@@ -953,8 +2268,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 (time.time() - started) * 1000,
                 TARGET_URL,
                 request_id=request_id,
+                session_id=session_id,
                 model=model,
+                bytes_in=bytes_in,
                 bytes_out=bytes_out,
+                chain_mode=chain_mode,
+                chain_hops=chain_hops,
+                is_stream=is_stream,
+                err_class=f"gateway_exception:{type(exc).__name__}",
+                request_body=cap_req_body,
+                request_headers=cap_req_headers,
             )
             if not self.wfile.closed:
                 try:
@@ -966,11 +2289,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
+    cap_err = _validate_capture_level()
+    if cap_err:
+        log(f"FATAL: {cap_err}")
+        return 3
+
+    if METRICS_DB_ENABLED:
+        if METRICS.open():
+            log(f"metrics: SQLite store ready at {METRICS.path}")
+            try:
+                _backfill_from_jsonl()
+            except Exception as exc:  # noqa: BLE001
+                log(f"metrics: backfill failed: {exc}")
+        else:
+            log(f"metrics: SQLite disabled (open failed: {METRICS.error})")
+
     httpd = ThreadingHTTPServer((BIND_HOST, PORT), GatewayHandler)
     httpd.daemon_threads = True
 
     def _shutdown(_signum, _frame) -> None:
         log("shutting down")
+        try:
+            METRICS.close()
+        except Exception:  # noqa: BLE001
+            pass
         httpd.shutdown()
 
     signal.signal(signal.SIGTERM, _shutdown)
@@ -978,6 +2320,8 @@ def main() -> int:
 
     health_thread = threading.Thread(target=_health_refresher_loop, daemon=True)
     health_thread.start()
+    if METRICS.enabled:
+        threading.Thread(target=_metrics_janitor_loop, daemon=True).start()
 
     if BIND_HOST not in ("127.0.0.1", "::1", "localhost"):
         log(
@@ -992,6 +2336,8 @@ def main() -> int:
         f"listening on http://{BIND_HOST}:{PORT} -> {TARGET_URL}"
         f" (dashboard={'on' if DASHBOARD_ENABLED else 'off'},"
         f" auth={'token' if DASHBOARD_TOKEN else 'none'},"
+        f" capture={CAPTURE_LEVEL},"
+        f" metrics_db={'on' if METRICS.enabled else 'off'},"
         f" history_persist={'on' if HISTORY_PERSIST else 'off'})"
     )
     httpd.serve_forever()

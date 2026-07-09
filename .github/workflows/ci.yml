@@ -53,6 +53,125 @@ jobs:
       - name: Python compile
         run: python -m py_compile bin/apx-gateway
 
+      - name: Gateway metrics dashboard API smoke
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sqlite3
+          import subprocess
+          import tempfile
+          import threading
+          import time
+          import urllib.request
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          class Upstream(BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get("content-length", "0") or "0")
+                  self.rfile.read(n)
+                  body = json.dumps({
+                      "id": "msg_1",
+                      "usage": {
+                          "input_tokens": 123,
+                          "output_tokens": 45,
+                          "cache_read_input_tokens": 10,
+                          "cache_creation_input_tokens": 5,
+                      },
+                      "content": [{"type": "tool_use", "name": "demo"}],
+                  }).encode()
+                  self.send_response(200)
+                  self.send_header("content-type", "application/json")
+                  self.send_header("content-length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def log_message(self, *_args):
+                  pass
+
+          def start_gateway(tmp, capture="metadata", ack=""):
+              os.makedirs(os.path.join(tmp, "state"), exist_ok=True)
+              os.makedirs(os.path.join(tmp, "config"), exist_ok=True)
+              cfg = os.path.join(tmp, "config", "config.env")
+              with open(cfg, "w", encoding="utf-8") as fh:
+                  fh.write("\n".join([
+                      "BIND_HOST=127.0.0.1",
+                      "GATEWAY_PORT=18787",
+                      "GATEWAY_ENABLED=1",
+                      "APX_CHAIN=\"\"",
+                      "HEADROOM_ENABLED=0",
+                      "PXPIPE_ENABLED=0",
+                      "SQUEEZR_ENABLED=0",
+                      "",
+                  ]))
+              env = os.environ.copy()
+              env.update({
+                  "GATEWAY_TARGET_URL": "http://127.0.0.1:18788",
+                  "GATEWAY_PORT": "18787",
+                  "BIND_HOST": "127.0.0.1",
+                  "APX_STATE_DIR": os.path.join(tmp, "state"),
+                  "APX_CONFIG": cfg,
+                  "APX_METRICS_DB": os.path.join(tmp, "state", "metrics.db"),
+                  "APX_CAPTURE": capture,
+                  "APX_CAPTURE_FULL_ACK": ack,
+                  "APX_DASHBOARD_ENABLED": "1",
+              })
+              return subprocess.Popen(["python", "bin/apx-gateway"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+          with tempfile.TemporaryDirectory() as tmp:
+              refused = start_gateway(tmp, capture="full")
+              refused.wait(timeout=5)
+              assert refused.returncode == 3, refused.stdout.read()
+
+          upstream = ThreadingHTTPServer(("127.0.0.1", 18788), Upstream)
+          threading.Thread(target=upstream.serve_forever, daemon=True).start()
+          with tempfile.TemporaryDirectory() as tmp:
+              proc = start_gateway(tmp, capture="metadata")
+              db = os.path.join(tmp, "state", "metrics.db")
+              try:
+                  time.sleep(1)
+                  for path in (
+                      "/api/capture",
+                      "/api/metrics/summary?window=1h",
+                      "/api/metrics/timeseries?window=1h&bucket=1m",
+                      "/api/metrics/sessions?window=24h",
+                      "/api/tool/detect",
+                      "/api/tool/compare",
+                  ):
+                      with urllib.request.urlopen("http://127.0.0.1:18787" + path, timeout=5) as r:
+                          assert r.status == 200, path
+                          r.read()
+                  with urllib.request.urlopen("http://127.0.0.1:18787/", timeout=5) as r:
+                      html = r.read().decode("utf-8")
+                      assert "Tool Comparison" in html
+                      assert "Squeezr iframe" in html
+
+                  payload = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hello"}]}
+                  req = urllib.request.Request(
+                      "http://127.0.0.1:18787/v1/messages",
+                      data=json.dumps(payload).encode(),
+                      headers={"content-type": "application/json"},
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(req, timeout=5) as r:
+                      assert r.headers.get("x-apx-request-id")
+                      assert r.headers.get("x-apx-session-id")
+                      r.read()
+                  time.sleep(0.3)
+                  row = sqlite3.connect(db).execute(
+                      "select status,tokens_in,tokens_out,cache_read_tokens,cache_write_tokens,tool_call_count,request_body,response_body from requests"
+                  ).fetchone()
+                  assert row[:6] == (200, 123, 45, 10, 5, 1), row
+                  assert row[6] is None and row[7] is None, row
+              finally:
+                  proc.terminate()
+                  try:
+                      proc.wait(timeout=3)
+                  except subprocess.TimeoutExpired:
+                      proc.kill()
+                  upstream.shutdown()
+          PY
+
       - name: Verify apx CLI help renders
         run: |
           chmod +x bin/apx

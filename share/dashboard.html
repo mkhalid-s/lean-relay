@@ -1,371 +1,629 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>apx dashboard</title>
   <style>
     :root {
       color-scheme: light dark;
       --bg: #0f1115;
       --panel: #171a21;
-      --panel-2: #1e222b;
-      --border: #2b313d;
-      --text: #e6e8ee;
-      --muted: #8b93a4;
-      --ok: #34c759;
-      --warn: #ffb020;
-      --fail: #ff4d4f;
-      --link: #7aa2ff;
+      --panel-2: #1f2430;
+      --border: #2c3340;
+      --text: #e7eaf0;
+      --muted: #8f98aa;
+      --ok: #31c48d;
+      --warn: #f6ad55;
+      --fail: #f56565;
+      --accent: #7aa2ff;
+      --purple: #b794f4;
     }
     @media (prefers-color-scheme: light) {
       :root {
         --bg: #f6f7fb;
         --panel: #ffffff;
-        --panel-2: #f0f2f7;
-        --border: #dfe3ec;
-        --text: #1a1d24;
-        --muted: #626878;
-        --link: #2b5cff;
+        --panel-2: #f0f3f8;
+        --border: #dfe4ee;
+        --text: #18202f;
+        --muted: #667085;
+        --accent: #245cff;
       }
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
     body {
       margin: 0;
       background: var(--bg);
       color: var(--text);
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Segoe UI, Roboto, Helvetica, Arial, sans-serif;
-      font-size: 14px;
-      line-height: 1.45;
+      font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
     header {
+      position: sticky;
+      top: 0;
+      z-index: 10;
       display: flex;
-      align-items: center;
       justify-content: space-between;
+      gap: 16px;
       padding: 14px 20px;
+      background: color-mix(in oklab, var(--panel) 94%, transparent);
       border-bottom: 1px solid var(--border);
-      background: var(--panel);
-      position: sticky; top: 0; z-index: 10;
+      backdrop-filter: blur(12px);
     }
-    header h1 {
-      margin: 0;
-      font-size: 16px;
-      font-weight: 600;
-      letter-spacing: 0.5px;
+    h1, h2, h3 { margin: 0; }
+    h1 { font-size: 17px; font-weight: 700; }
+    h2 { font-size: 13px; color: var(--muted); letter-spacing: .08em; text-transform: uppercase; }
+    h3 { font-size: 14px; }
+    main { max-width: 1500px; margin: 0 auto; padding: 20px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .meta { color: var(--muted); font-size: 12px; }
+    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 9px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel-2);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 650;
+      white-space: nowrap;
     }
-    header .meta { color: var(--muted); font-size: 12px; }
-    main { padding: 20px; max-width: 1400px; margin: 0 auto; }
+    .badge.ok { color: var(--ok); border-color: color-mix(in oklab, var(--ok) 45%, var(--border)); }
+    .badge.warn { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 45%, var(--border)); }
+    .badge.fail { color: var(--fail); border-color: color-mix(in oklab, var(--fail) 45%, var(--border)); }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
     }
     .card {
       background: var(--panel);
       border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      min-height: 120px;
+      border-radius: 12px;
+      padding: 14px;
+      min-height: 108px;
     }
-    .card h2 {
-      margin: 0 0 12px;
-      font-size: 13px;
-      font-weight: 600;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.6px;
+    .card.full { grid-column: 1 / -1; }
+    .kpi {
+      margin-top: 10px;
+      font-size: clamp(24px, 4vw, 38px);
+      font-weight: 760;
+      letter-spacing: -0.04em;
+      font-variant-numeric: tabular-nums;
     }
-    .card .row { display: flex; justify-content: space-between; padding: 4px 0; }
-    .card .row + .row { border-top: 1px dashed var(--border); }
-    .card .k { color: var(--muted); }
-    .card .v { font-variant-numeric: tabular-nums; }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.3px;
-      background: var(--panel-2);
-      color: var(--muted);
+    .kpi-sub { color: var(--muted); font-size: 12px; }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 6px 0;
+      border-top: 1px dashed var(--border);
     }
-    .badge.ok { color: #0a3d17; background: color-mix(in oklab, var(--ok) 30%, transparent); color: var(--ok); }
-    .badge.warn { color: var(--warn); background: color-mix(in oklab, var(--warn) 25%, transparent); }
-    .badge.fail { color: var(--fail); background: color-mix(in oklab, var(--fail) 25%, transparent); }
+    .row:first-of-type { border-top: 0; }
+    .k { color: var(--muted); }
+    .v { font-variant-numeric: tabular-nums; text-align: right; }
     .chain {
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
       align-items: center;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      margin-top: 10px;
+      font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .hop { padding: 5px 9px; border-radius: 8px; background: var(--panel-2); border: 1px solid var(--border); }
+    .arr { color: var(--muted); }
+    .accordion {
+      margin-top: 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+      background: var(--panel);
+    }
+    .accordion[hidden], .tool-section[hidden] { display: none; }
+    .accordion > summary {
+      cursor: pointer;
+      list-style: none;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid transparent;
+    }
+    .accordion[open] > summary { border-bottom-color: var(--border); }
+    .accordion > summary::-webkit-details-marker { display: none; }
+    .accordion .content { padding: 16px; }
+    .mini-chart {
+      width: 100%;
+      height: 160px;
+      display: block;
+      background: linear-gradient(180deg, color-mix(in oklab, var(--panel-2) 45%, transparent), transparent);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-top: 10px;
+    }
+    .bar {
+      height: 9px;
+      border-radius: 999px;
+      background: var(--panel-2);
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .bar > span { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--purple)); width: 0%; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
       font-size: 12px;
-    }
-    .chain .hop { padding: 4px 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--border); }
-    .chain .arr { color: var(--muted); }
-    a { color: var(--link); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .full { grid-column: 1 / -1; }
-    .iframe-wrap { position: relative; height: 480px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border); }
-    .iframe-wrap iframe { width: 100%; height: 100%; border: 0; background: white; }
-    .tabs { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
-    .tab {
-      padding: 6px 12px; border-radius: 6px; cursor: pointer; user-select: none;
-      background: var(--panel-2); border: 1px solid var(--border); color: var(--muted); font-size: 12px;
-    }
-    .tab.active { color: var(--text); background: var(--bg); }
-    .log-view {
-      background: #0a0d13; color: #d0d4de; border-radius: 8px; padding: 12px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-      height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
-    }
-    table.history {
-      width: 100%; border-collapse: collapse; font-size: 12px;
       font-variant-numeric: tabular-nums;
     }
-    table.history th, table.history td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); }
-    table.history th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-    table.history td.status-ok { color: var(--ok); }
-    table.history td.status-warn { color: var(--warn); }
-    table.history td.status-fail { color: var(--fail); }
-    .kpi { font-size: 20px; font-weight: 600; }
-    footer { padding: 20px; text-align: center; color: var(--muted); font-size: 11px; }
+    th, td {
+      text-align: left;
+      padding: 7px 8px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; font-weight: 650; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: var(--panel-2); }
+    .status-ok { color: var(--ok); }
+    .status-warn { color: var(--warn); }
+    .status-fail { color: var(--fail); }
+    .iframe-wrap {
+      height: 560px;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      background: white;
+    }
+    iframe { width: 100%; height: 100%; border: 0; background: white; }
+    .split {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 14px;
+    }
+    .log-view, pre.detail {
+      max-height: 340px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #090d14;
+      color: #d4d8e3;
+      padding: 12px;
+      font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .tab {
+      border: 1px solid var(--border);
+      background: var(--panel-2);
+      color: var(--muted);
+      border-radius: 8px;
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .tab.active { color: var(--text); border-color: var(--accent); }
+    .muted { color: var(--muted); }
+    @media (max-width: 900px) {
+      header { align-items: flex-start; flex-direction: column; }
+      .split { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <header>
     <div>
       <h1>apx dashboard</h1>
-      <div class="meta" id="header-meta">loading…</div>
+      <div class="meta" id="header-meta">loading gateway state...</div>
     </div>
-    <div class="meta">
-      <span id="version-badge" class="badge">apx</span>
-      <span id="refresh-badge" class="badge">refresh 2s</span>
+    <div class="top-actions">
+      <span class="badge" id="version-badge">apx</span>
+      <span class="badge" id="capture-badge">capture ?</span>
+      <span class="badge" id="stream-badge">live</span>
     </div>
   </header>
 
   <main>
     <section class="grid">
       <div class="card">
-        <h2>Overview</h2>
-        <div class="row"><span class="k">Mode</span><span class="v" id="mode">—</span></div>
-        <div class="row"><span class="k">Version</span><span class="v" id="version">—</span></div>
-        <div class="row"><span class="k">Uptime</span><span class="v" id="uptime">—</span></div>
-        <div class="row"><span class="k">Total requests</span><span class="v" id="req-count">—</span></div>
-        <div class="row"><span class="k">Avg latency</span><span class="v" id="req-latency">—</span></div>
+        <h2>Requests</h2>
+        <div class="kpi" id="k-requests">-</div>
+        <div class="kpi-sub" id="k-status">0 ok / 0 warn / 0 fail</div>
+      </div>
+      <div class="card">
+        <h2>Latency p95</h2>
+        <div class="kpi" id="k-p95">-</div>
+        <div class="kpi-sub" id="k-first-byte">first byte p95 -</div>
+      </div>
+      <div class="card">
+        <h2>Tokens</h2>
+        <div class="kpi" id="k-tokens">-</div>
+        <div class="kpi-sub" id="k-cache">cache read/write -</div>
+      </div>
+      <div class="card">
+        <h2>Estimated Cost</h2>
+        <div class="kpi" id="k-cost">-</div>
+        <div class="kpi-sub" id="k-tools">tool calls -</div>
       </div>
 
-      <div class="card">
+      <div class="card full">
         <h2>Chain</h2>
-        <div class="chain" id="chain-view">—</div>
-      </div>
-
-      <div class="card">
-        <h2>Health</h2>
-        <div class="row"><span class="k">Gateway</span><span class="v" id="h-gateway"><span class="badge">?</span></span></div>
-        <div class="row"><span class="k">Headroom</span><span class="v" id="h-headroom"><span class="badge">?</span></span></div>
-        <div class="row"><span class="k">pxpipe</span><span class="v" id="h-pxpipe"><span class="badge">?</span></span></div>
-        <div class="row"><span class="k">Squeezr</span><span class="v" id="h-squeezr"><span class="badge">?</span></span></div>
-      </div>
-
-      <div class="card">
-        <h2>Headroom stats</h2>
-        <div class="row"><span class="k">Requests compressed</span><span class="v" id="hr-compressed">—</span></div>
-        <div class="row"><span class="k">Tokens saved</span><span class="v" id="hr-saved">—</span></div>
-        <div class="row"><span class="k">Cache hits</span><span class="v" id="hr-cache-hits">—</span></div>
-        <div class="row"><span class="k">Cache misses</span><span class="v" id="hr-cache-misses">—</span></div>
-        <div class="row"><a href="/api/headroom/stats" target="_blank">raw /stats JSON</a></div>
-      </div>
-
-      <div class="card">
-        <h2>Cost &amp; tokens (session)</h2>
-        <div class="row"><span class="k">Input tokens</span><span class="v" id="s-tokens-in">—</span></div>
-        <div class="row"><span class="k">Output tokens</span><span class="v" id="s-tokens-out">—</span></div>
-        <div class="row"><span class="k">Estimated cost</span><span class="v" id="s-cost">—</span></div>
-        <div class="row"><span class="k">2xx / 4xx / 5xx</span><span class="v" id="s-status">—</span></div>
-      </div>
-
-      <div class="card full">
-        <h2>Recent gateway requests</h2>
-        <table class="history">
-          <thead><tr><th>time</th><th>method</th><th>path</th><th>model</th><th>status</th><th>latency</th><th>tok in</th><th>tok out</th><th>cost</th><th>req id</th></tr></thead>
-          <tbody id="history-body"><tr><td colspan="10" class="k">no requests yet</td></tr></tbody>
-        </table>
-      </div>
-
-      <div class="card full">
-        <h2>Logs</h2>
-        <div class="tabs" id="log-tabs">
-          <div class="tab active" data-service="supervisor">supervisor</div>
-          <div class="tab" data-service="gateway">gateway</div>
-          <div class="tab" data-service="headroom">headroom</div>
-          <div class="tab" data-service="pxpipe">pxpipe</div>
-          <div class="tab" data-service="squeezr">squeezr</div>
-        </div>
-        <div class="log-view" id="log-view">connecting…</div>
-      </div>
-
-      <div class="card full">
-        <h2>pxpipe dashboard <span class="k">(<a id="pxpipe-link" href="/proxy/pxpipe/" target="_blank">open</a>)</span></h2>
-        <div class="iframe-wrap"><iframe id="pxpipe-frame" src="/proxy/pxpipe/" title="pxpipe dashboard" loading="lazy"></iframe></div>
-      </div>
-
-      <div class="card full">
-        <h2>Squeezr dashboard <span class="k">(<a id="squeezr-link" href="/proxy/squeezr/squeezr/dashboard" target="_blank">open</a>)</span></h2>
-        <div class="iframe-wrap"><iframe id="squeezr-frame" src="/proxy/squeezr/squeezr/dashboard" title="Squeezr dashboard" loading="lazy"></iframe></div>
+        <div class="chain" id="chain-view">-</div>
       </div>
     </section>
-  </main>
 
-  <footer>apx dashboard · served by apx-gateway · <a href="/api/status" target="_blank">/api/status</a></footer>
+    <details class="accordion" open>
+      <summary><h2>Tool Comparison</h2><span class="badge" id="compare-count">0 tools</span></summary>
+      <div class="content">
+        <div class="grid" id="compare-cards"></div>
+        <svg class="mini-chart" id="compare-chart" role="img" aria-label="tool savings comparison"></svg>
+      </div>
+    </details>
+
+    <details class="accordion" open>
+      <summary><h2>Gateway Timeseries</h2><span class="badge">last hour</span></summary>
+      <div class="content">
+        <svg class="mini-chart" id="latency-chart" role="img" aria-label="latency chart"></svg>
+        <svg class="mini-chart" id="request-chart" role="img" aria-label="request chart"></svg>
+      </div>
+    </details>
+
+    <details class="accordion" open>
+      <summary><h2>Sessions</h2><span class="badge" id="session-count">0 sessions</span></summary>
+      <div class="content split">
+        <div>
+          <table>
+            <thead><tr><th>last</th><th>session</th><th>req</th><th>tokens</th><th>cost</th><th>mode</th></tr></thead>
+            <tbody id="sessions-body"><tr><td colspan="6" class="muted">no sessions yet</td></tr></tbody>
+          </table>
+        </div>
+        <div>
+          <h3 id="session-title">Session Detail</h3>
+          <pre class="detail" id="session-detail">Select a session to inspect per-request timing, status, tokens, and hop metadata.</pre>
+        </div>
+      </div>
+    </details>
+
+    <details class="accordion tool-section" id="headroom-section">
+      <summary><h2>Headroom</h2><span class="badge" id="headroom-state">disabled</span></summary>
+      <div class="content grid">
+        <div class="card"><h2>Saved</h2><div class="kpi" id="hr-saved">-</div><div class="kpi-sub" id="hr-pct">session savings -</div></div>
+        <div class="card"><h2>Requests</h2><div class="kpi" id="hr-requests">-</div><div class="kpi-sub" id="hr-failed">failed -</div></div>
+        <div class="card"><h2>Cache</h2><div class="kpi" id="hr-cache">-</div><div class="kpi-sub">hits / entries</div></div>
+        <div class="card"><h2>Raw</h2><div class="row"><span class="k">Endpoint</span><a href="/api/tool/headroom" target="_blank">/api/tool/headroom</a></div></div>
+      </div>
+    </details>
+
+    <details class="accordion tool-section" id="pxpipe-section">
+      <summary><h2>pxpipe</h2><span class="badge" id="pxpipe-state">disabled</span></summary>
+      <div class="content">
+        <section class="grid">
+          <div class="card"><h2>Saved</h2><div class="kpi" id="px-saved">-</div><div class="kpi-sub" id="px-pct">all-spend savings -</div></div>
+          <div class="card"><h2>Coverage</h2><div class="kpi" id="px-coverage">-</div><div class="kpi-sub">compressed / total requests</div></div>
+          <div class="card"><h2>A/B Cost</h2><div class="kpi" id="px-ab">-</div><div class="kpi-sub" id="px-sample">sample guard -</div></div>
+          <div class="card"><h2>Image Throughput</h2><div class="kpi" id="px-img">-</div><div class="kpi-sub">PNG bytes shipped</div></div>
+        </section>
+        <details class="accordion">
+          <summary><h2>pxpipe iframe</h2><a href="/proxy/pxpipe/" target="_blank">open native dashboard</a></summary>
+          <div class="content"><div class="iframe-wrap"><iframe src="/proxy/pxpipe/" loading="lazy" title="pxpipe dashboard"></iframe></div></div>
+        </details>
+      </div>
+    </details>
+
+    <details class="accordion tool-section" id="squeezr-section">
+      <summary><h2>Squeezr</h2><span class="badge" id="squeezr-state">disabled</span></summary>
+      <div class="content">
+        <section class="grid">
+          <div class="card"><h2>Saved</h2><div class="kpi" id="sq-saved">-</div><div class="kpi-sub" id="sq-pct">savings pct -</div></div>
+          <div class="card"><h2>Quality</h2><div class="kpi" id="sq-expand">-</div><div class="kpi-sub">expand rate, lower is better</div></div>
+          <div class="card"><h2>Mode</h2><div class="kpi" id="sq-mode">-</div><div class="kpi-sub" id="sq-breaker">circuit -</div></div>
+          <div class="card"><h2>Latency</h2><div class="kpi" id="sq-p95">-</div><div class="kpi-sub">Squeezr compression p95</div></div>
+        </section>
+        <div class="card full" style="margin-top:14px">
+          <h2>Technique Breakdown</h2>
+          <div id="sq-breakdown" class="grid"></div>
+        </div>
+        <details class="accordion">
+          <summary><h2>Squeezr iframe</h2><a href="/proxy/squeezr/squeezr/dashboard" target="_blank">open native dashboard</a></summary>
+          <div class="content"><div class="iframe-wrap"><iframe src="/proxy/squeezr/squeezr/dashboard" loading="lazy" title="Squeezr dashboard"></iframe></div></div>
+        </details>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary><h2>Recent Gateway Requests</h2><span class="badge">live</span></summary>
+      <div class="content">
+        <table>
+          <thead><tr><th>time</th><th>method</th><th>path</th><th>model</th><th>status</th><th>latency</th><th>fb</th><th>tokens</th><th>cost</th><th>session</th></tr></thead>
+          <tbody id="history-body"><tr><td colspan="10" class="muted">no requests yet</td></tr></tbody>
+        </table>
+      </div>
+    </details>
+
+    <details class="accordion">
+      <summary><h2>Logs</h2><span class="badge">tail</span></summary>
+      <div class="content">
+        <div class="tabs" id="log-tabs">
+          <button class="tab active" data-service="supervisor">supervisor</button>
+          <button class="tab" data-service="gateway">gateway</button>
+          <button class="tab" data-service="headroom">headroom</button>
+          <button class="tab" data-service="pxpipe">pxpipe</button>
+          <button class="tab" data-service="squeezr">squeezr</button>
+        </div>
+        <div class="log-view" id="log-view">connecting...</div>
+      </div>
+    </details>
+  </main>
 
   <script>
     const $ = (id) => document.getElementById(id);
-    const badge = (state) => {
-      const cls = state === 'ok' ? 'ok' : state === 'disabled' ? '' : 'fail';
-      return `<span class="badge ${cls}">${state}</span>`;
-    };
-    const fmt = (n) => typeof n === 'number' ? n.toLocaleString() : (n ?? '—');
-    const fmtMs = (n) => (typeof n === 'number' && !isNaN(n)) ? `${Math.round(n)} ms` : '—';
-    const fmtUsd = (n) => (typeof n === 'number' && !isNaN(n) && n > 0) ? `$${n.toFixed(4)}` : '—';
-    const shortId = (s) => (s ? String(s).slice(-6) : '—');
-    const fmtDur = (s) => {
-      if (!s && s !== 0) return '—';
-      s = Math.floor(s);
-      const d = Math.floor(s / 86400); s -= d * 86400;
-      const h = Math.floor(s / 3600); s -= h * 3600;
-      const m = Math.floor(s / 60); s -= m * 60;
-      if (d) return `${d}d ${h}h`;
-      if (h) return `${h}h ${m}m`;
-      if (m) return `${m}m ${s}s`;
-      return `${s}s`;
-    };
+    const state = { status: null, detect: null, compare: null, summary: null, sessions: [], history: [] };
 
-    async function refreshStatus() {
-      try {
-        const res = await fetch('/api/status', { cache: 'no-store' });
-        const j = await res.json();
-        $('mode').textContent = j.mode || '—';
-        $('version').textContent = j.version || '—';
-        $('uptime').textContent = fmtDur(j.uptime_seconds);
-        $('req-count').textContent = fmt(j.request_count);
-        $('req-latency').textContent = fmtMs(j.avg_latency_ms);
-        const meta = `${j.mode || 'unknown mode'} · ${j.chain_short || ''}`;
-        $('header-meta').textContent = j.bind_warning ? `${meta} · ${j.bind_warning}` : meta;
-        $('version-badge').textContent = 'apx ' + (j.version || '?');
+    const fmt = (n) => Number.isFinite(Number(n)) ? Number(n).toLocaleString() : "-";
+    const pct = (n) => Number.isFinite(Number(n)) ? `${Number(n).toFixed(1)}%` : "-";
+    const ms = (n) => Number.isFinite(Number(n)) && Number(n) > 0 ? `${Math.round(Number(n))} ms` : "-";
+    const usd = (n) => Number.isFinite(Number(n)) ? `$${Number(n).toFixed(Number(n) >= 1 ? 2 : 4)}` : "-";
+    const short = (s, n = 10) => s ? String(s).slice(0, n) : "-";
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    const age = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString() : "-";
 
-        const s = j.stats || {};
-        $('s-tokens-in').textContent = fmt(s.tokens_in);
-        $('s-tokens-out').textContent = fmt(s.tokens_out);
-        $('s-cost').textContent = fmtUsd(s.cost_est_usd);
-        $('s-status').textContent = `${fmt(s.status_2xx)} / ${fmt(s.status_4xx)} / ${fmt(s.status_5xx)}`;
+    function badgeClass(enabled, reachable, doing) {
+      if (!enabled) return "";
+      if (!reachable) return "fail";
+      return doing ? "ok" : "warn";
+    }
 
-        const c = $('chain-view');
-        c.innerHTML = '';
-        const hops = j.chain_hops || [];
-        hops.forEach((hop, i) => {
-          if (i > 0) c.insertAdjacentHTML('beforeend', '<span class="arr">→</span>');
-          c.insertAdjacentHTML('beforeend', `<span class="hop">${hop}</span>`);
-        });
+    async function getJSON(url) {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok) throw new Error(`${url} ${res.status}`);
+      return res.json();
+    }
 
-        const h = j.health || {};
-        $('h-gateway').innerHTML = badge(h.gateway || '?');
-        $('h-headroom').innerHTML = badge(h.headroom || '?');
-        $('h-pxpipe').innerHTML = badge(h.pxpipe || '?');
-        $('h-squeezr').innerHTML = badge(h.squeezr || '?');
+    function renderStatus(j) {
+      state.status = j;
+      $("version-badge").textContent = `apx ${j.version || "?"}`;
+      $("header-meta").textContent = `${j.mode || "unknown"} · ${j.chain_short || ""}${j.bind_warning ? " · " + j.bind_warning : ""}`;
+      $("chain-view").innerHTML = (j.chain_hops || []).map((hop, i) => `${i ? '<span class="arr">-></span>' : ""}<span class="hop">${esc(hop)}</span>`).join("");
+    }
 
-      } catch (e) {
-        $('header-meta').textContent = 'gateway unreachable';
+    function renderCapture(j) {
+      $("capture-badge").textContent = `capture ${j.level || "metadata"}`;
+      $("capture-badge").className = `badge ${j.level === "full" ? "warn" : "ok"}`;
+    }
+
+    function renderSummary(j) {
+      state.summary = j;
+      const t = j.totals || {};
+      const lat = j.latency_ms || {};
+      const fb = j.first_byte_ms || {};
+      $("k-requests").textContent = fmt(t.requests || 0);
+      $("k-status").textContent = `${fmt(t.ok || 0)} ok / ${fmt(t.warn_4xx || 0)} warn / ${fmt(t.err_5xx || 0)} fail`;
+      $("k-p95").textContent = ms(lat.p95 || 0);
+      $("k-first-byte").textContent = `first byte p95 ${ms(fb.p95 || 0)}`;
+      $("k-tokens").textContent = fmt((t.tokens_in || 0) + (t.tokens_out || 0));
+      $("k-cache").textContent = `cache read/write ${fmt(t.cache_read_tokens || 0)} / ${fmt(t.cache_write_tokens || 0)}`;
+      $("k-cost").textContent = usd(t.cost_est_usd || 0);
+      $("k-tools").textContent = `tool calls ${fmt(t.tool_calls || 0)}`;
+    }
+
+    function renderDetect(j) {
+      state.detect = j;
+      for (const name of ["headroom", "pxpipe", "squeezr"]) {
+        const t = (j.tools || {})[name] || {};
+        const section = $(`${name}-section`);
+        const badge = $(`${name}-state`);
+        const visible = !!t.enabled || !!t.reachable;
+        section.hidden = !visible;
+        badge.textContent = !t.enabled ? "disabled" : !t.reachable ? "unreachable" : t.doing_work ? "active" : "idle";
+        badge.className = `badge ${badgeClass(t.enabled, t.reachable, t.doing_work)}`;
       }
     }
 
-    async function refreshHeadroom() {
-      try {
-        const res = await fetch('/api/headroom/stats', { cache: 'no-store' });
-        if (!res.ok) throw new Error(res.statusText);
-        const j = await res.json();
-        $('hr-compressed').textContent = fmt(j.requests_compressed ?? j.compressed_requests);
-        $('hr-saved').textContent = fmt(j.tokens_saved);
-        $('hr-cache-hits').textContent = fmt(j.cache_hits);
-        $('hr-cache-misses').textContent = fmt(j.cache_misses);
-      } catch (e) {
-        $('hr-compressed').textContent = '—';
-        $('hr-saved').textContent = '—';
-        $('hr-cache-hits').textContent = '—';
-        $('hr-cache-misses').textContent = '—';
-      }
+    function renderCompare(j) {
+      state.compare = j;
+      const rows = j.rows || [];
+      $("compare-count").textContent = `${rows.length} tool${rows.length === 1 ? "" : "s"}`;
+      $("compare-cards").innerHTML = rows.length ? rows.map(r => `
+        <div class="card">
+          <h2>${esc(r.tool)}</h2>
+          <div class="kpi">${fmt(r.tokens_saved_session || r.tokens_saved_lifetime || 0)}</div>
+          <div class="kpi-sub">tokens saved · ${pct(r.savings_pct || 0)} · ${r.usd_saved == null ? "no USD" : usd(r.usd_saved)}</div>
+          <div class="row"><span class="k">Requests</span><span class="v">${fmt(r.requests_total || 0)}</span></div>
+          <div class="row"><span class="k">Cache hit</span><span class="v">${pct((r.cache_hit_rate || 0) * 100)}</span></div>
+          <div class="row"><span class="k">Bypass</span><span class="v">${r.bypassed ? "yes" : "no"}</span></div>
+        </div>
+      `).join("") : '<div class="card full muted">No enabled tool has returned metrics yet. Enable Headroom, pxpipe, or Squeezr and send traffic through apx.</div>';
+      chartBars("compare-chart", rows.map(r => ({ label: r.tool, value: Number(r.tokens_saved_session || r.tokens_saved_lifetime || 0) })));
     }
 
-    async function refreshHistory() {
-      try {
-        const res = await fetch('/api/history?n=50', { cache: 'no-store' });
-        const rows = (await res.json()).items || [];
-        const body = $('history-body');
-        if (!rows.length) {
-          body.innerHTML = '<tr><td colspan="10" class="k">no requests yet</td></tr>';
-          return;
+    function renderToolDetails() {
+      Promise.allSettled([getJSON("/api/tool/headroom"), getJSON("/api/tool/pxpipe"), getJSON("/api/tool/squeezr")]).then(([h, p, s]) => {
+        if (h.status === "fulfilled") {
+          const n = h.value.normalized || {};
+          $("hr-saved").textContent = fmt(n.tokens_saved_lifetime || n.tokens_saved_session || 0);
+          $("hr-pct").textContent = `session savings ${pct(n.savings_pct_session || 0)} · ${usd(n.usd_saved_lifetime || 0)}`;
+          $("hr-requests").textContent = fmt(n.requests_total || 0);
+          $("hr-failed").textContent = `failed ${fmt(n.requests_failed || 0)}`;
+          $("hr-cache").textContent = `${fmt(n.cache_hits || 0)} / ${fmt(n.cache_entries || 0)}`;
         }
-        body.innerHTML = rows.slice().reverse().map(r => {
-          const cls = r.status >= 500 ? 'status-fail' : r.status >= 400 ? 'status-warn' : 'status-ok';
-          const t = new Date(r.ts * 1000).toLocaleTimeString();
-          return `<tr>
-            <td>${t}</td>
-            <td>${r.method || ''}</td>
-            <td>${escapeHtml(r.path || '')}</td>
-            <td>${escapeHtml(r.model || '')}</td>
-            <td class="${cls}">${r.status ?? ''}</td>
-            <td>${fmtMs(r.latency_ms)}</td>
-            <td>${fmt(r.tokens_in || 0)}</td>
-            <td>${fmt(r.tokens_out || 0)}</td>
-            <td>${fmtUsd(r.cost_est_usd)}</td>
-            <td title="${escapeHtml(r.request_id || '')}">${shortId(r.request_id)}</td>
-          </tr>`;
-        }).join('');
-      } catch (e) {}
+        if (p.status === "fulfilled") {
+          const n = p.value.normalized || {};
+          $("px-saved").textContent = fmt(n.saved_input_tokens || 0);
+          $("px-pct").textContent = `${pct(n.saved_pct_of_all_spend || n.saved_pct_input_only || 0)} · ${usd(n.saved_usd || 0)}`;
+          $("px-coverage").textContent = `${fmt(n.compressed_requests || 0)} / ${fmt(n.requests_total || 0)}`;
+          $("px-ab").textContent = `${usd(n.compressed_avg_usd_per_request || 0)} vs ${usd(n.passthrough_avg_usd_per_request || 0)}`;
+          $("px-sample").textContent = n.split_sufficient_sample ? "sample sufficient" : "sample too small for A/B claim";
+          $("px-img").textContent = fmt(n.image_bytes_total || 0);
+        }
+        if (s.status === "fulfilled") {
+          const n = s.value.normalized || {};
+          $("sq-saved").textContent = fmt(n.total_saved_tokens || 0);
+          $("sq-pct").textContent = `savings ${pct(n.savings_pct || 0)}`;
+          $("sq-expand").textContent = pct(n.expand_rate_pct || 0);
+          $("sq-mode").textContent = n.mode || "-";
+          $("sq-breaker").textContent = `circuit ${n.circuit_breaker_state || "unknown"}${n.bypassed ? " · bypassed" : ""}`;
+          $("sq-p95").textContent = ms(n.latency_p95_ms || 0);
+          const breakdown = n.breakdown || {};
+          const entries = Object.entries(breakdown).filter(([, v]) => Number(v) > 0).sort((a, b) => Number(b[1]) - Number(a[1]));
+          const max = Math.max(1, ...entries.map(([, v]) => Number(v)));
+          $("sq-breakdown").innerHTML = entries.length ? entries.map(([k, v]) => `
+            <div>
+              <div class="row"><span class="k">${esc(k)}</span><span class="v">${fmt(v)}</span></div>
+              <div class="bar"><span style="width:${Math.min(100, Number(v) / max * 100)}%"></span></div>
+            </div>
+          `).join("") : '<div class="muted">No Squeezr breakdown yet.</div>';
+        }
+      });
     }
 
-    function escapeHtml(s) {
-      return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    function renderSessions(j) {
+      state.sessions = j.sessions || [];
+      $("session-count").textContent = `${state.sessions.length} sessions`;
+      $("sessions-body").innerHTML = state.sessions.length ? state.sessions.map(s => `
+        <tr class="clickable" data-session="${esc(s.session_id)}">
+          <td>${age(s.last_ts)}</td>
+          <td title="${esc(s.session_id)}">${esc(short(s.session_id, 16))}</td>
+          <td>${fmt(s.requests || 0)}</td>
+          <td>${fmt((s.tokens_in || 0) + (s.tokens_out || 0))}</td>
+          <td>${usd(s.cost_usd || 0)}</td>
+          <td>${esc(s.chain_mode || "")}</td>
+        </tr>
+      `).join("") : '<tr><td colspan="6" class="muted">no sessions yet</td></tr>';
+      document.querySelectorAll("[data-session]").forEach(row => row.onclick = () => loadSession(row.dataset.session));
+    }
+
+    async function loadSession(sessionId) {
+      $("session-title").textContent = `Session ${sessionId}`;
+      const j = await getJSON(`/api/metrics/session/${encodeURIComponent(sessionId)}`);
+      $("session-detail").textContent = (j.requests || []).map(r => {
+        return [
+          `${new Date((r.ts || 0) * 1000).toLocaleString()} ${r.method} ${r.path}`,
+          `  status=${r.status} model=${r.model || "-"} stream=${!!r.is_stream}`,
+          `  latency=${ms(r.latency_ms)} first_byte=${ms(r.first_byte_ms)} tokens=${fmt((r.tokens_in || 0) + (r.tokens_out || 0))} cost=${usd(r.cost_est_usd || 0)}`,
+          `  request_id=${r.request_id || "-"} hops=${r.chain_hops || "-"} err=${r.err_class || "-"}`,
+        ].join("\n");
+      }).join("\n\n") || "No requests in session.";
+    }
+
+    function renderHistory(items) {
+      if (items) state.history = [...state.history, ...items].slice(-80);
+      $("history-body").innerHTML = state.history.length ? state.history.slice().reverse().map(r => {
+        const cls = r.status >= 500 ? "status-fail" : r.status >= 400 ? "status-warn" : "status-ok";
+        return `<tr>
+          <td>${age(r.ts)}</td><td>${esc(r.method || "")}</td><td>${esc(r.path || "")}</td><td>${esc(r.model || "")}</td>
+          <td class="${cls}">${r.status ?? ""}</td><td>${ms(r.latency_ms)}</td><td>${ms(r.first_byte_ms)}</td>
+          <td>${fmt((r.tokens_in || 0) + (r.tokens_out || 0))}</td><td>${usd(r.cost_est_usd || 0)}</td><td>${esc(short(r.session_id, 10))}</td>
+        </tr>`;
+      }).join("") : '<tr><td colspan="10" class="muted">no requests yet</td></tr>';
+    }
+
+    function chartBars(id, rows) {
+      const svg = $(id);
+      const w = svg.clientWidth || 1000, h = svg.clientHeight || 160, pad = 24;
+      const max = Math.max(1, ...rows.map(r => r.value || 0));
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      svg.innerHTML = rows.length ? rows.map((r, i) => {
+        const bw = Math.max(30, (w - pad * 2) / rows.length - 16);
+        const x = pad + i * ((w - pad * 2) / rows.length) + 8;
+        const bh = (h - pad * 2) * ((r.value || 0) / max);
+        const y = h - pad - bh;
+        return `<rect x="${x}" y="${y}" width="${bw}" height="${bh}" rx="7" fill="var(--accent)"></rect>
+          <text x="${x}" y="${h - 8}" fill="var(--muted)" font-size="11">${esc(r.label)}</text>
+          <text x="${x}" y="${Math.max(14, y - 6)}" fill="var(--text)" font-size="12">${fmt(r.value)}</text>`;
+      }).join("") : `<text x="24" y="84" fill="var(--muted)">No comparison data yet</text>`;
+    }
+
+    function chartLine(id, rows, key, label) {
+      const svg = $(id);
+      const w = svg.clientWidth || 1000, h = svg.clientHeight || 160, pad = 24;
+      const vals = rows.map(r => Number(r[key] || 0));
+      const max = Math.max(1, ...vals);
+      const step = rows.length > 1 ? (w - pad * 2) / (rows.length - 1) : 0;
+      const pts = vals.map((v, i) => `${pad + i * step},${h - pad - (h - pad * 2) * (v / max)}`).join(" ");
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      svg.innerHTML = `<text x="14" y="18" fill="var(--muted)" font-size="12">${esc(label)}</text>
+        <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2.5"></polyline>
+        <text x="${w - 90}" y="18" fill="var(--muted)" font-size="12">max ${fmt(max)}</text>`;
+    }
+
+    async function refreshAll() {
+      try {
+        const [status, capture, detect, summary, series, sessions, history, compare] = await Promise.all([
+          getJSON("/api/status"),
+          getJSON("/api/capture"),
+          getJSON("/api/tool/detect"),
+          getJSON("/api/metrics/summary?window=1h"),
+          getJSON("/api/metrics/timeseries?window=1h&bucket=1m"),
+          getJSON("/api/metrics/sessions?window=24h&limit=50"),
+          getJSON("/api/history?n=50"),
+          getJSON("/api/tool/compare"),
+        ]);
+        renderStatus(status);
+        renderCapture(capture);
+        renderDetect(detect);
+        renderSummary(summary);
+        renderSessions(sessions);
+        renderHistory(history.items || []);
+        renderCompare(compare);
+        chartLine("latency-chart", series.series || [], "latency_p95_ms", "Gateway latency p95");
+        chartLine("request-chart", series.series || [], "requests", "Requests per bucket");
+        renderToolDetails();
+        $("stream-badge").textContent = "live";
+        $("stream-badge").className = "badge ok";
+      } catch (err) {
+        $("header-meta").textContent = `dashboard refresh failed: ${err.message}`;
+        $("stream-badge").textContent = "offline";
+        $("stream-badge").className = "badge fail";
+      }
+    }
+
+    function connectEvents() {
+      try {
+        const es = new EventSource("/api/events/stream");
+        es.addEventListener("summary", ev => renderSummary(JSON.parse(ev.data)));
+        es.addEventListener("compare", ev => renderCompare(JSON.parse(ev.data)));
+        es.addEventListener("history", ev => renderHistory((JSON.parse(ev.data).items || [])));
+        es.addEventListener("squeezr", () => renderToolDetails());
+        es.onerror = () => {
+          $("stream-badge").textContent = "polling";
+          $("stream-badge").className = "badge warn";
+        };
+      } catch (_) {
+        $("stream-badge").textContent = "polling";
+        $("stream-badge").className = "badge warn";
+      }
     }
 
     let logSource = null;
     function connectLogs(service) {
-      if (logSource) { logSource.close(); logSource = null; }
-      const view = $('log-view');
-      view.textContent = `[apx] streaming ${service}.log …\n`;
-      try {
-        logSource = new EventSource('/api/logs/stream?service=' + encodeURIComponent(service));
-        logSource.onmessage = (ev) => {
-          view.textContent += ev.data + '\n';
-          if (view.textContent.length > 200000) {
-            view.textContent = view.textContent.slice(-150000);
-          }
-          view.scrollTop = view.scrollHeight;
-        };
-        logSource.onerror = () => {
-          view.textContent += `[apx] connection to ${service} log lost. retry in 3s.\n`;
-          setTimeout(() => connectLogs(service), 3000);
-        };
-      } catch (e) {
-        view.textContent += `[apx] error: ${e.message}\n`;
-      }
+      if (logSource) logSource.close();
+      $("log-view").textContent = `[apx] streaming ${service}.log ...\n`;
+      logSource = new EventSource(`/api/logs/stream?service=${encodeURIComponent(service)}`);
+      logSource.onmessage = ev => {
+        const el = $("log-view");
+        el.textContent += ev.data + "\n";
+        if (el.textContent.length > 180000) el.textContent = el.textContent.slice(-140000);
+        el.scrollTop = el.scrollHeight;
+      };
+      logSource.onerror = () => {
+        $("log-view").textContent += `[apx] log stream interrupted; retrying ${service}...\n`;
+      };
     }
 
-    document.querySelectorAll('.tab').forEach(el => {
-      el.addEventListener('click', () => {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        el.classList.add('active');
-        connectLogs(el.dataset.service);
-      });
-    });
+    document.querySelectorAll(".tab").forEach(el => el.addEventListener("click", () => {
+      document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      el.classList.add("active");
+      connectLogs(el.dataset.service);
+    }));
 
-    refreshStatus();
-    refreshHeadroom();
-    refreshHistory();
-    connectLogs('supervisor');
-    setInterval(refreshStatus, 2000);
-    setInterval(refreshHeadroom, 5000);
-    setInterval(refreshHistory, 3000);
+    refreshAll();
+    connectEvents();
+    connectLogs("supervisor");
+    setInterval(refreshAll, 10000);
   </script>
 </body>
 </html>

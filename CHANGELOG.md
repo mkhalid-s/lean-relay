@@ -6,6 +6,36 @@ All notable changes to apx are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-09
+
+Dashboard mega-release. Adds a durable local metrics data plane, privacy-gated
+capture controls, session views, comparative tool cards, and collapsed native
+tool dashboards in one release.
+
+### Added
+
+- **Durable gateway metrics.** `apx-gateway` now records request metadata to
+  local SQLite (`~/.local/state/apx/metrics.db`) with JSONL history preserved
+  as an audit log. Fresh databases can backfill existing `history/*.jsonl`.
+- **Privacy-first capture levels.** `APX_CAPTURE=metadata` is the default and
+  never stores request/response bodies. `APX_CAPTURE=full` is refused unless
+  `APX_CAPTURE_FULL_ACK=i-understand` is also set; full capture still redacts
+  known secret headers, API keys, tokens, passwords, and common key patterns.
+- **Session and comparison APIs.** New endpoints expose aggregate metrics,
+  timeseries, sessions, session details, tool detection, Headroom/pxpipe/Squeezr
+  cards, normalized comparisons, and a single SSE stream for live updates.
+- **Comparative dashboard.** The dashboard now shows gateway KPIs, chain state,
+  model/session rollups, per-tool comparisons, Headroom savings/cache stats,
+  pxpipe A/B and image-throughput stats, and Squeezr technique/quality cards.
+- **Collapsed native dashboards.** pxpipe and Squeezr iframes are now inside
+  accordions and only shown when those tools are enabled or reachable.
+- **Request correlation.** The gateway injects `X-Apx-Request-Id` and
+  `X-Apx-Session-Id` so downstream tools and gateway metrics can be compared
+  across a session.
+- **CI coverage for dashboard metrics.** CI now checks capture refusal,
+  dashboard/API availability, proxy recording, token/cache extraction, and
+  metadata-only SQLite writes.
+
 ## [0.3.0] - 2026-07-09
 
 Convenience release. Adds a tiny release-mode bootstrap so users can do a

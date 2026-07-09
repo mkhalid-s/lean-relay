@@ -26,7 +26,7 @@ curl -fsSL https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/
 
 ```bash
 # pin a version
-curl -fsSL https://.../get.sh | APX_VERSION=v0.3.0 bash
+curl -fsSL https://.../get.sh | APX_VERSION=v0.4.0 bash
 
 # forward flags to apx.sh (e.g. do not start the LaunchAgent)
 curl -fsSL https://.../get.sh | bash -s -- --no-service --skip-deps
@@ -89,25 +89,69 @@ Existing runtime config is preserved on reinstall. The installer backs it up and
 
 ## Dashboard
 
-Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/) after installing to see a single pane that aggregates every component:
+Open [http://127.0.0.1:8787/](http://127.0.0.1:8787/) after installing to see a single pane that aggregates every component. The dashboard is zero-build, self-contained, and served by `apx-gateway`.
 
-- current mode, chain diagram, apx version
-- live health badges for Gateway, Headroom, pxpipe, Squeezr
-- Headroom stats (fetched from `:8788/stats` server-side, no CORS)
-- last 50 gateway requests with status/latency
+It includes:
+
+- gateway KPIs: request volume, status buckets, p95 latency, first-byte latency, token totals, cache token totals, estimated cost, and tool-call counts
+- current mode, chain diagram, apx version, and capture-level badge
+- a comparative tool view that normalizes Headroom, pxpipe, and Squeezr savings/cache/request data side-by-side
+- session rollups and drill-in details keyed by `X-Apx-Session-Id`
+- per-tool cards that appear only when the tool is enabled or reachable:
+  - Headroom: lifetime/session tokens saved, savings percentage, request failures, cache hits/entries
+  - pxpipe: saved input tokens, all-spend savings percentage, compressed-request coverage, A/B cost split, PNG throughput
+  - Squeezr: saved tokens, expand-rate quality signal, mode/circuit-breaker state, latency p95, technique breakdown
 - live log tail via SSE for each service (`supervisor`, `gateway`, `headroom`, `pxpipe`, `squeezr`)
-- iframed pxpipe and Squeezr dashboards
+- native pxpipe and Squeezr dashboards collapsed into accordions, so they do not load or take space until expanded
 
 JSON APIs for scripting:
 
 ```text
-GET /api/status              overall mode + health + counters
-GET /api/history?n=100       gateway request history
-GET /api/headroom/stats      proxied Headroom /stats JSON
-GET /api/logs/stream?service=gateway   Server-Sent Events log tail
+GET /api/status                         overall mode + health + counters
+GET /api/history?n=100                  in-memory gateway history
+GET /api/metrics/summary?window=1h      request/status/token/cost aggregate
+GET /api/metrics/timeseries?window=1h   bucketed latency/request/token series
+GET /api/metrics/sessions?window=24h    grouped sessions
+GET /api/metrics/session/<id>           per-request session detail
+GET /api/tool/detect                    enabled/reachable/doing_work per tool
+GET /api/tool/compare                   normalized Headroom/pxpipe/Squeezr rows
+GET /api/tool/headroom                  Headroom /stats + Prometheus parse
+GET /api/tool/pxpipe                    pxpipe /proxy-stats + /api/stats.json
+GET /api/tool/squeezr                   Squeezr /health + /stats + /limits
+GET /api/events/stream                  SSE fan-in for live dashboard updates
+GET /api/logs/stream?service=gateway    Server-Sent Events log tail
 ```
 
 Disable the dashboard entirely by setting `APX_DASHBOARD_ENABLED=0` in `~/.config/apx/config.env`. The gateway keeps proxying normally either way.
+
+### Capture and Local Metrics
+
+By default, apx records only metadata:
+
+```bash
+APX_CAPTURE=metadata
+```
+
+Metadata mode stores timing, status, path, model, request/session ids, token counts, cache token counts, byte counts, estimated cost, and tool-call count. It does **not** store request or response bodies.
+
+Full capture is available for local debugging, but it is gated by an explicit acknowledgment:
+
+```bash
+APX_CAPTURE=full
+APX_CAPTURE_FULL_ACK=i-understand
+```
+
+Full capture stores a truncated, redacted copy of request/response bodies in the local SQLite database. The gateway refuses to start if `APX_CAPTURE=full` is set without the acknowledgment. Known secret headers and common API-key/token/password fields are redacted before persistence.
+
+Metrics are local-only:
+
+```bash
+APX_METRICS_DB="${HOME}/.local/state/apx/metrics.db"
+APX_METRICS_RETENTION_DAYS=30
+APX_METRICS_BACKFILL=1
+```
+
+Set `APX_METRICS_DB=""` (or `off`) to disable SQLite while keeping the existing JSONL history log.
 
 ## Updating
 
