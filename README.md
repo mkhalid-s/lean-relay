@@ -16,7 +16,23 @@ apx ships two install modes. Pick whichever matches how you work.
 
 ### Release mode (single-file installer, no git required)
 
-Download the self-extracting `apx.sh` and its checksum from a GitHub Release, verify, and run:
+**One-liner** (fetches `apx.sh`, verifies its SHA-256 against the checksum published in the same release, then runs it):
+
+```bash
+curl -fsSL https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/get.sh | bash
+```
+
+`get.sh` is a ~2 KB bootstrap you can audit end-to-end before running (it never executes `apx.sh` unless the checksum matches). Pin a specific version or pass through installer flags:
+
+```bash
+# pin a version
+curl -fsSL https://.../get.sh | APX_VERSION=v0.3.0 bash
+
+# forward flags to apx.sh (e.g. do not start the LaunchAgent)
+curl -fsSL https://.../get.sh | bash -s -- --no-service --skip-deps
+```
+
+**Manual (two-step)** if you'd rather download and verify yourself:
 
 ```bash
 curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
@@ -24,7 +40,7 @@ curl -fsSL  https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download
 bash apx.sh
 ```
 
-`apx.sh` is a ~60 KB self-extracting bash installer that carries the runtime as an embedded base64 tarball. It installs into a versioned layout at `~/.local/share/apx/versions/vX.Y.Z/` and flips `~/.local/share/apx/current` to point at it. `~/.local/bin/apx*` are symlinks into `current/bin/`, so `apx use vX.Y.Z` and `apx rollback` are atomic.
+`apx.sh` is a ~70 KB self-extracting bash installer that carries the runtime as an embedded base64 tarball. It installs into a versioned layout at `~/.local/share/apx/versions/vX.Y.Z/` and flips `~/.local/share/apx/current` to point at it. `~/.local/bin/apx*` are symlinks into `current/bin/`, so `apx use vX.Y.Z` and `apx rollback` are atomic.
 
 Options:
 

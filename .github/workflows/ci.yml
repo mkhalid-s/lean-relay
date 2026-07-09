@@ -33,6 +33,7 @@ jobs:
         run: |
           bash -n install.sh
           bash -n bootstrap.sh
+          bash -n get.sh
           bash -n bin/apx
           bash -n bin/apx-squeezr
           bash -n build/pack.sh
@@ -43,6 +44,7 @@ jobs:
           shellcheck --severity=warning \
             install.sh \
             bootstrap.sh \
+            get.sh \
             bin/apx \
             bin/apx-squeezr \
             build/pack.sh \
@@ -119,6 +121,46 @@ jobs:
           embedded="$(bash dist/apx.sh --print-version)"
           test "$extracted_version" = "$embedded"
 
+      - name: Verify get.sh bootstrap round-trips against a real release
+        run: |
+          # Positive path: get.sh should fetch v0.2.0's apx.sh, verify its
+          # sha256, and pass --print-version through to it.
+          version=$(APX_VERSION=v0.2.0 bash get.sh --print-version 2>/dev/null | tail -1)
+          test "$version" = "0.2.0"
+
+      - name: Verify get.sh refuses a non-existent release
+        run: |
+          # Negative path: nonexistent tag → curl -f returns non-zero →
+          # get.sh must exit non-zero before running any apx.sh.
+          set +e
+          APX_VERSION=v99.99.99 bash get.sh --print-version >/dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+
+      - name: Verify get.sh refuses a checksum mismatch
+        run: |
+          # Stub curl so get.sh receives an apx.sh whose bytes do not match
+          # the published sha256. get.sh must refuse to execute.
+          stub_dir="$RUNNER_TEMP/curl-stub"
+          rm -rf "$stub_dir"; mkdir -p "$stub_dir"
+          cat > "$stub_dir/curl" <<'SH'
+          #!/usr/bin/env bash
+          out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+          # Serve a bogus apx.sh + a valid-looking (but mismatched) sha256.
+          case "$out" in
+            *apx.sh)         printf 'bogus\n' > "$out" ;;
+            *apx.sh.sha256)  printf '%s  apx.sh\n' "$(printf 'expected\n' | sha256sum | awk '{print $1}')" > "$out" ;;
+          esac
+          exit 0
+          SH
+          chmod +x "$stub_dir/curl"
+          set +e
+          PATH="$stub_dir:$PATH" bash get.sh --print-version >/dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
+
       - name: Upload apx.sh artifact
         if: matrix.os == 'ubuntu-latest'
         uses: actions/upload-artifact@v6
@@ -127,6 +169,8 @@ jobs:
           path: |
             dist/apx.sh
             dist/apx.sh.sha256
+            dist/get.sh
+            dist/get.sh.sha256
           if-no-files-found: error
           retention-days: 14
 

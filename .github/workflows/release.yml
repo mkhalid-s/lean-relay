@@ -48,11 +48,11 @@ jobs:
 
       - name: Lint
         run: |
-          for f in install.sh bootstrap.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh; do
+          for f in install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh; do
             bash -n "$f"
           done
           shellcheck --severity=warning \
-            install.sh bootstrap.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh
+            install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh
           python -m py_compile bin/apx-gateway
 
   # ── 2) Build all artifacts: source tarball + self-extracting apx.sh ──────
@@ -100,6 +100,8 @@ jobs:
           path: |
             dist/apx.sh
             dist/apx.sh.sha256
+            dist/get.sh
+            dist/get.sh.sha256
             dist/apx-*.tar.gz
             dist/apx-*.tar.gz.sha256
           if-no-files-found: error
@@ -128,12 +130,45 @@ jobs:
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum -c apx.sh.sha256
+            sha256sum -c get.sh.sha256
             sha256sum -c apx-*.tar.gz.sha256
           else
             shasum -a 256 -c apx.sh.sha256
+            shasum -a 256 -c get.sh.sha256
             shasum -a 256 -c apx-*.tar.gz.sha256
           fi
           tar -tzf apx-*.tar.gz | grep -q '/install.sh$'
+          # get.sh must be present and executable in dist.
+          test -x get.sh
+
+      - name: Verify get.sh round-trips against the previous release
+        # Use the last published release (v0.2.0) to prove the bootstrap
+        # mechanism works. The current tag isn't published yet, so we
+        # cannot self-reference; the negative test below covers the
+        # per-release checksum enforcement.
+        run: |
+          version=$(APX_VERSION=v0.2.0 bash dist/get.sh --print-version 2>/dev/null | tail -1)
+          test "$version" = "0.2.0"
+
+      - name: Verify get.sh refuses a checksum mismatch
+        run: |
+          stub_dir="$RUNNER_TEMP/curl-stub"
+          rm -rf "$stub_dir"; mkdir -p "$stub_dir"
+          cat > "$stub_dir/curl" <<'SH'
+          #!/usr/bin/env bash
+          out=""; while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+          case "$out" in
+            *apx.sh)         printf 'bogus\n' > "$out" ;;
+            *apx.sh.sha256)  printf '%s  apx.sh\n' "$(printf 'expected\n' | sha256sum | awk '{print $1}')" > "$out" ;;
+          esac
+          exit 0
+          SH
+          chmod +x "$stub_dir/curl"
+          set +e
+          PATH="$stub_dir:$PATH" bash dist/get.sh --print-version >/dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" != 0
 
       - name: Install into isolated HOME (no service, skip deps)
         run: |
@@ -330,6 +365,8 @@ jobs:
           files: |
             dist/apx.sh
             dist/apx.sh.sha256
+            dist/get.sh
+            dist/get.sh.sha256
             dist/apx-*.tar.gz
             dist/apx-*.tar.gz.sha256
           generate_release_notes: true

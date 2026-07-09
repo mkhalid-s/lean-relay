@@ -96,14 +96,30 @@ chmod +x "$OUT"
 
 # Compute sha256 with whichever tool is available.
 if command -v sha256sum >/dev/null 2>&1; then
-  ( cd "$OUT_DIR" && sha256sum apx.sh > apx.sh.sha256 )
+  SHA256=(sha256sum)
 elif command -v shasum >/dev/null 2>&1; then
-  ( cd "$OUT_DIR" && shasum -a 256 apx.sh > apx.sh.sha256 )
+  SHA256=(shasum -a 256)
 else
   echo "no sha256sum or shasum available" >&2
   exit 1
+fi
+( cd "$OUT_DIR" && "${SHA256[@]}" apx.sh > apx.sh.sha256 )
+
+# Ship the bootstrap installer alongside apx.sh so users can do a one-shot
+# curl | bash while keeping SHA-256 verification (get.sh is the tiny wrapper
+# that fetches apx.sh + apx.sh.sha256 from the same release and executes
+# after verifying).
+GET_SRC="$REPO_ROOT/get.sh"
+if [[ -f "$GET_SRC" ]]; then
+  cp "$GET_SRC" "$OUT_DIR/get.sh"
+  chmod +x "$OUT_DIR/get.sh"
+  ( cd "$OUT_DIR" && "${SHA256[@]}" get.sh > get.sh.sha256 )
 fi
 
 size=$(wc -c < "$OUT")
 printf '[apx:pack] built %s (%d bytes, version %s)\n' "$OUT" "$size" "$VERSION"
 printf '[apx:pack] sha256: %s\n' "$(awk '{print $1}' "$OUT_DIR/apx.sh.sha256")"
+if [[ -f "$OUT_DIR/get.sh" ]]; then
+  printf '[apx:pack] bundled bootstrap: %s (sha256=%s)\n' \
+    "$OUT_DIR/get.sh" "$(awk '{print $1}' "$OUT_DIR/get.sh.sha256")"
+fi

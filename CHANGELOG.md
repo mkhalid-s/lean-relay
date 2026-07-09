@@ -6,6 +6,22 @@ All notable changes to apx are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-09
+
+Convenience release. Adds a tiny release-mode bootstrap so users can do a
+single-command install without giving up SHA-256 verification.
+
+### Added
+
+- **`get.sh` bootstrap installer.** A ~60-line release asset that fetches
+  `apx.sh` + `apx.sh.sha256` from the same GitHub Release, verifies the
+  checksum, and executes `apx.sh`. Enables the one-liner
+  `curl -fsSL https://.../releases/latest/download/get.sh | bash` while
+  keeping the same integrity guarantee as the two-step manual flow. Pin a
+  version with `APX_VERSION=vX.Y.Z` and forward installer flags with
+  `bash -s -- --no-service`. Both CI and Release pipelines exercise get.sh
+  end-to-end against a real release plus a checksum-mismatch negative test.
+
 ## [0.2.0] - 2026-07-09
 
 Safety-focused release. Adds opt-in cleanup for the extras apx installs on
