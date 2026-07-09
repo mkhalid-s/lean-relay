@@ -138,8 +138,10 @@ jobs:
             shasum -a 256 -c apx-*.tar.gz.sha256
           fi
           tar -tzf apx-*.tar.gz | grep -q '/install.sh$'
-          # get.sh must be present and executable in dist.
-          test -x get.sh
+          # get.sh must be present. Executable bit is stripped by
+          # actions/upload-artifact so we only assert existence here; we
+          # always invoke get.sh via `bash dist/get.sh` below.
+          test -f get.sh
 
       - name: Verify get.sh round-trips against the previous release
         # Use the last published release (v0.2.0) to prove the bootstrap
