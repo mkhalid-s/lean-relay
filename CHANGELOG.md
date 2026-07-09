@@ -45,7 +45,17 @@ All notable changes to apx are documented here. The format follows
 - **Uninstall `state`-without-`deps,caches` note.** When `--purge=state` is
   invoked without `deps`/`caches` and the install manifest still exists, apx
   prints a note that the manifest is about to be removed and suggests the
-  combined form `--purge=all,deps,caches`.
+  combined form `--purge=all,deps,caches`. The note (and the env-override
+  refusal) print before the interactive confirmation, so users can back out
+  without ever typing `yes`.
+- **Trailing-slash tolerance on `APX_SHARE`/`APX_STATE`/`APX_CONFIG`.** The
+  default-layout guard now normalizes a trailing `/`, so
+  `APX_SHARE=$HOME/.local/share/apx/` is accepted instead of being refused as
+  non-default.
+- **`log()` self-heals a missing `~/.local/state/apx/logs`.** If the log
+  directory was manually removed between `apx start` and `apx stop`, the
+  stop path no longer aborts under `set -Eeuo pipefail` before killing the
+  supervisor and children.
 
 ## [0.1.0] - 2026-07-08
 
