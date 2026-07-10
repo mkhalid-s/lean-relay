@@ -223,7 +223,7 @@
       <div class="meta" id="header-meta">loading gateway state...</div>
     </div>
     <div class="top-actions">
-      <span class="badge" id="version-badge">apx</span>
+      <span class="badge" id="version-badge">LeanRelay</span>
       <span class="badge" id="capture-badge">capture ?</span>
       <span class="badge" id="stream-badge">live</span>
     </div>
@@ -414,7 +414,7 @@
 
     function renderStatus(j) {
       state.status = j;
-      $("version-badge").textContent = `apx ${j.version || "?"}`;
+      $("version-badge").textContent = `LeanRelay · apx ${j.version || "?"}`;
       $("header-meta").textContent = `${j.mode || "unknown"} · ${j.chain_short || ""}${j.bind_warning ? " · " + j.bind_warning : ""}`;
       $("chain-view").innerHTML = (j.chain_hops || []).map((hop, i) => `${i ? '<span class="arr">-></span>' : ""}<span class="hop">${esc(hop)}</span>`).join("");
       setNativeToolUrl("pxpipe", j.pxpipe_url, "/");

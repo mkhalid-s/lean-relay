@@ -1,6 +1,6 @@
 # Security Policy
 
-apx runs local proxies and can observe LLM request/response traffic.
+LeanRelay (`apx`) runs local proxies and can observe LLM request/response traffic.
 Treat its logs and dashboards as sensitive.
 
 ## Reporting
@@ -10,7 +10,7 @@ opening a public issue with sensitive details.
 
 ## Operational Notes
 
-- Bind to `127.0.0.1` unless you intentionally need remote access. The apx
+- Bind to `127.0.0.1` unless you intentionally need remote access. The LeanRelay
   dashboard at `http://127.0.0.1:8787/` exposes request history and log tails;
   do not expose the gateway port to a public network.
 - Review any third-party dependencies before installing them.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# apx release-mode bootstrap installer.
+# LeanRelay release bootstrap installer (`apx`).
 #
 # Fetches the self-extracting apx.sh from a GitHub Release, verifies its
 # SHA-256 against the checksum published in the same release, and executes

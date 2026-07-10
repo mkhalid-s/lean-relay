@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for improving apx.
+Thanks for improving LeanRelay (`apx`).
 
 ## Development
 
@@ -20,8 +20,8 @@ Keep scripts portable:
 - Do not commit user-specific absolute paths.
 - Do not commit runtime logs, PID files, or generated LaunchAgent output.
 - Keep dependency installation explicit and visible to the user.
-- Preserve backward compatibility for the `ai-proxy-stack` / `ai-proxy-gateway` /
-  `ai-proxy-squeezr-foreground` shim names for at least one minor release.
+- Preserve the `apx`, `apx-gateway`, and `apx-squeezr` command names; legacy
+  `ai-proxy-stack*` shims are not installed.
 
 ## Releasing
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot installer for apx.
+# One-shot dev installer for LeanRelay (`apx`).
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/mkhalid-s/ai-proxy-stack/main/bootstrap.sh | bash

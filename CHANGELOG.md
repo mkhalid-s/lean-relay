@@ -21,6 +21,8 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 - Project branding is **LeanRelay**; `apx` remains the installed CLI and command
   name (`apx-gateway`, `apx-squeezr` unchanged).
+- README, docs, dashboard, and GitHub metadata now use consistent LeanRelay
+  product naming alongside the `apx` command.
 - Tool dashboards now load lazily from their native ports instead of executing
   unsandboxed third-party UI code under the sensitive apx dashboard origin.
 - Dashboard SSE uses a bounded, single-loop stream with shared payload caching

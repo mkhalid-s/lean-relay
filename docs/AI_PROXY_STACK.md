@@ -1,5 +1,7 @@
 # LeanRelay
 
+**Local context-efficiency platform for AI agents — operated through the `apx` CLI.**
+
 **LeanRelay** is the project name for this local context-efficiency platform. The
 `apx` CLI (formerly packaged as `ai-proxy-stack`) provides one stable Gateway
 URL for Claude Code and routes traffic through Headroom, pxpipe, Squeezr, or
@@ -8,7 +10,8 @@ unified dashboard that aggregates health, request history, Headroom stats, and
 log tails from every component.
 
 > **Commands:** `apx` (CLI), `apx-gateway` (gateway), `apx-squeezr` (Squeezr
-> helper). Legacy `ai-proxy-stack*` shims are not installed.
+> helper). Legacy `ai-proxy-stack*` shims are not installed. The GitHub
+> repository remains `ai-proxy-stack` so existing install URLs keep working.
 
 ## Architecture
 

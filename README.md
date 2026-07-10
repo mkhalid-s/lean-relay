@@ -18,7 +18,8 @@ after the Gateway, so the client base URL remains stable.
 
 > **LeanRelay** is the project name. The CLI, gateway, and Squeezr helper are
 > `apx`, `apx-gateway`, and `apx-squeezr`. No legacy `ai-proxy-stack*` shims are
-> installed.
+> installed. The GitHub repository remains `ai-proxy-stack` so existing install
+> URLs keep working.
 
 ## Why LeanRelay Exists
 
@@ -584,16 +585,12 @@ apx logs headroom.proxy
 
 ## Third-Party Projects and Credits
 
-<<<<<<< Updated upstream
-This project is **LeanRelay**, licensed under MIT. See `LICENSE`.
-=======
-apx is an orchestration layer built around independent open-source projects.
+LeanRelay is an orchestration layer built around independent open-source projects.
 The context optimization, rendering, parsing, and helper-tool functionality
 comes from their maintainers and contributors. Please support those projects,
 read their documentation, and report tool-specific bugs upstream.
->>>>>>> Stashed changes
 
-| Project | How apx uses it | Reference |
+| Project | How LeanRelay uses it | Reference |
 |---|---|---|
 | Headroom | Optional context-compression and cache-aware proxy | [headroomlabs-ai/headroom](https://github.com/headroomlabs-ai/headroom), [PyPI](https://pypi.org/project/headroom-ai/) |
 | pxpipe | Optional text-to-image context proxy and savings telemetry | [teamchong/pxpipe](https://github.com/teamchong/pxpipe), [npm](https://www.npmjs.com/package/pxpipe-proxy) |
@@ -606,10 +603,10 @@ read their documentation, and report tool-specific bugs upstream.
 | Homebrew | Optional macOS dependency installation | [Homebrew](https://brew.sh/) |
 | Python standard library | Gateway HTTP server, streaming proxy, process logic, and SQLite integration | [Python](https://www.python.org/), [sqlite3](https://docs.python.org/3/library/sqlite3.html) |
 
-Claude Code and Anthropic are referenced because apx provides an
-Anthropic-compatible local routing layer. apx is not an Anthropic product.
+Claude Code and Anthropic are referenced because LeanRelay provides an
+Anthropic-compatible local routing layer. LeanRelay is not an Anthropic product.
 
-Third-party projects are not relicensed by apx. Each project retains its own
+Third-party projects are not relicensed by LeanRelay. Each project retains its own
 copyright, license, support policy, privacy behavior, and release lifecycle.
 The list above describes direct operational dependencies and is not a complete
 inventory of every transitive package. See `NOTICE` and each upstream package
@@ -654,7 +651,7 @@ for authoritative license information.
 
 ## Disclaimer
 
-apx is an independent, unofficial open-source project. It is not affiliated
+LeanRelay is an independent, unofficial open-source project. It is not affiliated
 with, endorsed by, sponsored by, or supported by Anthropic, Claude Code,
 Headroom, pxpipe, Squeezr, or their maintainers. Product names and trademarks
 belong to their respective owners.

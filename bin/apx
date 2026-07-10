@@ -2071,6 +2071,7 @@ show_version() {
   installed="$(read_installed_version)"
   local_repo="$(read_source_repo)"
   mode="$(read_install_mode)"
+  echo "product:           LeanRelay (apx)"
   echo "installed version: $installed"
   echo "install mode:      ${mode:-unknown}"
   if [[ "$mode" == "release" ]]; then
