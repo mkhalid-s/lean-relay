@@ -34,8 +34,11 @@ Usage: bash apx.sh [options]
 Options:
   --print-version         Print embedded apx version and exit
   --extract-to <dir>      Extract payload into <dir> and exit (no install)
-  --no-service            Sync files but do not start the LaunchAgent
-  --skip-deps             Do not install/refresh Homebrew or pipx dependencies
+  --no-service            Sync files but do not start a service
+  --service-backend <b>   auto, launchd, systemd, or nohup
+  --client-topology <t>   local, docker-host, custom, or none
+  --client-base-url <url> URL used with custom topology
+  --skip-deps             Do not install/refresh platform dependencies
   --force                 Overwrite an existing installation of this version
   --dry-run               Show what would happen; make no changes
   -h, --help              Show this help
@@ -48,6 +51,9 @@ NO_SERVICE=0
 SKIP_DEPS=0
 PRINT_VERSION=0
 EXTRACT_ONLY=""
+SERVICE_BACKEND="${APX_SERVICE_BACKEND:-auto}"
+CLIENT_TOPOLOGY="${APX_CLIENT_TOPOLOGY:-none}"
+CLIENT_BASE_URL="${APX_CLIENT_BASE_URL:-}"
 INSTALL_YES="${APX_YES:-1}"
 
 while [[ $# -gt 0 ]]; do
@@ -55,7 +61,13 @@ while [[ $# -gt 0 ]]; do
     --print-version) PRINT_VERSION=1 ;;
     --extract-to) shift; EXTRACT_ONLY="${1:-}" ;;
     --extract-to=*) EXTRACT_ONLY="${1#--extract-to=}" ;;
-    --no-service) NO_SERVICE=1 ;;
+    --no-service|--no-start) NO_SERVICE=1 ;;
+    --service-backend) shift; SERVICE_BACKEND="${1:-}" ;;
+    --service-backend=*) SERVICE_BACKEND="${1#*=}" ;;
+    --client-topology) shift; CLIENT_TOPOLOGY="${1:-}" ;;
+    --client-topology=*) CLIENT_TOPOLOGY="${1#*=}" ;;
+    --client-base-url) shift; CLIENT_BASE_URL="${1:-}" ;;
+    --client-base-url=*) CLIENT_BASE_URL="${1#*=}" ;;
     --skip-deps) SKIP_DEPS=1 ;;
     --force) FORCE=1 ;;
     --dry-run) DRY_RUN=1 ;;
@@ -133,18 +145,7 @@ if [[ -n "$EXTRACT_ONLY" ]]; then
   exit 0
 fi
 
-case "$(uname -s)" in
-  Darwin) ;;
-  Linux)
-    warn "Linux is best-effort: LaunchAgent step will be skipped and dependency install (Homebrew/pipx) is macOS-only"
-    NO_SERVICE=1
-    # install.sh's dep step gates on Homebrew, which is macOS-only, so
-    # a Linux run would die inside require_brew_for_deps. Auto-skip so the
-    # file-sync path completes and users still get a working CLI.
-    SKIP_DEPS=1
-    ;;
-  *) die "unsupported OS: $(uname -s)" ;;
-esac
+case "$(uname -s)" in Darwin|Linux) ;; *) die "unsupported OS: $(uname -s)" ;; esac
 
 if ! grep -q '^__APX_PAYLOAD_BEGIN__$' "${BASH_SOURCE[0]}" 2>/dev/null; then
   die "installer is missing its embedded payload; the file is likely corrupted"
@@ -157,10 +158,10 @@ if [[ -d "$TARGET_DIR" && "$FORCE" != "1" ]]; then
   # v0.2 vs v0.2.0, or v0.2.0 vs v0.2.0-rc1) does not spuriously match.
   if [[ -L "$CURRENT_LINK" && "$(readlink "$CURRENT_LINK")" == "versions/$VERSION_TAG" ]]; then
     log "already installed and active: $VERSION_TAG"
-    log "use --force to reinstall, or run: apx update"
-    exit 0
+    log "refreshing binary links, config defaults, and service state"
+  else
+    log "version $VERSION_TAG is already extracted; flipping current -> $VERSION_TAG"
   fi
-  log "version $VERSION_TAG is already extracted; flipping current -> $VERSION_TAG"
 else
   if [[ "$DRY_RUN" == "1" ]]; then
     log "would extract payload into $TARGET_DIR"
@@ -246,8 +247,11 @@ if [[ "$INSTALL_YES" == "1" ]]; then
   installer_flags+=(--yes)
 fi
 if [[ "$NO_SERVICE" == "1" ]]; then
-  installer_flags+=(--no-start)
+  installer_flags+=(--no-service)
 fi
+installer_flags+=(--service-backend "$SERVICE_BACKEND")
+installer_flags+=(--client-topology "$CLIENT_TOPOLOGY")
+[[ -n "$CLIENT_BASE_URL" ]] && installer_flags+=(--client-base-url "$CLIENT_BASE_URL")
 if [[ "$SKIP_DEPS" == "1" ]]; then
   installer_flags+=(--skip-deps)
 fi

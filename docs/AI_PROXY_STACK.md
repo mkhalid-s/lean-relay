@@ -15,7 +15,8 @@ log tails from every component.
 Claude Code should always use the Gateway:
 
 ```text
-ANTHROPIC_BASE_URL=http://host.docker.internal:8787
+same host/container:  ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+container to macOS:   ANTHROPIC_BASE_URL=http://host.docker.internal:8787
 ```
 
 The Gateway listens on `127.0.0.1:8787` and routes to one of these downstream paths:
@@ -111,18 +112,20 @@ Useful install options:
 
 ```bash
 ./install.sh --yes        # non-interactive install
-./install.sh --no-start   # sync runtime files without starting launchd
+./install.sh --no-service # sync runtime files without starting a service
+./install.sh --service-backend nohup
 ./install.sh --skip-deps  # skip dependency installation
-./install.sh --uninstall  # remove LaunchAgent and runtime command; keep config/logs
+./install.sh --uninstall  # remove service; keep config/logs
 ```
 
-The installer copies source files into launchd-safe runtime locations and starts the macOS LaunchAgent.
+The installer copies source files into user-writable runtime locations and starts
+launchd on macOS, systemd-user when available on Linux, or the nohup fallback.
 
 Re-running the installer preserves an existing runtime config. It creates a timestamped backup and appends any new default keys from the source template, instead of replacing local mode and port experiments.
 
 ## Dependency Bootstrap
 
-When Homebrew is present, the installer can auto-install safe missing dependencies:
+The installer can use Homebrew, apt, dnf, or pacman to install safe missing dependencies:
 
 ```text
 pipx
@@ -135,7 +138,7 @@ pxpipe-proxy@0.8.0 npm cache
 squeezr-ai npm cache
 ```
 
-Homebrew itself is not installed silently. If Homebrew is missing, the installer prints the official Homebrew install command.
+Package managers themselves are not installed or reconfigured by apx.
 
 RTK and Ponytail are optional add-ons and are not installed by default.
 
@@ -158,16 +161,18 @@ Runtime mirrors:
 ~/.local/bin/apx
 ~/.local/bin/apx-gateway
 ~/.local/bin/apx-squeezr
-~/.local/bin/ai-proxy-stack               # legacy shim -> apx
-~/.local/bin/ai-proxy-gateway             # legacy shim -> apx-gateway
-~/.local/bin/ai-proxy-squeezr-foreground  # legacy shim -> apx-squeezr
 ~/.config/apx/config.env
+~/.config/apx/service.backend
 ~/.local/state/apx/
 ~/.local/share/apx/dashboard.html
-~/Library/LaunchAgents/io.github.apx.plist
+~/Library/LaunchAgents/io.github.apx.plist             # macOS
+~/.config/systemd/user/io.github.apx.service           # Linux systemd-user
+$XDG_RUNTIME_DIR/apx/                                  # ephemeral Linux PID/lock state
 ```
 
-The runtime mirror is intentional. macOS LaunchAgents can hit privacy/TCC failures when reading protected directories such as `~/Documents`.
+The runtime mirror is intentional. It avoids macOS privacy/TCC restrictions and
+supports Linux XDG config/state/runtime conventions. See
+[`DEVCONTAINER.md`](DEVCONTAINER.md) for container topologies.
 
 ## Configuration
 
@@ -295,7 +300,7 @@ apx uninstall
 
 ## Mode Behavior
 
-`mode` updates config, restarts the LaunchAgent, and syncs Claude settings by default.
+`mode` updates config, restarts the active service backend, and syncs Claude settings by default.
 
 ```bash
 apx mode pxpipe
@@ -351,7 +356,7 @@ Other useful Claude settings from this local setup:
 
 ## Disable vs Stop
 
-`stop` stops the LaunchAgent and child processes, but leaves Claude settings alone.
+`stop` stops the active apx service backend and child processes, but leaves Claude settings alone.
 
 ```bash
 apx stop
@@ -368,7 +373,7 @@ It does all of this:
 ```text
 sets mode to off
 stops Gateway, Headroom, pxpipe, and Squeezr
-stops the LaunchAgent
+stops the active apx service
 removes ANTHROPIC_BASE_URL from ~/.claude/settings.json
 ```
 
@@ -418,7 +423,7 @@ apx logs headroom.proxy # Headroom request/error details only
 apx logs pxpipe      # upstream Anthropic/OpenAI status and dashboard
 apx logs squeezr     # Squeezr startup, self-test, and request handling
 apx logs supervisor  # process restarts and health checks
-apx logs launchd.err # macOS LaunchAgent failures
+apx logs launchd.err # macOS launchd failures
 apx logs launchd.out
 ```
 

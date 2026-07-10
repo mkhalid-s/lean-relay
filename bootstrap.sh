@@ -11,6 +11,11 @@
 #   APX_REF       git ref to check out (branch, tag, or SHA; default: main)
 #   APX_SRC_DIR   checkout path (default: $HOME/.local/share/apx-src)
 #   APX_YES       if set to 0, pass through interactive install (default: 1)
+#   APX_SERVICE_BACKEND  auto|launchd|systemd|nohup (default: auto)
+#   APX_SKIP_DEPS if set to 1, skip dependency installation
+#   APX_NO_SERVICE if set to 1, install files without starting a service
+#   APX_CLIENT_TOPOLOGY local|docker-host|custom|none
+#   APX_CLIENT_BASE_URL URL used with custom topology
 
 set -Eeuo pipefail
 
@@ -18,11 +23,22 @@ REPO="${APX_REPO:-${AI_PROXY_STACK_REPO:-https://github.com/mkhalid-s/ai-proxy-s
 REF="${APX_REF:-${AI_PROXY_STACK_REF:-main}}"
 CLONE_DIR="${APX_SRC_DIR:-${AI_PROXY_STACK_DIR:-$HOME/.local/share/apx-src}}"
 YES_FLAG="${APX_YES:-${AI_PROXY_STACK_YES:-1}}"
+SERVICE_BACKEND="${APX_SERVICE_BACKEND:-auto}"
+SKIP_DEPS="${APX_SKIP_DEPS:-0}"
+NO_SERVICE="${APX_NO_SERVICE:-0}"
+CLIENT_TOPOLOGY="${APX_CLIENT_TOPOLOGY:-none}"
+CLIENT_BASE_URL="${APX_CLIENT_BASE_URL:-}"
 
 log() { printf '[apx:bootstrap] %s\n' "$*"; }
 die() { printf '[apx:bootstrap] error: %s\n' "$*" >&2; exit 1; }
 
-command -v git >/dev/null 2>&1 || die "git is required. Install Xcode command line tools: xcode-select --install"
+if ! command -v git >/dev/null 2>&1; then
+  case "$(uname -s)" in
+    Darwin) die "git is required. Install Xcode command line tools: xcode-select --install" ;;
+    Linux) die "git is required. Install it with apt, dnf, or pacman, then retry" ;;
+    *) die "git is required" ;;
+  esac
+fi
 
 mkdir -p "$(dirname "$CLONE_DIR")"
 
@@ -47,8 +63,11 @@ fi
 INSTALLER="$CLONE_DIR/install.sh"
 [[ -x "$INSTALLER" ]] || die "installer missing or not executable: $INSTALLER"
 
-if [[ "$YES_FLAG" == "1" ]]; then
-  exec "$INSTALLER" --yes
-else
-  exec "$INSTALLER"
-fi
+set --
+[[ "$YES_FLAG" == "1" ]] && set -- "$@" --yes
+[[ "$SKIP_DEPS" == "1" ]] && set -- "$@" --skip-deps
+[[ "$NO_SERVICE" == "1" ]] && set -- "$@" --no-service
+set -- "$@" --service-backend "$SERVICE_BACKEND"
+set -- "$@" --client-topology "$CLIENT_TOPOLOGY"
+[[ -n "$CLIENT_BASE_URL" ]] && set -- "$@" --client-base-url "$CLIENT_BASE_URL"
+exec "$INSTALLER" "$@"

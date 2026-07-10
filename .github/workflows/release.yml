@@ -48,11 +48,11 @@ jobs:
 
       - name: Lint
         run: |
-          for f in install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh; do
+          for f in install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh tests/lifecycle.sh; do
             bash -n "$f"
           done
           shellcheck --severity=warning \
-            install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh
+            install.sh bootstrap.sh get.sh bin/apx bin/apx-squeezr build/pack.sh build/header.sh tests/lifecycle.sh
           python -m py_compile bin/apx-gateway
 
   # ── 2) Build all artifacts: source tarball + self-extracting apx.sh ──────

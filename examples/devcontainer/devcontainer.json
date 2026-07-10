@@ -1,0 +1,24 @@
+{
+  "name": "LeanRelay same-container",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
+    "ghcr.io/devcontainers/features/python:1": { "version": "3.12" }
+  },
+  "containerEnv": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787",
+    "APX_SERVICE_BACKEND": "nohup",
+    "APX_CLIENT_TOPOLOGY": "local",
+    "PATH": "/home/vscode/.local/bin:${containerEnv:PATH}"
+  },
+  "mounts": [
+    "source=apx-config,target=/home/vscode/.config/apx,type=volume",
+    "source=apx-share,target=/home/vscode/.local/share/apx,type=volume",
+    "source=apx-state,target=/home/vscode/.local/state/apx,type=volume",
+    "source=apx-npm-cache,target=/home/vscode/.npm,type=volume"
+  ],
+  "forwardPorts": [8787, 8788, 47821, 18780],
+  "postCreateCommand": "curl -fsSL https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/get.sh | APX_SERVICE_BACKEND=nohup bash",
+  "postStartCommand": "bash -lc 'export PATH=\"$HOME/.local/bin:$PATH\"; apx start'",
+  "remoteUser": "vscode"
+}

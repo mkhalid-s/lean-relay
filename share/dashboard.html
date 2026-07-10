@@ -159,6 +159,7 @@
       font-size: 12px;
       font-variant-numeric: tabular-nums;
     }
+    .table-wrap { width: 100%; overflow-x: auto; }
     th, td {
       text-align: left;
       padding: 7px 8px;
@@ -168,6 +169,7 @@
     th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; font-weight: 650; }
     tr.clickable { cursor: pointer; }
     tr.clickable:hover { background: var(--panel-2); }
+    tr.clickable:focus { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--panel-2); }
     .status-ok { color: var(--ok); }
     .status-warn { color: var(--warn); }
     .status-fail { color: var(--fail); }
@@ -276,10 +278,10 @@
       <summary><h2>Sessions</h2><span class="badge" id="session-count">0 sessions</span></summary>
       <div class="content split">
         <div>
-          <table>
+          <div class="table-wrap"><table>
             <thead><tr><th>last</th><th>session</th><th>req</th><th>tokens</th><th>cost</th><th>mode</th></tr></thead>
             <tbody id="sessions-body"><tr><td colspan="6" class="muted">no sessions yet</td></tr></tbody>
-          </table>
+          </table></div>
         </div>
         <div>
           <h3 id="session-title">Session Detail</h3>
@@ -288,7 +290,7 @@
       </div>
     </details>
 
-    <details class="accordion tool-section" id="headroom-section">
+    <details class="accordion tool-section" id="headroom-section" hidden>
       <summary><h2>Headroom</h2><span class="badge" id="headroom-state">disabled</span></summary>
       <div class="content grid">
         <div class="card"><h2>Saved</h2><div class="kpi" id="hr-saved">-</div><div class="kpi-sub" id="hr-pct">session savings -</div></div>
@@ -298,7 +300,7 @@
       </div>
     </details>
 
-    <details class="accordion tool-section" id="pxpipe-section">
+    <details class="accordion tool-section" id="pxpipe-section" hidden>
       <summary><h2>pxpipe</h2><span class="badge" id="pxpipe-state">disabled</span></summary>
       <div class="content">
         <section class="grid">
@@ -308,13 +310,13 @@
           <div class="card"><h2>Image Throughput</h2><div class="kpi" id="px-img">-</div><div class="kpi-sub">PNG bytes shipped</div></div>
         </section>
         <details class="accordion">
-          <summary><h2>pxpipe iframe</h2><a href="/proxy/pxpipe/" target="_blank">open native dashboard</a></summary>
-          <div class="content"><div class="iframe-wrap"><iframe src="/proxy/pxpipe/" loading="lazy" title="pxpipe dashboard"></iframe></div></div>
+          <summary><h2>pxpipe dashboard</h2><a id="pxpipe-native-link" href="#" target="_blank" rel="noopener noreferrer">open native dashboard</a></summary>
+          <div class="content"><div class="iframe-wrap"><iframe id="pxpipe-native-frame" loading="lazy" referrerpolicy="no-referrer" title="pxpipe dashboard"></iframe></div></div>
         </details>
       </div>
     </details>
 
-    <details class="accordion tool-section" id="squeezr-section">
+    <details class="accordion tool-section" id="squeezr-section" hidden>
       <summary><h2>Squeezr</h2><span class="badge" id="squeezr-state">disabled</span></summary>
       <div class="content">
         <section class="grid">
@@ -328,8 +330,8 @@
           <div id="sq-breakdown" class="grid"></div>
         </div>
         <details class="accordion">
-          <summary><h2>Squeezr iframe</h2><a href="/proxy/squeezr/squeezr/dashboard" target="_blank">open native dashboard</a></summary>
-          <div class="content"><div class="iframe-wrap"><iframe src="/proxy/squeezr/squeezr/dashboard" loading="lazy" title="Squeezr dashboard"></iframe></div></div>
+          <summary><h2>Squeezr dashboard</h2><a id="squeezr-native-link" href="#" target="_blank" rel="noopener noreferrer">open native dashboard</a></summary>
+          <div class="content"><div class="iframe-wrap"><iframe id="squeezr-native-frame" loading="lazy" referrerpolicy="no-referrer" title="Squeezr dashboard"></iframe></div></div>
         </details>
       </div>
     </details>
@@ -337,24 +339,24 @@
     <details class="accordion">
       <summary><h2>Recent Gateway Requests</h2><span class="badge">live</span></summary>
       <div class="content">
-        <table>
+        <div class="table-wrap"><table>
           <thead><tr><th>time</th><th>method</th><th>path</th><th>model</th><th>status</th><th>latency</th><th>fb</th><th>tokens</th><th>cost</th><th>session</th></tr></thead>
           <tbody id="history-body"><tr><td colspan="10" class="muted">no requests yet</td></tr></tbody>
-        </table>
+        </table></div>
       </div>
     </details>
 
     <details class="accordion">
       <summary><h2>Logs</h2><span class="badge">tail</span></summary>
       <div class="content">
-        <div class="tabs" id="log-tabs">
-          <button class="tab active" data-service="supervisor">supervisor</button>
-          <button class="tab" data-service="gateway">gateway</button>
-          <button class="tab" data-service="headroom">headroom</button>
-          <button class="tab" data-service="pxpipe">pxpipe</button>
-          <button class="tab" data-service="squeezr">squeezr</button>
+        <div class="tabs" id="log-tabs" role="tablist" aria-label="Service logs">
+          <button class="tab active" role="tab" aria-selected="true" data-service="supervisor">supervisor</button>
+          <button class="tab" role="tab" aria-selected="false" data-service="gateway">gateway</button>
+          <button class="tab" role="tab" aria-selected="false" data-service="headroom">headroom</button>
+          <button class="tab" role="tab" aria-selected="false" data-service="pxpipe">pxpipe</button>
+          <button class="tab" role="tab" aria-selected="false" data-service="squeezr">squeezr</button>
         </div>
-        <div class="log-view" id="log-view">connecting...</div>
+        <div class="log-view" id="log-view" role="log" aria-live="polite">connecting...</div>
       </div>
     </details>
   </main>
@@ -362,11 +364,13 @@
   <script>
     const $ = (id) => document.getElementById(id);
     const state = { status: null, detect: null, compare: null, summary: null, sessions: [], history: [] };
+    let sessionLoadSequence = 0;
+    let refreshInFlight = false;
 
-    const fmt = (n) => Number.isFinite(Number(n)) ? Number(n).toLocaleString() : "-";
-    const pct = (n) => Number.isFinite(Number(n)) ? `${Number(n).toFixed(1)}%` : "-";
-    const ms = (n) => Number.isFinite(Number(n)) && Number(n) > 0 ? `${Math.round(Number(n))} ms` : "-";
-    const usd = (n) => Number.isFinite(Number(n)) ? `$${Number(n).toFixed(Number(n) >= 1 ? 2 : 4)}` : "-";
+    const fmt = (n) => n != null && Number.isFinite(Number(n)) ? Number(n).toLocaleString() : "-";
+    const pct = (n) => n != null && Number.isFinite(Number(n)) ? `${Number(n).toFixed(1)}%` : "-";
+    const ms = (n) => n != null && Number.isFinite(Number(n)) && Number(n) > 0 ? `${Math.round(Number(n))} ms` : "-";
+    const usd = (n) => n != null && Number.isFinite(Number(n)) ? `$${Number(n).toFixed(Number(n) >= 1 ? 2 : 4)}` : "unpriced";
     const short = (s, n = 10) => s ? String(s).slice(0, n) : "-";
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
     const age = (ts) => ts ? new Date(ts * 1000).toLocaleTimeString() : "-";
@@ -383,11 +387,38 @@
       return res.json();
     }
 
+    function nativeToolUrl(rawUrl, path) {
+      try {
+        const url = new URL(rawUrl);
+        url.hostname = window.location.hostname;
+        url.pathname = path;
+        url.search = "";
+        url.hash = "";
+        return url.toString();
+      } catch (_) {
+        return "";
+      }
+    }
+
+    function setNativeToolUrl(name, rawUrl, path) {
+      const url = nativeToolUrl(rawUrl, path);
+      const link = $(`${name}-native-link`);
+      const frame = $(`${name}-native-frame`);
+      if (link) link.href = url || "#";
+      if (frame) {
+        frame.dataset.src = url;
+        const details = frame.closest("details");
+        if (url && details?.open && !frame.getAttribute("src")) frame.src = url;
+      }
+    }
+
     function renderStatus(j) {
       state.status = j;
       $("version-badge").textContent = `apx ${j.version || "?"}`;
       $("header-meta").textContent = `${j.mode || "unknown"} · ${j.chain_short || ""}${j.bind_warning ? " · " + j.bind_warning : ""}`;
       $("chain-view").innerHTML = (j.chain_hops || []).map((hop, i) => `${i ? '<span class="arr">-></span>' : ""}<span class="hop">${esc(hop)}</span>`).join("");
+      setNativeToolUrl("pxpipe", j.pxpipe_url, "/");
+      setNativeToolUrl("squeezr", j.squeezr_url, "/squeezr/dashboard");
     }
 
     function renderCapture(j) {
@@ -401,7 +432,7 @@
       const lat = j.latency_ms || {};
       const fb = j.first_byte_ms || {};
       $("k-requests").textContent = fmt(t.requests || 0);
-      $("k-status").textContent = `${fmt(t.ok || 0)} ok / ${fmt(t.warn_4xx || 0)} warn / ${fmt(t.err_5xx || 0)} fail`;
+      $("k-status").textContent = `${fmt(t.ok ?? 0)} ok / ${fmt(t.warn_4xx ?? 0)} warn / ${fmt(t.err_5xx ?? 0)} fail · ${j.window || "window ?"}`;
       $("k-p95").textContent = ms(lat.p95 || 0);
       $("k-first-byte").textContent = `first byte p95 ${ms(fb.p95 || 0)}`;
       $("k-tokens").textContent = fmt((t.tokens_in || 0) + (t.tokens_out || 0));
@@ -430,21 +461,21 @@
       $("compare-cards").innerHTML = rows.length ? rows.map(r => `
         <div class="card">
           <h2>${esc(r.tool)}</h2>
-          <div class="kpi">${fmt(r.tokens_saved_session || r.tokens_saved_lifetime || 0)}</div>
-          <div class="kpi-sub">tokens saved · ${pct(r.savings_pct || 0)} · ${r.usd_saved == null ? "no USD" : usd(r.usd_saved)}</div>
+          <div class="kpi">${fmt(r.tokens_saved_session ?? r.tokens_saved_lifetime ?? 0)}</div>
+          <div class="kpi-sub">session tokens saved · ${pct(r.savings_pct ?? 0)} · ${r.usd_saved == null ? "unpriced" : usd(r.usd_saved)}</div>
           <div class="row"><span class="k">Requests</span><span class="v">${fmt(r.requests_total || 0)}</span></div>
           <div class="row"><span class="k">Cache hit</span><span class="v">${pct((r.cache_hit_rate || 0) * 100)}</span></div>
           <div class="row"><span class="k">Bypass</span><span class="v">${r.bypassed ? "yes" : "no"}</span></div>
         </div>
       `).join("") : '<div class="card full muted">No enabled tool has returned metrics yet. Enable Headroom, pxpipe, or Squeezr and send traffic through apx.</div>';
-      chartBars("compare-chart", rows.map(r => ({ label: r.tool, value: Number(r.tokens_saved_session || r.tokens_saved_lifetime || 0) })));
+      chartBars("compare-chart", rows.map(r => ({ label: r.tool, value: Number(r.tokens_saved_session ?? r.tokens_saved_lifetime ?? 0) })));
     }
 
     function renderToolDetails() {
       Promise.allSettled([getJSON("/api/tool/headroom"), getJSON("/api/tool/pxpipe"), getJSON("/api/tool/squeezr")]).then(([h, p, s]) => {
         if (h.status === "fulfilled") {
           const n = h.value.normalized || {};
-          $("hr-saved").textContent = fmt(n.tokens_saved_lifetime || n.tokens_saved_session || 0);
+          $("hr-saved").textContent = fmt(n.tokens_saved_lifetime ?? n.tokens_saved_session ?? 0);
           $("hr-pct").textContent = `session savings ${pct(n.savings_pct_session || 0)} · ${usd(n.usd_saved_lifetime || 0)}`;
           $("hr-requests").textContent = fmt(n.requests_total || 0);
           $("hr-failed").textContent = `failed ${fmt(n.requests_failed || 0)}`;
@@ -453,7 +484,7 @@
         if (p.status === "fulfilled") {
           const n = p.value.normalized || {};
           $("px-saved").textContent = fmt(n.saved_input_tokens || 0);
-          $("px-pct").textContent = `${pct(n.saved_pct_of_all_spend || n.saved_pct_input_only || 0)} · ${usd(n.saved_usd || 0)}`;
+          $("px-pct").textContent = `${pct(n.saved_pct_of_all_spend ?? n.saved_pct_input_only ?? 0)} · ${usd(n.saved_usd ?? 0)}`;
           $("px-coverage").textContent = `${fmt(n.compressed_requests || 0)} / ${fmt(n.requests_total || 0)}`;
           $("px-ab").textContent = `${usd(n.compressed_avg_usd_per_request || 0)} vs ${usd(n.passthrough_avg_usd_per_request || 0)}`;
           $("px-sample").textContent = n.split_sufficient_sample ? "sample sufficient" : "sample too small for A/B claim";
@@ -484,7 +515,7 @@
       state.sessions = j.sessions || [];
       $("session-count").textContent = `${state.sessions.length} sessions`;
       $("sessions-body").innerHTML = state.sessions.length ? state.sessions.map(s => `
-        <tr class="clickable" data-session="${esc(s.session_id)}">
+        <tr class="clickable" role="button" tabindex="0" aria-label="Open session ${esc(short(s.session_id, 16))}" data-session="${esc(s.session_id)}">
           <td>${age(s.last_ts)}</td>
           <td title="${esc(s.session_id)}">${esc(short(s.session_id, 16))}</td>
           <td>${fmt(s.requests || 0)}</td>
@@ -493,25 +524,50 @@
           <td>${esc(s.chain_mode || "")}</td>
         </tr>
       `).join("") : '<tr><td colspan="6" class="muted">no sessions yet</td></tr>';
-      document.querySelectorAll("[data-session]").forEach(row => row.onclick = () => loadSession(row.dataset.session));
+      document.querySelectorAll("[data-session]").forEach(row => {
+        const activate = () => loadSession(row.dataset.session);
+        row.onclick = activate;
+        row.onkeydown = ev => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            activate();
+          }
+        };
+      });
     }
 
     async function loadSession(sessionId) {
+      const sequence = ++sessionLoadSequence;
       $("session-title").textContent = `Session ${sessionId}`;
-      const j = await getJSON(`/api/metrics/session/${encodeURIComponent(sessionId)}`);
-      $("session-detail").textContent = (j.requests || []).map(r => {
-        return [
-          `${new Date((r.ts || 0) * 1000).toLocaleString()} ${r.method} ${r.path}`,
-          `  status=${r.status} model=${r.model || "-"} stream=${!!r.is_stream}`,
-          `  latency=${ms(r.latency_ms)} first_byte=${ms(r.first_byte_ms)} tokens=${fmt((r.tokens_in || 0) + (r.tokens_out || 0))} cost=${usd(r.cost_est_usd || 0)}`,
-          `  request_id=${r.request_id || "-"} hops=${r.chain_hops || "-"} err=${r.err_class || "-"}`,
-        ].join("\n");
-      }).join("\n\n") || "No requests in session.";
+      $("session-detail").textContent = "Loading session...";
+      try {
+        const j = await getJSON(`/api/metrics/session/${encodeURIComponent(sessionId)}`);
+        if (sequence !== sessionLoadSequence) return;
+        $("session-detail").textContent = (j.requests || []).map(r => {
+          return [
+            `${new Date((r.ts || 0) * 1000).toLocaleString()} ${r.method} ${r.path}`,
+            `  status=${r.status} model=${r.model || "-"} stream=${!!r.is_stream}`,
+            `  latency=${ms(r.latency_ms)} first_byte=${ms(r.first_byte_ms)} tokens=${fmt((r.tokens_in || 0) + (r.tokens_out || 0))} cost=${usd(r.cost_est_usd)}`,
+            `  request_id=${r.request_id || "-"} hops=${r.chain_hops || "-"} err=${r.err_class || "-"}`,
+          ].join("\n");
+        }).join("\n\n") || "No requests in session.";
+      } catch (err) {
+        if (sequence !== sessionLoadSequence) return;
+        $("session-detail").textContent = `Could not load session: ${err.message}`;
+      }
     }
 
     function renderHistory(items, replace = false) {
       if (items) {
-        state.history = replace ? items.slice(-80) : [...state.history, ...items].slice(-80);
+        const merged = replace ? items : [...state.history, ...items];
+        const unique = new Map();
+        merged.forEach(r => {
+          const key = r.request_id || `${r.ts}|${r.method}|${r.path}|${r.status}`;
+          unique.set(key, r);
+        });
+        state.history = [...unique.values()]
+          .sort((a, b) => Number(a.ts || 0) - Number(b.ts || 0))
+          .slice(-80);
       }
       $("history-body").innerHTML = state.history.length ? state.history.slice().reverse().map(r => {
         const cls = r.status >= 500 ? "status-fail" : r.status >= 400 ? "status-warn" : "status-ok";
@@ -542,17 +598,35 @@
     function chartLine(id, rows, key, label) {
       const svg = $(id);
       const w = svg.clientWidth || 1000, h = svg.clientHeight || 160, pad = 24;
+      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      if (!rows.length) {
+        svg.innerHTML = `<text x="24" y="84" fill="var(--muted)">No data for this window</text>`;
+        return;
+      }
       const vals = rows.map(r => Number(r[key] || 0));
       const max = Math.max(1, ...vals);
-      const step = rows.length > 1 ? (w - pad * 2) / (rows.length - 1) : 0;
-      const pts = vals.map((v, i) => `${pad + i * step},${h - pad - (h - pad * 2) * (v / max)}`).join(" ");
-      svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+      const minTs = Math.min(...rows.map(r => Number(r.ts || 0)));
+      const maxTs = Math.max(...rows.map(r => Number(r.ts || 0)));
+      const span = Math.max(1, maxTs - minTs);
+      const points = vals.map((v, i) => ({
+        x: pad + (w - pad * 2) * ((Number(rows[i].ts || minTs) - minTs) / span),
+        y: h - pad - (h - pad * 2) * (v / max),
+      }));
+      const pts = points.map(p => `${p.x},${p.y}`).join(" ");
+      const singlePoint = points.length === 1
+        ? `<circle cx="${points[0].x}" cy="${points[0].y}" r="3.5" fill="var(--accent)"></circle>`
+        : "";
       svg.innerHTML = `<text x="14" y="18" fill="var(--muted)" font-size="12">${esc(label)}</text>
         <polyline points="${pts}" fill="none" stroke="var(--accent)" stroke-width="2.5"></polyline>
-        <text x="${w - 90}" y="18" fill="var(--muted)" font-size="12">max ${fmt(max)}</text>`;
+        ${singlePoint}
+        <text x="${w - 90}" y="18" fill="var(--muted)" font-size="12">max ${fmt(max)}</text>
+        <text x="${pad}" y="${h - 6}" fill="var(--muted)" font-size="10">${new Date(minTs * 1000).toLocaleTimeString()}</text>
+        <text x="${w - pad}" y="${h - 6}" fill="var(--muted)" font-size="10" text-anchor="end">${new Date(maxTs * 1000).toLocaleTimeString()}</text>`;
     }
 
     async function refreshAll() {
+      if (refreshInFlight) return;
+      refreshInFlight = true;
       try {
         const [status, capture, detect, summary, series, sessions, history, compare] = await Promise.all([
           getJSON("/api/status"),
@@ -580,17 +654,30 @@
         $("header-meta").textContent = `dashboard refresh failed: ${err.message}`;
         $("stream-badge").textContent = "offline";
         $("stream-badge").className = "badge fail";
+      } finally {
+        refreshInFlight = false;
       }
     }
 
+    let eventSource = null;
     function connectEvents() {
       try {
-        const es = new EventSource("/api/events/stream");
-        es.addEventListener("summary", ev => renderSummary(JSON.parse(ev.data)));
-        es.addEventListener("compare", ev => renderCompare(JSON.parse(ev.data)));
-        es.addEventListener("history", ev => renderHistory((JSON.parse(ev.data).items || [])));
-        es.addEventListener("squeezr", () => renderToolDetails());
-        es.onerror = () => {
+        if (eventSource) eventSource.close();
+        eventSource = new EventSource("/api/events/stream?window=1h");
+        eventSource.onopen = () => {
+          $("stream-badge").textContent = "live";
+          $("stream-badge").className = "badge ok";
+        };
+        eventSource.addEventListener("summary", ev => {
+          try { renderSummary(JSON.parse(ev.data)); } catch (_) {}
+        });
+        eventSource.addEventListener("compare", ev => {
+          try { renderCompare(JSON.parse(ev.data)); } catch (_) {}
+        });
+        eventSource.addEventListener("history", ev => {
+          try { renderHistory((JSON.parse(ev.data).items || [])); } catch (_) {}
+        });
+        eventSource.onerror = () => {
           $("stream-badge").textContent = "polling";
           $("stream-badge").className = "badge warn";
         };
@@ -601,31 +688,92 @@
     }
 
     let logSource = null;
+    let logRetryTimer = null;
+    let activeLogService = "supervisor";
+    let availableLogTargets = null;
+    const trimLogView = () => {
+      const view = $("log-view");
+      if (view.textContent.length > 180000) view.textContent = view.textContent.slice(-140000);
+    };
+
+    async function refreshLogTargets() {
+      try {
+        const j = await getJSON("/api/logs/targets");
+        availableLogTargets = new Set(j.targets || []);
+        document.querySelectorAll(".tab[data-service]").forEach(tab => {
+          tab.hidden = !availableLogTargets.has(tab.dataset.service);
+        });
+        if (!availableLogTargets.has(activeLogService)) {
+          const first = document.querySelector(".tab[data-service]:not([hidden])");
+          if (first) selectLogTab(first);
+        }
+      } catch (_) {}
+    }
+
     function connectLogs(service) {
+      activeLogService = service;
+      if (logRetryTimer) clearTimeout(logRetryTimer);
       if (logSource) logSource.close();
       $("log-view").textContent = `[apx] streaming ${service}.log ...\n`;
+      if (availableLogTargets && !availableLogTargets.has(service)) {
+        $("log-view").textContent = `[apx] ${service}.log is not available.\n`;
+        return;
+      }
       logSource = new EventSource(`/api/logs/stream?service=${encodeURIComponent(service)}`);
       logSource.onmessage = ev => {
         const el = $("log-view");
         el.textContent += ev.data + "\n";
-        if (el.textContent.length > 180000) el.textContent = el.textContent.slice(-140000);
+        trimLogView();
         el.scrollTop = el.scrollHeight;
       };
       logSource.onerror = () => {
+        logSource.close();
         $("log-view").textContent += `[apx] log stream interrupted; retrying ${service}...\n`;
+        trimLogView();
+        if (!availableLogTargets || availableLogTargets.has(service)) {
+          logRetryTimer = setTimeout(() => {
+            if (activeLogService === service) connectLogs(service);
+          }, 3000);
+        }
       };
     }
 
-    document.querySelectorAll(".tab").forEach(el => el.addEventListener("click", () => {
+    function selectLogTab(el) {
       document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+      document.querySelectorAll(".tab").forEach(t => t.setAttribute("aria-selected", "false"));
       el.classList.add("active");
+      el.setAttribute("aria-selected", "true");
       connectLogs(el.dataset.service);
-    }));
+    }
+    document.querySelectorAll(".tab").forEach(el => {
+      el.addEventListener("click", () => selectLogTab(el));
+      el.addEventListener("keydown", ev => {
+        if (!["ArrowLeft", "ArrowRight"].includes(ev.key)) return;
+        const tabs = [...document.querySelectorAll(".tab:not([hidden])")];
+        const current = tabs.indexOf(el);
+        const delta = ev.key === "ArrowRight" ? 1 : -1;
+        const next = tabs[(current + delta + tabs.length) % tabs.length];
+        next?.focus();
+        if (next) selectLogTab(next);
+      });
+    });
+    document.querySelectorAll("iframe[data-src], iframe[id$='-native-frame']").forEach(frame => {
+      const details = frame.closest("details");
+      details?.addEventListener("toggle", () => {
+        if (details.open && frame.dataset.src && !frame.getAttribute("src")) frame.src = frame.dataset.src;
+      });
+    });
 
     refreshAll();
     connectEvents();
-    connectLogs("supervisor");
+    refreshLogTargets().then(() => connectLogs(activeLogService));
     setInterval(refreshAll, 10000);
+    setInterval(refreshLogTargets, 30000);
+    window.addEventListener("pagehide", () => {
+      eventSource?.close();
+      logSource?.close();
+      if (logRetryTimer) clearTimeout(logRetryTimer);
+    });
   </script>
 </body>
 </html>

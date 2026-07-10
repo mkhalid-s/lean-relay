@@ -38,6 +38,7 @@ jobs:
           bash -n bin/apx-squeezr
           bash -n build/pack.sh
           bash -n build/header.sh
+          bash -n tests/lifecycle.sh
 
       - name: Shellcheck
         run: |
@@ -48,7 +49,8 @@ jobs:
             bin/apx \
             bin/apx-squeezr \
             build/pack.sh \
-            build/header.sh
+            build/header.sh \
+            tests/lifecycle.sh
 
       - name: Python compile
         run: python -m py_compile bin/apx-gateway
@@ -272,6 +274,13 @@ jobs:
                   with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/api/capture", timeout=5) as r:
                       assert r.status == 200
                       r.read()
+                  try:
+                      opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/api/not-a-real-route", timeout=5)
+                      raise AssertionError("unknown dashboard API unexpectedly reached an upstream")
+                  except urllib.error.HTTPError as e:
+                      assert e.code == 404, e
+                      payload = json.loads(e.read())
+                      assert payload["error"] == "not_found", payload
                   req = urllib.request.Request(
                       f"http://127.0.0.1:{GATEWAY_PORT}/proxy/pxpipe/api/toggle?token=secret-token&x=1",
                       data=b"{}",
@@ -359,7 +368,10 @@ jobs:
                   with urllib.request.urlopen(f"http://127.0.0.1:{GATEWAY_PORT}/", timeout=5) as r:
                       html = r.read().decode("utf-8")
                       assert "Tool Comparison" in html
-                      assert "Squeezr iframe" in html
+                      assert 'id="pxpipe-native-frame"' in html
+                      assert 'id="squeezr-native-frame"' in html
+                      assert 'iframe src="/proxy/' not in html
+                      assert 'new EventSource("/api/events/stream?window=1h")' in html
 
                   payload = {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "hello"}]}
                   req = urllib.request.Request(
@@ -447,6 +459,17 @@ jobs:
 
       - name: Verify install.sh --help renders
         run: ./install.sh --help
+
+      - name: Verify Linux dependency adapters
+        run: |
+          for manager in apt dnf pacman; do
+            APX_PACKAGE_MANAGER="$manager" APX_FORCE_INSTALL_PREREQS=1 \
+              ./install.sh --yes --check-only --service-backend=nohup \
+              > "/tmp/apx-${manager}.log"
+          done
+          grep -q 'apt-get install' /tmp/apx-apt.log
+          grep -q 'dnf install' /tmp/apx-dnf.log
+          grep -q 'pacman -Sy' /tmp/apx-pacman.log
 
   # ── 2) Pack apx.sh on both Linux and macOS to catch tool differences ─────
   pack:
@@ -568,6 +591,9 @@ jobs:
       FAKE_HOME: ${{ github.workspace }}/.smoke-home
     steps:
       - uses: actions/checkout@v5
+
+      - name: Cross-platform lifecycle backend smoke
+        run: bash tests/lifecycle.sh
 
       - name: Pack apx.sh
         run: bash build/pack.sh

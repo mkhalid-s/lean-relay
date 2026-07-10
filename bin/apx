@@ -35,14 +35,22 @@ INSTALL_MODE_FILE="$CONFIG_DIR/install.mode"
 INSTALL_MANIFEST_FILE="$STATE_DIR/install-manifest.env"
 RELEASE_ASSET_URL="${APX_RELEASE_ASSET_URL:-https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh}"
 RELEASE_ASSET_SHA_URL="${APX_RELEASE_ASSET_SHA_URL:-${RELEASE_ASSET_URL}.sha256}"
-RUN_DIR="$STATE_DIR/run"
+RUN_DIR="${APX_RUN_DIR:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/apx}}"
+RUN_DIR="${RUN_DIR:-$STATE_DIR/run}"
 LOG_DIR="$STATE_DIR/logs"
+SUPERVISOR_LOCK_DIR="$RUN_DIR/supervisor.lock"
 UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}"
 UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-main}"
 PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
+SERVICE_BACKEND_FILE="$CONFIG_DIR/service.backend"
+SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+SYSTEMD_UNIT_FILE="$SYSTEMD_USER_DIR/$LABEL.service"
 CLAUDE_SETTINGS_FILE="${APX_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
 DEFAULT_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH="${APX_PATH:-$DEFAULT_PATH}:$PATH"
+APX_SERVICE_BACKEND_OVERRIDE="${APX_SERVICE_BACKEND:-}"
+APX_CLIENT_BASE_URL_OVERRIDE="${APX_CLIENT_BASE_URL:-}"
+APX_CLIENT_TOPOLOGY_OVERRIDE="${APX_CLIENT_TOPOLOGY:-}"
 
 # Create runtime dirs lazily. Doing this at script load leaked side effects to
 # read-only commands (help, version, uninstall --dry-run) and, combined with
@@ -108,6 +116,13 @@ load_config() {
   : "${APX_METRICS_RETENTION_DAYS:=30}"
   : "${APX_METRICS_BACKFILL:=1}"
   : "${APX_MAX_REQUEST_BYTES:=67108864}"
+  : "${APX_MAX_EVENT_STREAMS_PER_IP:=4}"
+  : "${APX_SERVICE_BACKEND:=auto}"
+  : "${APX_CLIENT_TOPOLOGY:=none}"
+  : "${APX_CLIENT_BASE_URL:=}"
+  [[ -n "$APX_SERVICE_BACKEND_OVERRIDE" ]] && APX_SERVICE_BACKEND="$APX_SERVICE_BACKEND_OVERRIDE"
+  [[ -n "$APX_CLIENT_BASE_URL_OVERRIDE" ]] && APX_CLIENT_BASE_URL="$APX_CLIENT_BASE_URL_OVERRIDE"
+  [[ -n "$APX_CLIENT_TOPOLOGY_OVERRIDE" ]] && APX_CLIENT_TOPOLOGY="$APX_CLIENT_TOPOLOGY_OVERRIDE"
   # APX_CHAIN is authoritative; if unset (legacy config), infer it from the
   # ENABLED flags and TARGET_API_URL routing so upgrades don't break silently.
   if [[ -z "${APX_CHAIN+x}" ]]; then
@@ -146,7 +161,16 @@ log() {
 
 pid_alive() { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
 read_pid() { [[ -f "$1" ]] && tr -d '[:space:]' < "$1" || true; }
-port_pid() { lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR==1 {print; exit}' || true; }
+port_pid() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR==1 {print; exit}' || true
+  elif command -v ss >/dev/null 2>&1; then
+    ss -ltnp "sport = :$port" 2>/dev/null | awk -F'pid=' 'NR>1 && NF>1 {split($2,a,","); print a[1]; exit}' || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser "$port/tcp" 2>/dev/null | awk '{print $1}' || true
+  fi
+}
 proc_cmd() { ps -p "$1" -o command= 2>/dev/null || true; }
 
 url_ok() {
@@ -227,7 +251,7 @@ start_gateway() {
     export APX_DASHBOARD_TOKEN="$APX_DASHBOARD_TOKEN"
     export APX_METRICS_ENABLED="$APX_METRICS_ENABLED" APX_METRICS_DB="$APX_METRICS_DB" APX_METRICS_RETENTION_DAYS="$APX_METRICS_RETENTION_DAYS" APX_METRICS_BACKFILL="$APX_METRICS_BACKFILL"
     export APX_CAPTURE="$APX_CAPTURE" APX_CAPTURE_FULL_ACK="$APX_CAPTURE_FULL_ACK" APX_CAPTURE_BODY_CAP="$APX_CAPTURE_BODY_CAP" APX_REDACT_KEYS="$APX_REDACT_KEYS"
-    export APX_MAX_REQUEST_BYTES="$APX_MAX_REQUEST_BYTES" APX_HEALTH_INTERVAL_SECONDS="$HEALTH_INTERVAL_SECONDS"
+    export APX_MAX_REQUEST_BYTES="$APX_MAX_REQUEST_BYTES" APX_MAX_EVENT_STREAMS_PER_IP="$APX_MAX_EVENT_STREAMS_PER_IP" APX_HEALTH_INTERVAL_SECONDS="$HEALTH_INTERVAL_SECONDS"
     export APX_CHAIN="${APX_CHAIN:-}"
     export APX_STATE_DIR="$STATE_DIR" APX_LOG_DIR="$LOG_DIR" APX_CONFIG="$CONFIG_FILE"
     export APX_HEADROOM_URL="http://$BIND_HOST:$HEADROOM_PORT" APX_PXPIPE_URL="http://$BIND_HOST:$PXPIPE_PORT" APX_SQUEEZR_URL="http://$BIND_HOST:$SQUEEZR_PORT"
@@ -367,24 +391,44 @@ stop_children() {
 }
 
 stop_stale_supervisors() {
-  local self pid cmd
-  self="$$"
-  while read -r pid cmd; do
-    [[ -n "${pid:-}" ]] || continue
-    [[ "$pid" == "$self" ]] && continue
-    [[ "$cmd" == *"apx supervisor"* ]] || continue
-    log "stopping stale supervisor pid $pid: $cmd"
-    kill "$pid" 2>/dev/null || true
-    sleep 1
-    pid_alive "$pid" && kill -9 "$pid" 2>/dev/null || true
-  done < <(ps -axo pid=,command= 2>/dev/null)
+  local pid
+  pid="$(read_pid "$RUN_DIR/supervisor.pid")"
+  if pid_alive "$pid" && [[ "$(proc_cmd "$pid")" != *"apx supervisor"* ]]; then
+    rm -f "$RUN_DIR/supervisor.pid"
+  fi
+}
+
+acquire_supervisor_lock() {
+  if mkdir "$SUPERVISOR_LOCK_DIR" 2>/dev/null; then
+    printf '%s\n' "$$" > "$SUPERVISOR_LOCK_DIR/pid"
+    return 0
+  fi
+  local owner=""
+  [[ -f "$SUPERVISOR_LOCK_DIR/pid" ]] && owner="$(tr -d '[:space:]' < "$SUPERVISOR_LOCK_DIR/pid")"
+  if pid_alive "$owner" && [[ "$(proc_cmd "$owner")" == *"apx supervisor"* ]]; then
+    echo "error: supervisor already running (pid $owner)" >&2
+    return 1
+  fi
+  rm -rf "$SUPERVISOR_LOCK_DIR"
+  mkdir "$SUPERVISOR_LOCK_DIR"
+  printf '%s\n' "$$" > "$SUPERVISOR_LOCK_DIR/pid"
+}
+
+supervisor_cleanup() {
+  trap - INT TERM EXIT
+  log "supervisor stopping"
+  stop_children
+  rm -f "$RUN_DIR/supervisor.pid"
+  rm -rf "$SUPERVISOR_LOCK_DIR"
 }
 
 supervisor() {
   load_config
   ensure_runtime_dirs
+  acquire_supervisor_lock || exit 1
   echo $$ > "$RUN_DIR/supervisor.pid"
-  trap 'log "supervisor stopping"; stop_children; rm -f "$RUN_DIR/supervisor.pid"; exit 0' INT TERM
+  trap 'supervisor_cleanup; exit 0' INT TERM
+  trap 'supervisor_cleanup' EXIT
   log "supervisor starting"
   while true; do
     if [[ "$PXPIPE_ENABLED" == "1" ]]; then
@@ -432,7 +476,7 @@ supervisor() {
   done
 }
 
-start_bg() {
+nohup_start() {
   load_config
   ensure_runtime_dirs
   local takeover=0
@@ -481,7 +525,7 @@ write_plist() {
 EOF
 }
 
-install_service() {
+launchd_install_service() {
   load_config
   ensure_runtime_dirs
   write_plist
@@ -495,7 +539,7 @@ install_service() {
   echo "installed and started: $PLIST_FILE"
 }
 
-stop_service() {
+launchd_stop_service() {
   if [[ -f "$CONFIG_FILE" ]]; then
     load_config
   else
@@ -509,6 +553,167 @@ stop_service() {
   stop_stale_supervisors
   stop_children
   echo "stopped"
+}
+
+systemd_user_available() {
+  command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
+}
+
+detect_service_backend() {
+  case "$(uname -s)" in
+    Darwin) echo launchd ;;
+    Linux)
+      if systemd_user_available; then echo systemd; else echo nohup; fi
+      ;;
+    *) echo nohup ;;
+  esac
+}
+
+service_backend() {
+  local requested="${APX_SERVICE_BACKEND:-auto}" saved=""
+  if [[ "$requested" != "auto" ]]; then
+    case "$requested" in launchd|systemd|nohup) echo "$requested"; return ;; esac
+    echo "error: invalid APX_SERVICE_BACKEND: $requested" >&2
+    return 2
+  fi
+  [[ -f "$SERVICE_BACKEND_FILE" ]] && IFS= read -r saved < "$SERVICE_BACKEND_FILE" || true
+  case "$saved" in launchd|systemd|nohup) echo "$saved" ;; *) detect_service_backend ;; esac
+}
+
+persist_service_backend() {
+  local backend="$1"
+  mkdir -p "$CONFIG_DIR"
+  printf '%s\n' "$backend" > "$SERVICE_BACKEND_FILE"
+}
+
+write_systemd_unit() {
+  mkdir -p "$SYSTEMD_USER_DIR"
+  cat > "$SYSTEMD_UNIT_FILE" <<EOF
+[Unit]
+Description=apx local AI proxy stack
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$HOME/.local/bin/apx supervisor
+Restart=on-failure
+RestartSec=3
+Environment=APX_ROOT=$STACK_ROOT
+Environment=APX_CONFIG=$CONFIG_FILE
+Environment=APX_STATE=$STATE_DIR
+
+[Install]
+WantedBy=default.target
+EOF
+}
+
+systemd_install_service() {
+  systemd_user_available || { echo "error: systemd user manager is not available" >&2; return 1; }
+  load_config
+  ensure_runtime_dirs
+  write_systemd_unit
+  systemctl --user daemon-reload
+  systemctl --user enable --now "$LABEL.service"
+  echo "installed and started: $SYSTEMD_UNIT_FILE"
+}
+
+systemd_stop_service() {
+  if [[ -f "$CONFIG_FILE" ]]; then load_config; else : "${SQUEEZR_PORT:=18780}"; fi
+  systemctl --user stop "$LABEL.service" >/dev/null 2>&1 || true
+  stop_children
+  rm -f "$RUN_DIR/supervisor.pid"
+  echo "stopped"
+}
+
+nohup_stop() {
+  if [[ -f "$CONFIG_FILE" ]]; then load_config; else : "${SQUEEZR_PORT:=18780}"; fi
+  local spid
+  spid="$(read_pid "$RUN_DIR/supervisor.pid")"
+  if pid_alive "$spid" && [[ "$(proc_cmd "$spid")" == *"apx supervisor"* ]]; then
+    kill "$spid" 2>/dev/null || true
+    local i
+    for i in {1..20}; do pid_alive "$spid" || break; sleep 0.1; done
+  fi
+  stop_children
+  rm -f "$RUN_DIR/supervisor.pid"
+  echo "stopped"
+}
+
+service_is_active() {
+  local backend
+  backend="$(service_backend)" || return
+  case "$backend" in
+    launchd) command -v launchctl >/dev/null 2>&1 && launchctl print "$(launchd_domain)/$(installed_plist_label)" >/dev/null 2>&1 ;;
+    systemd) systemctl --user is-active --quiet "$LABEL.service" ;;
+    nohup)
+      local spid
+      spid="$(read_pid "$RUN_DIR/supervisor.pid")"
+      pid_alive "$spid" && [[ "$(proc_cmd "$spid")" == *"apx supervisor"* ]]
+      ;;
+  esac
+}
+
+install_service() {
+  load_config
+  local backend
+  backend="$(service_backend)" || return
+  persist_service_backend "$backend"
+  case "$backend" in
+    launchd) launchd_install_service ;;
+    systemd) systemd_install_service ;;
+    nohup) nohup_start --takeover ;;
+  esac
+}
+
+start_service() {
+  load_config
+  local backend
+  backend="$(service_backend)" || return
+  persist_service_backend "$backend"
+  case "$backend" in
+    launchd) launchd_install_service ;;
+    systemd)
+      [[ -f "$SYSTEMD_UNIT_FILE" ]] || write_systemd_unit
+      systemctl --user daemon-reload
+      systemctl --user start "$LABEL.service"
+      ;;
+    nohup) nohup_start "${1:-}" ;;
+  esac
+}
+
+stop_service() {
+  local backend
+  backend="$(service_backend)" || return
+  case "$backend" in
+    launchd) launchd_stop_service ;;
+    systemd) systemd_stop_service ;;
+    nohup) nohup_stop ;;
+  esac
+}
+
+restart_service() {
+  local backend
+  backend="$(service_backend)" || return
+  case "$backend" in
+    launchd) launchd_install_service ;;
+    systemd) systemctl --user restart "$LABEL.service" ;;
+    nohup) nohup_stop; nohup_start "${1:-}" ;;
+  esac
+}
+
+remove_service() {
+  local backend
+  backend="$(service_backend 2>/dev/null || detect_service_backend)"
+  case "$backend" in
+    launchd) launchd_stop_service; rm -f "$PLIST_FILE" ;;
+    systemd)
+      systemctl --user disable --now "$LABEL.service" >/dev/null 2>&1 || true
+      rm -f "$SYSTEMD_UNIT_FILE"
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      ;;
+    nohup) nohup_stop ;;
+  esac
+  rm -f "$SERVICE_BACKEND_FILE"
 }
 
 # --- uninstall / purge ------------------------------------------------------
@@ -810,12 +1015,7 @@ delete_source_clone() {
 }
 
 stop_and_remove_plist() {
-  if [[ -f "$CONFIG_FILE" ]]; then
-    stop_service
-  else
-    launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
-  fi
-  rm -f "$PLIST_FILE"
+  remove_service
 }
 
 pipx_uninstall_headroom_ai() {
@@ -844,7 +1044,9 @@ remove_recorded_headroom_cache() {
   local cache_dir
   cache_dir="$(manifest_get HEADROOM_TOOLS_CACHE_DIR 2>/dev/null || true)"
   [[ -n "$cache_dir" ]] || return 0
-  if [[ "$cache_dir" != "$HOME/Library/Caches/headroom/bin" ]]; then
+  local mac_cache="$HOME/Library/Caches/headroom/bin"
+  local xdg_cache="${XDG_CACHE_HOME:-$HOME/.cache}/headroom/bin"
+  if [[ "$cache_dir" != "$mac_cache" && "$cache_dir" != "$xdg_cache" ]]; then
     echo "[apx:uninstall] refusing unexpected Headroom helper cache path: $cache_dir" >&2
     return 1
   fi
@@ -902,19 +1104,11 @@ remove_recorded_caches() {
 
 do_uninstall_service_only() {
   if [[ "${APX_DRY_RUN:-0}" == "1" ]]; then
-    purge_action "stop LaunchAgent and remove $PLIST_FILE" :
+    purge_action "stop and remove apx service" :
     return 0
   fi
-  # stop_service touches config-derived ports; the config may already be gone.
-  if [[ -f "$CONFIG_FILE" ]]; then
-    load_config
-    stop_service
-  else
-    # Fall back to a best-effort launchctl bootout when config is missing.
-    launchctl bootout "$(launchd_domain)" "$PLIST_FILE" >/dev/null 2>&1 || true
-  fi
-  purge_action "remove $PLIST_FILE" rm -f "$PLIST_FILE"
-  echo "removed LaunchAgent. Config, state, and binaries were preserved."
+  remove_service
+  echo "removed apx service. Config, state, and binaries were preserved."
   echo "Run 'apx uninstall --purge' to remove everything."
 }
 
@@ -959,7 +1153,7 @@ do_uninstall_purge() {
   recorded_src="$(source_clone_path 2>/dev/null || true)"
 
   # Always stop the service first so nothing races the deletions.
-  purge_action "stop service and remove plist" stop_and_remove_plist
+  purge_action "stop and remove apx service" stop_and_remove_plist
 
   if purge_has claude; then
     purge_action "remove ANTHROPIC_BASE_URL from $CLAUDE_SETTINGS_FILE" remove_from_claude_settings
@@ -1297,16 +1491,22 @@ apply_chain() {
 mode_hint() {
   if [[ "$(current_mode)" == "off" ]]; then
     echo "Claude Code base URL: unset ANTHROPIC_BASE_URL"
+  elif [[ -z "$(claude_base_url_for_mode)" ]]; then
+    echo "Claude Code base URL: not configured (run: apx claude configure)"
   else
-    echo "Claude Code base URL: http://host.docker.internal:$GATEWAY_PORT"
+    echo "Claude Code base URL: $(claude_base_url_for_mode)"
   fi
 }
 
 claude_base_url_for_mode() {
   if [[ "$(current_mode)" == "off" ]]; then
     echo ""
+  elif [[ "${APX_CLIENT_TOPOLOGY:-none}" == "none" ]]; then
+    echo ""
+  elif [[ -n "${APX_CLIENT_BASE_URL:-}" ]]; then
+    echo "$APX_CLIENT_BASE_URL"
   else
-    echo "http://host.docker.internal:$GATEWAY_PORT"
+    echo "http://127.0.0.1:$GATEWAY_PORT"
   fi
 }
 
@@ -1355,6 +1555,105 @@ PY
   echo "Restart Claude Code for settings changes to take effect."
 }
 
+claude_usage() {
+  cat <<EOF
+usage: apx claude <get|configure|set|sync|clear>
+
+  get                         Show configured client base URL
+  configure                   Interactively choose where Claude Code runs
+  set local                   Use http://127.0.0.1:<gateway-port>
+  set docker-host             Use http://host.docker.internal:<gateway-port>
+  set <http(s)://url>         Use an explicit client base URL
+  sync                        Write the configured URL to Claude settings
+  clear                       Remove ANTHROPIC_BASE_URL from Claude settings
+EOF
+}
+
+claude_command() {
+  local sub="${1:-get}" value="${2:-}"
+  load_config
+  case "$sub" in
+    get|show)
+      echo "client topology: ${APX_CLIENT_TOPOLOGY:-none}"
+      echo "client base URL: $(claude_base_url_for_mode)"
+      ;;
+    configure)
+      [[ -t 0 ]] || { echo "error: interactive terminal required; use 'apx claude set local|docker-host|<url>'" >&2; return 2; }
+      cat <<EOF
+Where does Claude Code run?
+  1) Same host or same container as apx        (127.0.0.1)
+  2) Devcontainer, while apx runs on the host (host.docker.internal)
+  3) Custom URL
+  4) Do not update Claude settings
+EOF
+      local choice custom
+      printf 'Select [1-4]: '
+      read -r choice
+      case "$choice" in
+        1) claude_command set local ;;
+        2) claude_command set docker-host ;;
+        3)
+          printf 'Base URL: '
+          read -r custom
+          claude_command set "$custom"
+          ;;
+        4) claude_command clear ;;
+        *) echo "invalid selection" >&2; return 2 ;;
+      esac
+      ;;
+    set)
+      local topology
+      case "$value" in
+        local|same-container) topology=local; value="http://127.0.0.1:$GATEWAY_PORT" ;;
+        docker-host) topology=docker-host; value="http://host.docker.internal:$GATEWAY_PORT" ;;
+        http://*|https://*) topology=custom ;;
+        *) claude_usage >&2; return 2 ;;
+      esac
+      set_config_var APX_CLIENT_TOPOLOGY "$topology"
+      set_config_var APX_CLIENT_BASE_URL "\"$value\""
+      load_config
+      sync_claude_settings
+      ;;
+    sync) sync_claude_settings ;;
+    clear)
+      set_config_var APX_CLIENT_TOPOLOGY none
+      set_config_var APX_CLIENT_BASE_URL '""'
+      remove_from_claude_settings
+      echo "Claude settings: ANTHROPIC_BASE_URL removed"
+      ;;
+    help|-h|--help) claude_usage ;;
+    *) claude_usage >&2; return 2 ;;
+  esac
+}
+
+confirm_and_sync_claude_settings() {
+  load_config
+  if [[ ! -t 0 ]]; then
+    if [[ "${APX_CLIENT_TOPOLOGY:-none}" == "none" ]]; then
+      echo "Claude settings not updated: client topology is not configured."
+      echo "Run: apx claude set local | docker-host | <url>"
+      return 0
+    fi
+    sync_claude_settings
+    return
+  fi
+  if [[ "${APX_CLIENT_TOPOLOGY:-none}" == "none" ]]; then
+    claude_command configure
+    return
+  fi
+  local answer
+  echo "Claude client topology: $APX_CLIENT_TOPOLOGY"
+  echo "Claude base URL: $(claude_base_url_for_mode)"
+  printf 'Use this setting for the new mode? [Y]es/[R]econfigure/[N]o: '
+  read -r answer
+  case "${answer:-Y}" in
+    Y|y|yes|YES) sync_claude_settings ;;
+    R|r) claude_command configure ;;
+    N|n|no|NO) echo "Claude settings left unchanged" ;;
+    *) echo "invalid selection; Claude settings left unchanged" ;;
+  esac
+}
+
 
 disable_stack() {
   load_config
@@ -1375,7 +1674,7 @@ apply_mode_common() {
   echo "chain: $(chain_description)"
   mode_hint
   if [[ "$sync_claude" == "1" ]]; then
-    sync_claude_settings
+    confirm_and_sync_claude_settings
   fi
   if [[ "$restart" == "1" ]]; then
     APX_TAKEOVER=1 install_service
@@ -1632,6 +1931,7 @@ status() {
   fi
   echo "version: $(read_installed_version)"
   echo "config: $CONFIG_FILE"
+  echo "service backend: $(service_backend 2>/dev/null || echo unknown)"
   echo "mode: $(current_mode)"
   echo "chain: $(chain_description)"
   echo "supervisor: ${spid:-none} $sstate"
@@ -1720,7 +2020,14 @@ open_dashboard() {
   load_config
   dashboard_urls
   if [[ "${1:-}" == "--open" ]]; then
-    open "http://$BIND_HOST:$GATEWAY_PORT/livez" >/dev/null 2>&1 || true
+    local url="http://$BIND_HOST:$GATEWAY_PORT/"
+    if command -v open >/dev/null 2>&1; then
+      open "$url" >/dev/null 2>&1 || true
+    elif command -v xdg-open >/dev/null 2>&1; then
+      xdg-open "$url" >/dev/null 2>&1 || true
+    else
+      echo "open this URL in a browser: $url"
+    fi
   fi
 }
 
@@ -2186,34 +2493,12 @@ installed_plist_label() {
 }
 
 restart_service_if_managed() {
-  # Prefer `launchctl kickstart -k` over `apx restart` for two reasons:
-  #   1. Re-executing `$0 restart` goes through the ~/.local/bin/apx symlink,
-  #      which now points at the NEW version. Any renamed/removed subcommand
-  #      in the new version would wedge the switch.
-  #   2. `apx restart` calls bootout + a fresh spawn; `kickstart -k` asks
-  #      launchd to signal the current process and let KeepAlive relaunch it
-  #      cleanly, which is the semantic we want after flipping `current`.
-  #
-  # If the user has explicitly stopped the service (`apx stop` bootouts it
-  # but leaves the plist file on disk), we must NOT auto-start it just
-  # because they ran `apx use`. Check that the service is currently loaded
-  # first, and skip the restart otherwise.
-  if ! have_launchctl_managed; then
+  if ! service_is_active; then
+    echo "note: apx service is stopped; run 'apx start' to load the new version"
     return 0
   fi
-  local domain label
-  domain="$(launchd_domain 2>/dev/null || true)"
-  [[ -z "$domain" ]] && return 0
-  label="$(installed_plist_label)"
-  if ! launchctl print "${domain}/${label}" >/dev/null 2>&1; then
-    echo "note: service $label is stopped; run 'apx start' to load the new version"
-    return 0
-  fi
-  if launchctl kickstart -k "${domain}/${label}" >/dev/null 2>&1; then
-    echo "restarted service ($label)"
-  else
-    echo "warning: launchctl kickstart failed for $label; you may need 'apx restart'" >&2
-  fi
+  restart_service
+  echo "restarted apx service ($(service_backend))"
 }
 
 rollback_command() {
@@ -2491,10 +2776,11 @@ EOF
 
 print_completions() {
   local shell="${1:-}"
-  local cmds="start stop disable restart status mode chain target doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
+  local cmds="start stop disable restart run status mode chain target claude doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
   local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
   local chain_subs="get set clear ls preset help"
   local target_subs="get set reset help"
+  local claude_subs="get set sync clear help"
   local services="headroom pxpipe squeezr"
   local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
   local purge_flags="--purge --purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches --dry-run --yes -y --help"
@@ -2517,6 +2803,7 @@ _apx_completions() {
     mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
     chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
     target)   COMPREPLY=( \$(compgen -W "$target_subs --no-restart" -- "\$cur") ) ;;
+    claude)   COMPREPLY=( \$(compgen -W "$claude_subs local docker-host" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
     completions) COMPREPLY=( \$(compgen -W "bash zsh fish install uninstall" -- "\$cur") ) ;;
     uninstall) COMPREPLY=( \$(compgen -W "$purge_flags" -- "\$cur") ) ;;
@@ -2539,6 +2826,7 @@ ZSH
       printf '  modes=(%s)\n' "$modes"
       printf '  chain_subs=(%s)\n' "$chain_subs"
       printf '  target_subs=(%s)\n' "$target_subs"
+      printf '  claude_subs=(%s)\n' "$claude_subs"
       printf '  services=(%s)\n' "$services"
       printf '  log_targets=(%s)\n' "$log_targets"
       cat <<'ZSH'
@@ -2550,6 +2838,7 @@ ZSH
     mode) _describe -t modes 'apx mode' modes ;;
     chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
     target) _describe -t target 'apx target' target_subs ;;
+    claude) _describe -t claude 'apx claude' claude_subs ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
     completions) _values 'action' 'bash' 'zsh' 'fish' 'install' 'uninstall' ;;
     uninstall) _values 'flag' '--purge' '--purge=all' '--purge=binaries' '--purge=share' '--purge=state' '--purge=config' '--purge=claude' '--purge=completions' '--purge=source' '--purge=deps' '--purge=caches' '--purge=all,deps,caches' '--dry-run' '--yes' '-y' '--help' ;;
@@ -2576,6 +2865,9 @@ FISH
       done
       for t in $target_subs; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from target" -a "%s"\n' "$t"
+      done
+      for t in $claude_subs; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from claude" -a "%s"\n' "$t"
       done
       for s in $services; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from chain" -a "%s"\n' "$s"
@@ -2717,6 +3009,7 @@ Usage: apx <command>
 
 Commands:
   start [--takeover]   Start supervisor in the background
+  run                  Run supervisor in the foreground (containers)
   stop                 Stop launchd service/supervisor and owned children
   disable              Stop stack/gateway and remove ANTHROPIC_BASE_URL
   restart [--takeover] Stop then start
@@ -2724,10 +3017,11 @@ Commands:
   mode [preset]        Show/set mode preset and sync Claude settings
   chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
   target <sub>         Get/set upstream API endpoint (get|set|reset)
+  claude <sub>         Configure Claude client URL (local|docker-host|custom)
   doctor               Show status plus dependency diagnostics
-  install              Install/start macOS LaunchAgent with KeepAlive
-  uninstall [--purge]  Stop and remove LaunchAgent; --purge removes apx-owned files
-  supervisor           Internal foreground supervisor for launchd
+  install              Install/start the selected service backend
+  uninstall [--purge]  Stop and remove service; --purge removes apx-owned files
+  supervisor           Internal foreground supervisor
   logs [name]          Follow logs: all, supervisor, gateway, pxpipe, squeezr, headroom, headroom.proxy, launchd.*
   urls                 Print dashboard, health, and stats URLs
   dashboard [--open]   Print URLs; with --open, open the pxpipe dashboard
@@ -2763,7 +3057,7 @@ For custom upstream-compatible APIs:
   apx target set https://your-compatible-endpoint.example.com --no-restart
 
 Options:
-  --no-restart         Do not restart the LaunchAgent after mode/chain change
+  --no-restart         Do not restart the apx service after mode/chain change
   --no-claude-sync     Do not update ~/.claude/settings.json
 
 Config: $CONFIG_FILE
@@ -2774,14 +3068,16 @@ cmd="${1:-status}"
 shift || true
 case "$cmd" in
   supervisor) supervisor ;;
-  start) start_bg "${1:-}" ;;
+  run) supervisor ;;
+  start) start_service "${1:-}" ;;
   stop) stop_service ;;
   disable) disable_stack ;;
-  restart) stop_service; start_bg "${1:-}" ;;
+  restart) restart_service "${1:-}" ;;
   status) status ;;
   mode) set_mode "${@:-current}" ;;
   chain) chain_cli "$@" ;;
   target) target_cli "$@" ;;
+  claude) claude_command "$@" ;;
   doctor) doctor ;;
   install) install_service ;;
   uninstall) uninstall_command "$@" ;;

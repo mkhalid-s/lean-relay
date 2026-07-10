@@ -46,6 +46,7 @@ HISTORY_PERSIST = os.environ.get("APX_HISTORY_PERSIST", "1") == "1"
 HISTORY_DIR = os.environ.get("APX_HISTORY_DIR", os.path.join(STATE_DIR, "history"))
 HEALTH_INTERVAL_SECONDS = float(os.environ.get("APX_HEALTH_INTERVAL_SECONDS", "5"))
 MAX_LOG_STREAMS_PER_IP = int(os.environ.get("APX_MAX_LOG_STREAMS_PER_IP", "8"))
+MAX_EVENT_STREAMS_PER_IP = int(os.environ.get("APX_MAX_EVENT_STREAMS_PER_IP", "4"))
 MAX_REQUEST_BYTES = int(os.environ.get("APX_MAX_REQUEST_BYTES", str(64 * 1024 * 1024)))
 
 # --- Metrics data plane (0.4.0+) ---------------------------------------------
@@ -357,11 +358,17 @@ def _derive_session_id(headers: Any, model: str | None, body: bytes) -> str:
 
 
 # --- SQLite metrics store ---------------------------------------------------
-_METRICS_SCHEMA_VERSION = 1
+_METRICS_SCHEMA_VERSION = 2
 _METRICS_DDL = [
     """
     CREATE TABLE IF NOT EXISTS schema_version (
       version INTEGER NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS backfill_state (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
     )
     """,
     """
@@ -393,7 +400,8 @@ _METRICS_DDL = [
       capture_level TEXT,
       request_body TEXT,
       response_body TEXT,
-      request_headers TEXT
+      request_headers TEXT,
+      source_key TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts)",
@@ -420,7 +428,9 @@ class MetricsStore:
 
     def open(self) -> bool:
         try:
-            Path(os.path.dirname(self.path) or ".").mkdir(parents=True, exist_ok=True)
+            parent = Path(os.path.dirname(self.path) or ".")
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(parent, 0o700)
             conn = sqlite3.connect(
                 self.path,
                 timeout=5.0,
@@ -435,11 +445,22 @@ class MetricsStore:
             cur = conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
             row = cur.fetchone()
             current = int(row[0]) if row else 0
+            columns = {str(r[1]) for r in conn.execute("PRAGMA table_info(requests)").fetchall()}
+            if "source_key" not in columns:
+                conn.execute("ALTER TABLE requests ADD COLUMN source_key TEXT")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_source_key ON requests(source_key)")
             if current < _METRICS_SCHEMA_VERSION:
+                if current < 2:
+                    existing = int(conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0])
+                    if existing > 0:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO backfill_state(key, value) VALUES ('jsonl_complete', 'legacy_nonempty')"
+                        )
                 conn.execute("DELETE FROM schema_version")
                 conn.execute("INSERT INTO schema_version(version) VALUES (?)", (_METRICS_SCHEMA_VERSION,))
             self._conn = conn
             self.enabled = True
+            self._secure_files()
             return True
         except Exception as exc:  # noqa: BLE001
             self.error = str(exc)
@@ -456,6 +477,15 @@ class MetricsStore:
                     pass
             self._conn = None
             self.enabled = False
+
+    def _secure_files(self) -> None:
+        for candidate in (self.path, f"{self.path}-wal", f"{self.path}-shm"):
+            try:
+                os.chmod(candidate, 0o600)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log(f"metrics: could not restrict permissions on {candidate}: {exc}")
 
     def is_fresh(self) -> bool:
         if not self.enabled or self._conn is None:
@@ -474,6 +504,7 @@ class MetricsStore:
             "bytes_in", "bytes_out", "chain_mode", "chain_hops", "hop_timings",
             "upstream", "is_stream", "tool_call_count", "err_class",
             "capture_level", "request_body", "response_body", "request_headers",
+            "source_key",
         )
         values = tuple(row.get(c) for c in cols)
         placeholders = ",".join(["?"] * len(cols))
@@ -483,6 +514,7 @@ class MetricsStore:
                     f"INSERT INTO requests({','.join(cols)}) VALUES ({placeholders})",
                     values,
                 )
+                self._secure_files()
         except Exception as exc:  # noqa: BLE001
             log(f"metrics insert failed: {exc}")
 
@@ -496,17 +528,20 @@ class MetricsStore:
             "bytes_in", "bytes_out", "chain_mode", "chain_hops", "hop_timings",
             "upstream", "is_stream", "tool_call_count", "err_class",
             "capture_level", "request_body", "response_body", "request_headers",
+            "source_key",
         )
         placeholders = ",".join(["?"] * len(cols))
-        stmt = f"INSERT INTO requests({','.join(cols)}) VALUES ({placeholders})"
+        stmt = f"INSERT OR IGNORE INTO requests({','.join(cols)}) VALUES ({placeholders})"
         count = 0
         try:
             with self._lock:
                 self._conn.execute("BEGIN")
                 for r in rows:
-                    self._conn.execute(stmt, tuple(r.get(c) for c in cols))
-                    count += 1
+                    cur = self._conn.execute(stmt, tuple(r.get(c) for c in cols))
+                    if (cur.rowcount or 0) > 0:
+                        count += 1
                 self._conn.execute("COMMIT")
+                self._secure_files()
         except Exception as exc:  # noqa: BLE001
             try:
                 self._conn.execute("ROLLBACK")
@@ -518,10 +553,33 @@ class MetricsStore:
     def query(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         if not self.enabled or self._conn is None:
             return []
-        with self._lock:
-            cur = self._conn.execute(sql, params)
+        uri = f"{Path(self.path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        try:
+            conn.execute("PRAGMA busy_timeout=5000")
+            cur = conn.execute(sql, params)
             columns = [d[0] for d in cur.description] if cur.description else []
             return [dict(zip(columns, row)) for row in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def backfill_completed(self) -> bool:
+        if not self.enabled or self._conn is None:
+            return True
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM backfill_state WHERE key = 'jsonl_complete'"
+            ).fetchone()
+            return row is not None
+
+    def mark_backfill_complete(self) -> None:
+        if not self.enabled or self._conn is None:
+            return
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO backfill_state(key, value) VALUES ('jsonl_complete', ?)",
+                (str(int(time.time())),),
+            )
 
     def prune_older_than(self, cutoff_ts: float) -> int:
         if not self.enabled or self._conn is None:
@@ -530,88 +588,140 @@ class MetricsStore:
             cur = self._conn.execute("DELETE FROM requests WHERE ts < ?", (cutoff_ts,))
             return cur.rowcount or 0
 
+    def checkpoint(self) -> None:
+        if not self.enabled or self._conn is None:
+            return
+        with self._lock:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._secure_files()
+
 
 METRICS = MetricsStore(METRICS_DB_PATH)
 
 
 def _backfill_from_jsonl() -> None:
-    """Import existing history/*.jsonl into SQLite if the DB is fresh.
-
-    Rows without a capture_level are marked "metadata" (legacy pre-0.4.0 rows
-    are always metadata-only by definition). We do this once, on a fresh DB.
-    """
+    """Resume-safe, idempotent import of retained history JSONL into SQLite."""
     if not METRICS_BACKFILL or not METRICS.enabled:
         return
-    if not METRICS.is_fresh():
+    if METRICS.backfill_completed():
         return
     if not os.path.isdir(HISTORY_DIR):
+        METRICS.mark_backfill_complete()
         return
     files = sorted(f for f in os.listdir(HISTORY_DIR) if f.endswith(".jsonl"))
     if not files:
+        METRICS.mark_backfill_complete()
         return
     log(f"metrics: backfilling from {len(files)} JSONL file(s) in {HISTORY_DIR}")
     total = 0
+    all_read = True
+    cutoff = (
+        time.time() - METRICS_RETENTION_DAYS * 86400
+        if METRICS_RETENTION_DAYS > 0
+        else 0.0
+    )
     for fname in files:
         rows: list[dict[str, Any]] = []
         try:
             with open(os.path.join(HISTORY_DIR, fname), "r", encoding="utf-8", errors="replace") as fh:
-                for raw in fh:
+                for line_number, raw in enumerate(fh, 1):
                     raw = raw.strip()
                     if not raw:
                         continue
                     try:
                         entry = json.loads(raw)
-                    except Exception:  # noqa: BLE001
+                        if not isinstance(entry, dict):
+                            continue
+                        ts = float(entry.get("ts") or 0.0)
+                        if ts < cutoff:
+                            continue
+                        rows.append({
+                            "ts": ts,
+                            "request_id": entry.get("request_id") or "",
+                            "session_id": entry.get("session_id") or "",
+                            "method": entry.get("method") or "",
+                            "path": entry.get("path") or "",
+                            "model": entry.get("model") or "",
+                            "status": int(entry.get("status") or 0),
+                            "latency_ms": float(entry.get("latency_ms") or 0.0),
+                            "first_byte_ms": float(entry.get("first_byte_ms") or 0.0),
+                            "tokens_in": int(entry.get("tokens_in") or 0),
+                            "tokens_out": int(entry.get("tokens_out") or 0),
+                            "cache_read_tokens": int(entry.get("cache_read_tokens") or 0),
+                            "cache_write_tokens": int(entry.get("cache_write_tokens") or 0),
+                            "cost_est_usd": float(entry.get("cost_est_usd") or 0.0),
+                            "bytes_in": int(entry.get("bytes_in") or 0),
+                            "bytes_out": int(entry.get("bytes_out") or 0),
+                            "chain_mode": entry.get("chain_mode") or "",
+                            "chain_hops": entry.get("chain_hops") or "",
+                            "hop_timings": entry.get("hop_timings") or "",
+                            "upstream": entry.get("upstream") or "",
+                            "is_stream": int(bool(entry.get("is_stream"))),
+                            "tool_call_count": int(entry.get("tool_call_count") or 0),
+                            "err_class": entry.get("err_class") or "",
+                            "capture_level": entry.get("capture_level") or "metadata",
+                            "request_body": None,
+                            "response_body": None,
+                            "request_headers": None,
+                            "source_key": f"jsonl:{fname}:{line_number}",
+                        })
+                    except (TypeError, ValueError, json.JSONDecodeError):
                         continue
-                    if not isinstance(entry, dict):
-                        continue
-                    rows.append({
-                        "ts": float(entry.get("ts") or 0.0),
-                        "request_id": entry.get("request_id") or "",
-                        "session_id": entry.get("session_id") or "",
-                        "method": entry.get("method") or "",
-                        "path": entry.get("path") or "",
-                        "model": entry.get("model") or "",
-                        "status": int(entry.get("status") or 0),
-                        "latency_ms": float(entry.get("latency_ms") or 0.0),
-                        "first_byte_ms": float(entry.get("first_byte_ms") or 0.0),
-                        "tokens_in": int(entry.get("tokens_in") or 0),
-                        "tokens_out": int(entry.get("tokens_out") or 0),
-                        "cache_read_tokens": int(entry.get("cache_read_tokens") or 0),
-                        "cache_write_tokens": int(entry.get("cache_write_tokens") or 0),
-                        "cost_est_usd": float(entry.get("cost_est_usd") or 0.0),
-                        "bytes_in": int(entry.get("bytes_in") or 0),
-                        "bytes_out": int(entry.get("bytes_out") or 0),
-                        "chain_mode": entry.get("chain_mode") or "",
-                        "chain_hops": entry.get("chain_hops") or "",
-                        "hop_timings": entry.get("hop_timings") or "",
-                        "upstream": entry.get("upstream") or "",
-                        "is_stream": int(bool(entry.get("is_stream"))),
-                        "tool_call_count": int(entry.get("tool_call_count") or 0),
-                        "err_class": entry.get("err_class") or "",
-                        "capture_level": entry.get("capture_level") or "metadata",
-                        "request_body": None,
-                        "response_body": None,
-                        "request_headers": None,
-                    })
+                    if len(rows) >= 500:
+                        total += METRICS.bulk_insert(rows)
+                        rows.clear()
         except OSError:
+            all_read = False
             continue
         total += METRICS.bulk_insert(rows)
-    log(f"metrics: backfill complete, {total} rows imported")
+    if all_read:
+        METRICS.mark_backfill_complete()
+        log(f"metrics: backfill complete, {total} row(s) imported")
+    else:
+        log(f"metrics: backfill paused after {total} row(s); unreadable files will be retried")
 
 
 def _metrics_janitor_loop() -> None:
     """Periodically prune old rows per retention policy."""
     while True:
         try:
-            if METRICS.enabled and METRICS_RETENTION_DAYS > 0:
+            if METRICS_RETENTION_DAYS > 0:
                 cutoff = time.time() - METRICS_RETENTION_DAYS * 86400
-                deleted = METRICS.prune_older_than(cutoff)
-                if deleted:
-                    log(f"metrics: pruned {deleted} row(s) older than {METRICS_RETENTION_DAYS}d")
+                if METRICS.enabled:
+                    deleted = METRICS.prune_older_than(cutoff)
+                    if deleted:
+                        log(f"metrics: pruned {deleted} row(s) older than {METRICS_RETENTION_DAYS}d")
+                    METRICS.checkpoint()
+                removed_history = _prune_history_files(cutoff)
+                if removed_history:
+                    log(f"history: pruned {removed_history} JSONL file(s) older than {METRICS_RETENTION_DAYS}d")
         except Exception as exc:  # noqa: BLE001
             log(f"metrics janitor error: {exc}")
         time.sleep(3600)
+
+
+def _prune_history_files(cutoff_ts: float) -> int:
+    cutoff_day = date.fromtimestamp(cutoff_ts)
+    removed = 0
+    try:
+        names = os.listdir(HISTORY_DIR)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        try:
+            file_day = date.fromisoformat(name[:-6])
+        except ValueError:
+            continue
+        if file_day >= cutoff_day:
+            continue
+        try:
+            os.remove(os.path.join(HISTORY_DIR, name))
+            removed += 1
+        except OSError as exc:
+            log(f"history: could not prune {name}: {exc}")
+    return removed
 
 
 HOP_BY_HOP_HEADERS = {
@@ -643,6 +753,10 @@ _HEALTH_CACHE: dict = {"ts": 0.0, "value": {}}
 _HEALTH_LOCK = threading.Lock()
 _LOG_STREAMS_BY_IP: "collections.defaultdict[str, int]" = collections.defaultdict(int)
 _LOG_STREAMS_LOCK = threading.Lock()
+_EVENT_STREAMS_BY_IP: "collections.defaultdict[str, int]" = collections.defaultdict(int)
+_EVENT_STREAMS_LOCK = threading.Lock()
+_EVENT_PAYLOAD_CACHE: dict[str, dict[str, Any]] = {}
+_EVENT_PAYLOAD_CACHE_LOCK = threading.Lock()
 _HISTORY_FH = None
 _HISTORY_FH_DATE: str | None = None
 _HISTORY_FH_LOCK = threading.Lock()
@@ -826,8 +940,13 @@ def _rotate_history_fh() -> "any":
     except Exception:  # noqa: BLE001
         pass
     try:
-        Path(HISTORY_DIR).mkdir(parents=True, exist_ok=True)
-        _HISTORY_FH = open(os.path.join(HISTORY_DIR, f"{today}.jsonl"), "a", encoding="utf-8")
+        history_path = Path(HISTORY_DIR)
+        history_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(history_path, 0o700)
+        file_path = os.path.join(HISTORY_DIR, f"{today}.jsonl")
+        fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.chmod(file_path, 0o600)
+        _HISTORY_FH = os.fdopen(fd, "a", encoding="utf-8")
         _HISTORY_FH_DATE = today
     except OSError:
         _HISTORY_FH = None
@@ -1073,6 +1192,18 @@ def _tool_cached(key: str, ttl: float, fetch) -> dict[str, Any]:
     return value
 
 
+def _event_payload_cached(key: str, ttl: float, fetch) -> dict[str, Any]:
+    """Single-flight cache for SSE payloads shared by all dashboard clients."""
+    with _EVENT_PAYLOAD_CACHE_LOCK:
+        now = time.time()
+        entry = _EVENT_PAYLOAD_CACHE.get(key)
+        if entry and now - float(entry.get("_ts", 0.0)) < ttl:
+            return entry["_value"]
+        value = fetch()
+        _EVENT_PAYLOAD_CACHE[key] = {"_ts": time.time(), "_value": value}
+        return value
+
+
 def _api_metrics_summary(query: dict[str, list[str]]) -> dict[str, Any]:
     window = (query.get("window", ["1h"])[0] or "1h").lower()
     ws = _window_seconds(window)
@@ -1176,8 +1307,16 @@ def _api_metrics_timeseries(query: dict[str, list[str]]) -> dict[str, Any]:
         e["cost_usd"] += float(r.get("cost_est_usd") or 0)
         e["_lats"].append(float(r.get("latency_ms") or 0))
     series = []
-    for b in sorted(buckets.keys()):
-        e = buckets[b]
+    now_bucket = int(time.time() // bs) * bs
+    first_bucket = int(since // bs) * bs
+    bucket_count = ((now_bucket - first_bucket) // bs) + 1
+    bucket_keys = (
+        range(first_bucket, now_bucket + bs, bs)
+        if bucket_count <= 5000
+        else sorted(buckets.keys())
+    )
+    for b in bucket_keys:
+        e = buckets.get(b, {"requests": 0, "err": 0, "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "_lats": []})
         lats = sorted(e.pop("_lats"))
         series.append({
             "ts": b,
@@ -1201,11 +1340,14 @@ def _api_metrics_sessions(query: dict[str, list[str]]) -> dict[str, Any]:
             "SELECT session_id, MIN(ts) AS first_ts, MAX(ts) AS last_ts, COUNT(*) AS requests, "
             "SUM(tokens_in) AS tokens_in, SUM(tokens_out) AS tokens_out, "
             "SUM(cost_est_usd) AS cost_usd, SUM(tool_call_count) AS tool_calls, "
-            "AVG(latency_ms) AS avg_latency_ms, MAX(chain_mode) AS chain_mode, "
-            "MAX(model) AS last_model "
+            "AVG(latency_ms) AS avg_latency_ms, "
+            "(SELECT r2.chain_mode FROM requests r2 WHERE r2.session_id = requests.session_id AND r2.ts >= ? "
+            " ORDER BY r2.ts DESC, r2.id DESC LIMIT 1) AS chain_mode, "
+            "(SELECT r3.model FROM requests r3 WHERE r3.session_id = requests.session_id AND r3.ts >= ? "
+            " ORDER BY r3.ts DESC, r3.id DESC LIMIT 1) AS last_model "
             "FROM requests WHERE ts >= ? AND session_id != '' "
             "GROUP BY session_id ORDER BY last_ts DESC LIMIT ?",
-            (since, limit),
+            (since, since, since, limit),
         )
     else:
         # In-memory fallback: group history entries.
@@ -1244,7 +1386,7 @@ def _api_metrics_session_detail(session_id: str, query: dict[str, list[str]]) ->
         return {"error": "session_id required", "requests": []}
     if METRICS.enabled:
         rows = METRICS.query(
-            "SELECT ts, request_id, method, path, model, status, latency_ms, first_byte_ms, "
+            "SELECT id, ts, request_id, method, path, model, status, latency_ms, first_byte_ms, "
             "tokens_in, tokens_out, cache_read_tokens, cache_write_tokens, cost_est_usd, "
             "bytes_in, bytes_out, chain_mode, chain_hops, hop_timings, is_stream, "
             "tool_call_count, err_class, capture_level "
@@ -1257,13 +1399,13 @@ def _api_metrics_session_detail(session_id: str, query: dict[str, list[str]]) ->
     # Include full bodies only when explicitly requested AND capture=full.
     if query.get("include_body", ["0"])[0] in ("1", "true", "yes") and CAPTURE_LEVEL == "full" and METRICS.enabled:
         detail = METRICS.query(
-            "SELECT request_id, request_body, response_body, request_headers "
+            "SELECT id, request_body, response_body, request_headers "
             "FROM requests WHERE session_id = ? ORDER BY ts ASC LIMIT 5000",
             (session_id,),
         )
-        detail_by_rid = {d.get("request_id"): d for d in detail}
+        detail_by_id = {d.get("id"): d for d in detail}
         for r in rows:
-            d = detail_by_rid.get(r.get("request_id")) or {}
+            d = detail_by_id.get(r.get("id")) or {}
             r["request_body"] = d.get("request_body")
             r["response_body"] = d.get("response_body")
             r["request_headers"] = d.get("request_headers")
@@ -1524,7 +1666,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
     server_version = "apx-gateway/0.1"
 
     def log_message(self, fmt: str, *args: object) -> None:
-        msg = fmt % args
+        safe_args = list(args)
+        if safe_args and isinstance(safe_args[0], str):
+            parts = safe_args[0].split(" ", 2)
+            if len(parts) == 3 and parts[1].startswith("/"):
+                parts[1] = _scrub_url_path(parts[1])
+                safe_args[0] = " ".join(parts)
+        msg = fmt % tuple(safe_args)
         msg = re.sub(r"([?&](?:token|api_key|apikey|api-key|authorization|password|secret)=)[^&\s\"]+", r"\1REDACTED", msg, flags=re.I)
         log(msg)
 
@@ -1579,6 +1727,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:  # noqa: BLE001
             return "unknown"
 
+    def _dashboard_host_allowed(self) -> bool:
+        host_header = self.headers.get("host", "")
+        try:
+            hostname = (urlsplit(f"//{host_header}").hostname or "").lower()
+        except ValueError:
+            return False
+        allowed = {"127.0.0.1", "::1", "localhost", "host.docker.internal"}
+        if BIND_HOST not in {"0.0.0.0", "::"}:
+            allowed.add(BIND_HOST.lower())
+        return hostname in allowed or bool(DASHBOARD_TOKEN and self._authorized_for_dashboard())
+
+    def _dashboard_origin_allowed(self) -> bool:
+        if self.headers.get("sec-fetch-site", "").lower() == "cross-site":
+            return False
+        origin = self.headers.get("origin", "")
+        if not origin:
+            return True
+        try:
+            origin_host = (urlsplit(origin).hostname or "").lower()
+            request_host = (urlsplit(f"//{self.headers.get('host', '')}").hostname or "").lower()
+        except ValueError:
+            return False
+        return origin_host == request_host
+
     def _authorized_for_dashboard(self, allow_query: bool = True) -> bool:
         if not DASHBOARD_TOKEN:
             return True
@@ -1601,8 +1773,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _dashboard_cookie_headers(self) -> dict[str, str]:
         if not DASHBOARD_TOKEN:
             return {}
-        parsed = urlsplit(self.path)
-        provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
+        provided = ""
+        auth = self.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth[7:].strip()
+        if not provided:
+            parsed = urlsplit(self.path)
+            provided = (parse_qs(parsed.query).get("token", [""])[0] or "").strip()
         if provided and secrets.compare_digest(provided, DASHBOARD_TOKEN):
             return {
                 "set-cookie": (
@@ -1630,6 +1807,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
         passthrough_query = self._drop_dashboard_token_query(parsed.query)
+        is_dashboard_path = (
+            path in {"/", "/dashboard", "/metrics"}
+            or path.startswith("/api/")
+            or path.startswith("/proxy/pxpipe")
+            or path.startswith("/proxy/squeezr")
+        )
+        if is_dashboard_path and not self._dashboard_host_allowed():
+            self._respond_json(403, {"error": "dashboard_host_forbidden"})
+            return True
+        if is_dashboard_path and not self._dashboard_origin_allowed():
+            self._respond_json(403, {"error": "cross_site_dashboard_request_forbidden"})
+            return True
 
         if path.startswith("/proxy/pxpipe/") or path == "/proxy/pxpipe":
             if not self._authorized_for_dashboard(allow_query=False):
@@ -1648,8 +1837,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not self._authorized_for_dashboard():
                 self._require_token()
                 return True
+            cookie_headers = self._dashboard_cookie_headers()
+            if cookie_headers and "token" in query:
+                location = path
+                if passthrough_query:
+                    location = f"{location}?{passthrough_query}"
+                self._redirect(303, location, cookie_headers)
+                return True
             body = _read_dashboard_html()
-            self._respond(200, body, content_type="text/html; charset=utf-8", extra_headers=self._dashboard_cookie_headers())
+            self._respond(200, body, content_type="text/html; charset=utf-8", extra_headers=cookie_headers)
             return True
         if path.startswith("/api/"):
             if not self._authorized_for_dashboard():
@@ -1713,13 +1909,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
             })
             return True
         if path == "/api/events/stream":
-            self._stream_events()
+            window = (query.get("window", ["1h"])[0] or "1h").lower()
+            self._stream_events(window)
             return True
         if path == "/api/logs/stream":
             service = (query.get("service", ["supervisor"])[0]) or "supervisor"
             self._stream_log(service)
             return True
+        if path == "/api/logs/targets":
+            self._respond_json(200, {"targets": sorted(_log_targets().keys())})
+            return True
+        if path.startswith("/api/"):
+            self._respond_json(404, {"error": "not_found", "path": path})
+            return True
         if path == "/metrics":
+            if not self._authorized_for_dashboard():
+                self._respond_json(401, {"error": "unauthorized"})
+                return True
             if not METRICS_ENABLED:
                 self._respond_json(404, {"error": "metrics disabled; set APX_METRICS_ENABLED=1"})
                 return True
@@ -1734,6 +1940,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             b"<code>?token=...</code> or an <code>Authorization: Bearer</code> header.</p>"
         )
         self._respond(401, body, content_type="text/html; charset=utf-8")
+
+    def _redirect(self, status: int, location: str, headers: dict[str, str] | None = None) -> None:
+        extra = dict(headers or {})
+        extra["location"] = location
+        self._respond(status, b"", content_type="text/plain; charset=utf-8", extra_headers=extra)
 
     def _rewrite_proxied_html(self, body: bytes, prefix: str, content_type: str) -> bytes:
         if not prefix or "text/html" not in (content_type or "").lower():
@@ -1799,6 +2010,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self.send_header(key, value)
             if rewrite_body:
                 self.send_header("content-length", str(len(body_out)))
+            self.send_header("x-frame-options", "DENY")
+            self.send_header("content-security-policy", "frame-ancestors 'none'")
             self.send_header("connection", "close")
             self.end_headers()
             if rewrite_body:
@@ -1915,39 +2128,55 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except OSError:
                 pass
 
+        fh = None
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
-                fh.seek(0, os.SEEK_END)
-                size = fh.tell()
-                start = max(0, size - 4096)
-                fh.seek(start)
-                if start > 0:
-                    fh.readline()
-                tail = fh.read()
-                for line in tail.splitlines():
-                    self._sse_write(line)
-                last_heartbeat = time.time()
-                while True:
-                    where = fh.tell()
-                    line = fh.readline()
-                    if not line:
-                        if time.time() - last_heartbeat > 15:
-                            try:
-                                self.wfile.write(b": keepalive\n\n")
-                                self.wfile.flush()
-                                last_heartbeat = time.time()
-                            except Exception:
-                                return
-                        time.sleep(0.5)
-                        fh.seek(where)
-                        continue
+            fh = open(path, "r", encoding="utf-8", errors="replace")
+            inode = os.fstat(fh.fileno()).st_ino
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            start = max(0, size - 4096)
+            fh.seek(start)
+            if start > 0:
+                fh.readline()
+            for line in fh.read().splitlines():
+                self._sse_write(line)
+            last_heartbeat = time.time()
+            while True:
+                where = fh.tell()
+                line = fh.readline()
+                if line:
                     if line.endswith("\n"):
                         line = line[:-1]
                     if not self._sse_write(line):
                         return
                     last_heartbeat = time.time()
+                    continue
+                try:
+                    stat_now = os.stat(path)
+                    if stat_now.st_ino != inode or stat_now.st_size < where:
+                        fh.close()
+                        fh = open(path, "r", encoding="utf-8", errors="replace")
+                        inode = os.fstat(fh.fileno()).st_ino
+                        continue
+                except OSError:
+                    pass
+                if time.time() - last_heartbeat > 15:
+                    try:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last_heartbeat = time.time()
+                    except Exception:
+                        return
+                time.sleep(0.5)
+                fh.seek(where)
         except Exception as exc:  # noqa: BLE001
             log(f"log stream error for {service}: {exc}")
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _sse_write(self, line: str) -> bool:
         try:
@@ -1970,12 +2199,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         except Exception:
             return False
 
-    def _stream_events(self) -> None:
-        """Fan-in SSE: emits `summary` (2s), `compare` (5s), and forwards
-        Squeezr's `/squeezr/events` SSE frames as `squeezr` events. This lets
-        the browser subscribe once and receive live updates for every enabled
-        tool without polling three endpoints itself.
-        """
+    def _stream_events(self, window: str = "1h") -> None:
+        """Stream cached summary/comparison updates without per-client workers."""
+        ip = self._client_ip()
+        with _EVENT_STREAMS_LOCK:
+            active = _EVENT_STREAMS_BY_IP[ip]
+            if active >= MAX_EVENT_STREAMS_PER_IP:
+                self._respond_json(429, {"error": "too many event streams", "limit": MAX_EVENT_STREAMS_PER_IP})
+                return
+            _EVENT_STREAMS_BY_IP[ip] = active + 1
         try:
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
@@ -1984,127 +2216,50 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self.send_header("x-accel-buffering", "no")
             self.end_headers()
         except Exception:
+            with _EVENT_STREAMS_LOCK:
+                _EVENT_STREAMS_BY_IP[ip] = max(0, _EVENT_STREAMS_BY_IP[ip] - 1)
             return
 
-        stop = threading.Event()
-        write_lock = threading.Lock()
-        squeezr_conn: http.client.HTTPConnection | None = None
-        last_history_ts = 0.0
-
-        def _write_named(event: str, data: str) -> bool:
-            try:
-                lines = [f"event: {event}"]
-                for line in str(data).splitlines() or [""]:
-                    lines.append(f"data: {line}")
-                payload = ("\n".join(lines) + "\n\n").encode("utf-8")
-                with write_lock:
-                    self.wfile.write(payload)
-                    self.wfile.flush()
-                return True
-            except Exception:
-                return False
-
-        def _write_ping() -> bool:
-            try:
-                with write_lock:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
-                return True
-            except Exception:
-                return False
-
-        def _pump_summary():
-            nonlocal last_history_ts
-            while not stop.is_set():
-                try:
-                    payload = _api_metrics_summary({"window": ["5m"]})
-                    if not _write_named("summary", json.dumps(payload, default=str)):
-                        stop.set()
-                        return
-                    # Also emit any new completed requests since last tick.
-                    with _HISTORY_LOCK:
-                        new = [r for r in _HISTORY if r.get("ts", 0) > last_history_ts]
-                    if new:
-                        last_history_ts = max(r.get("ts", 0) for r in new)
-                        if not _write_named("history", json.dumps({"items": new[-25:]}, default=str)):
-                            stop.set()
-                            return
-                except Exception:  # noqa: BLE001
-                    pass
-                stop.wait(2.0)
-
-        def _pump_compare():
-            while not stop.is_set():
-                try:
-                    payload = _api_tool_compare()
-                    if not _write_named("compare", json.dumps(payload, default=str)):
-                        stop.set()
-                        return
-                except Exception:  # noqa: BLE001
-                    pass
-                stop.wait(5.0)
-
-        def _pump_squeezr():
-            nonlocal squeezr_conn
-            cfg = _cfg_now()
-            if not _service_is_enabled(cfg, "squeezr"):
-                return
-            target = urlsplit(SQUEEZR_URL + "/squeezr/events")
-            cls = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
-            while not stop.is_set():
-                try:
-                    squeezr_conn = cls(target.netloc, timeout=30)
-                    squeezr_conn.request("GET", target.path or "/", headers={"accept": "text/event-stream"})
-                    resp = squeezr_conn.getresponse()
-                    if resp.status != 200:
-                        stop.wait(5.0)
-                        continue
-                    buf = b""
-                    while not stop.is_set():
-                        chunk = resp.read1(4096)
-                        if not chunk:
-                            break
-                        buf += chunk
-                        while b"\n\n" in buf:
-                            frame, buf = buf.split(b"\n\n", 1)
-                            data_lines = [
-                                line[5:].strip().decode("utf-8", errors="replace")
-                                for line in frame.splitlines()
-                                if line.startswith(b"data:")
-                            ]
-                            if data_lines:
-                                data = "\n".join(data_lines)
-                                if not _write_named("squeezr", data):
-                                    stop.set()
-                                    return
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    try:
-                        if squeezr_conn:
-                            squeezr_conn.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                stop.wait(5.0)
-
-        threads = [
-            threading.Thread(target=_pump_summary, daemon=True),
-            threading.Thread(target=_pump_compare, daemon=True),
-            threading.Thread(target=_pump_squeezr, daemon=True),
-        ]
-        for t in threads:
-            t.start()
+        with _HISTORY_LOCK:
+            last_history_ts = max((float(r.get("ts") or 0.0) for r in _HISTORY), default=0.0)
+        next_summary = next_compare = next_ping = 0.0
         try:
-            while not stop.is_set():
-                try:
-                    if not _write_ping():
-                        raise RuntimeError("sse ping failed")
-                except Exception:
-                    stop.set()
-                    return
-                stop.wait(15.0)
+            while True:
+                now = time.monotonic()
+                if now >= next_summary:
+                    summary = _event_payload_cached(
+                        f"summary:{window}",
+                        1.5,
+                        lambda: _api_metrics_summary({"window": [window]}),
+                    )
+                    if not self._sse_write_named("summary", json.dumps(summary, default=str)):
+                        return
+                    with _HISTORY_LOCK:
+                        new = [r for r in _HISTORY if float(r.get("ts") or 0.0) > last_history_ts]
+                    if new:
+                        last_history_ts = max(float(r.get("ts") or 0.0) for r in new)
+                        if not self._sse_write_named("history", json.dumps({"items": new[-25:]}, default=str)):
+                            return
+                    next_summary = now + 2.0
+                if now >= next_compare:
+                    compare = _event_payload_cached("compare", 4.5, _api_tool_compare)
+                    if not self._sse_write_named("compare", json.dumps(compare, default=str)):
+                        return
+                    next_compare = now + 5.0
+                if now >= next_ping:
+                    try:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        return
+                    next_ping = now + 15.0
+                wait_for = min(next_summary, next_compare, next_ping) - time.monotonic()
+                time.sleep(max(0.05, min(0.5, wait_for)))
+        except Exception as exc:  # noqa: BLE001
+            log(f"event stream error for {ip}: {exc}")
         finally:
-            stop.set()
+            with _EVENT_STREAMS_LOCK:
+                _EVENT_STREAMS_BY_IP[ip] = max(0, _EVENT_STREAMS_BY_IP[ip] - 1)
 
     def _respond_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
@@ -2169,10 +2324,28 @@ class GatewayHandler(BaseHTTPRequestHandler):
         headers: dict[str, str] = {}
         for key, value in self.headers.items():
             lower = key.lower()
-            if lower in HOP_BY_HOP_HEADERS or lower in {"host", "content-length"}:
+            if lower in HOP_BY_HOP_HEADERS or lower in {"host", "content-length", "accept-encoding"}:
                 continue
+            if lower == "cookie" and DASHBOARD_TOKEN:
+                kept = []
+                for part in value.split(";"):
+                    name, sep, _cookie_value = part.strip().partition("=")
+                    if sep and name == DASHBOARD_COOKIE_NAME:
+                        continue
+                    if part.strip():
+                        kept.append(part.strip())
+                if kept:
+                    headers[key] = "; ".join(kept)
+                continue
+            if lower == "authorization" and DASHBOARD_TOKEN:
+                prefix = "bearer "
+                if value.lower().startswith(prefix):
+                    provided = value[len(prefix):].strip()
+                    if secrets.compare_digest(provided, DASHBOARD_TOKEN):
+                        continue
             headers[key] = value
         headers["Host"] = target.netloc
+        headers["Accept-Encoding"] = "identity"
         headers["X-Apx-Gateway-Target"] = TARGET_URL
         headers["X-Apx-Request-Id"] = request_id
         if session_id:
@@ -2330,12 +2503,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
         first_byte_at: float | None = None
         status = 0
         bytes_out = 0
-        response_chunks: list[bytes] = []
+        response_prefix_chunks: list[bytes] = []
+        response_prefix_size = 0
+        response_tail = bytearray()
+        response_total_captured = 0
         capture_response = self.command == "POST" and body
         conn = conn_cls(target.netloc, timeout=REQUEST_TIMEOUT)
         err_class = ""
         is_stream = False
         response_started = False
+        client_disconnected = False
         try:
             conn.request(self.command, upstream_path, body=body, headers=self._proxy_headers(target, request_id, session_id, body_len=len(body)))
             resp = conn.getresponse()
@@ -2365,8 +2542,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             response_started = True
 
             if self.command != "HEAD":
-                capture_cap = 2 * 1024 * 1024 if is_stream else 512 * 1024
-                capture_size = 0
+                prefix_cap = 128 * 1024 if is_stream else 512 * 1024
+                tail_cap = 512 * 1024 if is_stream else 0
                 while True:
                     chunk = resp.read1(65536) if is_stream else resp.read(8192)
                     if not chunk:
@@ -2377,11 +2554,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         self.wfile.write(chunk)
                         self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError):
+                        client_disconnected = True
                         break
                     bytes_out += len(chunk)
-                    if capture_response and capture_size < capture_cap:
-                        response_chunks.append(chunk)
-                        capture_size += len(chunk)
+                    if capture_response:
+                        response_total_captured += len(chunk)
+                        if response_prefix_size < prefix_cap:
+                            take = chunk[: prefix_cap - response_prefix_size]
+                            response_prefix_chunks.append(take)
+                            response_prefix_size += len(take)
+                        if tail_cap:
+                            response_tail.extend(chunk)
+                            if len(response_tail) > tail_cap:
+                                del response_tail[: len(response_tail) - tail_cap]
 
             elapsed_ms = (time.time() - started) * 1000
             first_byte_ms = ((first_byte_at - started) * 1000) if first_byte_at else 0.0
@@ -2389,27 +2574,33 @@ class GatewayHandler(BaseHTTPRequestHandler):
             tokens_in = tokens_out = cache_read = cache_write = tool_calls = 0
             cap_resp_body: str | None = None
             if capture_response and 200 <= status < 300:
-                joined = b"".join(response_chunks)
+                prefix = b"".join(response_prefix_chunks)
                 if is_stream:
-                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_sse(joined)
+                    tail = bytes(response_tail)
+                    overlap = max(0, len(prefix) + len(tail) - response_total_captured)
+                    usage_bytes = prefix + (b"\n" if prefix and tail else b"") + tail[overlap:]
+                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_sse(usage_bytes)
                 elif "application/json" in content_type:
-                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_json(joined)
+                    tokens_in, tokens_out, cache_read, cache_write, tool_calls = self._extract_tokens_from_json(prefix)
                 if CAPTURE_LEVEL == "full":
-                    cap_resp_body = _capture_body(joined, content_type)
+                    cap_resp_body = _capture_body(prefix, content_type)
 
-            if status >= 500:
+            if client_disconnected:
+                err_class = "client_disconnected"
+            elif status >= 500:
                 err_class = "upstream_5xx"
             elif status >= 400:
                 err_class = "upstream_4xx"
 
+            recorded_status = 499 if client_disconnected else resp.status
             log(
-                f"{self.command} {safe_path} -> {resp.status} via {TARGET_URL} "
+                f"{self.command} {safe_path} -> {recorded_status} via {TARGET_URL} "
                 f"({int(elapsed_ms)}ms) req_id={request_id} session={session_id}"
             )
             _record_request(
                 self.command,
                 safe_path,
-                resp.status,
+                recorded_status,
                 elapsed_ms,
                 TARGET_URL,
                 request_id=request_id,
@@ -2503,14 +2694,14 @@ def main() -> int:
 
     httpd = ApxHTTPServer((BIND_HOST, PORT), GatewayHandler)
     httpd.daemon_threads = True
+    shutdown_started = threading.Event()
 
     def _shutdown(_signum, _frame) -> None:
+        if shutdown_started.is_set():
+            return
+        shutdown_started.set()
         log("shutting down")
-        try:
-            METRICS.close()
-        except Exception:  # noqa: BLE001
-            pass
-        httpd.shutdown()
+        threading.Thread(target=httpd.shutdown, name="apx-http-shutdown", daemon=True).start()
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
@@ -2537,7 +2728,17 @@ def main() -> int:
         f" metrics_db={'on' if METRICS.enabled else 'off'},"
         f" history_persist={'on' if HISTORY_PERSIST else 'off'})"
     )
-    httpd.serve_forever()
+    try:
+        httpd.serve_forever()
+    finally:
+        httpd.server_close()
+        METRICS.close()
+        with _HISTORY_FH_LOCK:
+            if _HISTORY_FH is not None:
+                try:
+                    _HISTORY_FH.close()
+                except Exception:  # noqa: BLE001
+                    pass
     return 0
 
 

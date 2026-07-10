@@ -6,10 +6,48 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Cross-platform service backends: launchd on macOS, systemd-user on Linux when
+  available, portable nohup fallback, and foreground `apx run` for containers.
+- Linux dependency adapters for apt, dnf, and pacman, with Debian/Ubuntu as the
+  primary CI-tested installation path.
+- Explicit Claude endpoint configuration through `apx claude set
+  local|docker-host|<url>`.
+- Checked-in same-container devcontainer example and a dedicated Linux/container
+  topology guide.
+
 ### Changed
 
 - Project branding is **LeanRelay**; `apx` remains the installed CLI and command
   name (`apx-gateway`, `apx-squeezr` unchanged).
+- Tool dashboards now load lazily from their native ports instead of executing
+  unsandboxed third-party UI code under the sensitive apx dashboard origin.
+- Dashboard SSE uses a bounded, single-loop stream with shared payload caching
+  rather than spawning three polling threads per browser connection.
+- Metrics backfill is resumable, batched, retention-aware, and idempotent;
+  dashboard reads use separate read-only SQLite connections.
+- README now documents the project's purpose, use cases, benefits, architecture,
+  platform scope, upstream project credits, limitations, privacy model, and disclaimer.
+
+### Fixed
+
+- Reserved unknown `/api/*` routes now return local `404` responses instead of
+  falling through to the LLM upstream with dashboard credentials.
+- Dashboard host/origin checks, authenticated `/metrics`, clean token-login
+  redirects, and decoded query redaction close DNS-rebinding/credential leaks.
+- One-hour KPI polling and SSE now use the same window; recent requests are
+  deduplicated across SSE reconnects.
+- Client disconnects are recorded as `499`, signal shutdown no longer deadlocks,
+  and log streams follow file rotation/truncation.
+- Large SSE responses retain usage from both the beginning and end without
+  buffering the whole response; upstream encoding is forced to identity.
+- Timeseries include empty buckets, session mode/model use the newest request,
+  and captured bodies are joined by database row ID.
+- Metrics/history storage now enforces `0700` directories and `0600` files;
+  JSONL retention follows SQLite retention and WAL is checkpointed after prune.
+- Dashboard sessions, logs, tables, tabs, and charts now handle keyboard use,
+  mobile overflow, loading/errors, no-data, and unavailable services correctly.
 
 ## [0.4.0] - 2026-07-09
 

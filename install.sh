@@ -26,6 +26,10 @@ STACK_VERSION="$( [ -f "$SRC_VERSION_FILE" ] && head -n 1 "$SRC_VERSION_FILE" | 
 
 YES=0
 NO_START=0
+SERVICE_BACKEND="${APX_SERVICE_BACKEND:-auto}"
+PACKAGE_MANAGER="${APX_PACKAGE_MANAGER:-auto}"
+CLIENT_TOPOLOGY="${APX_CLIENT_TOPOLOGY:-none}"
+CLIENT_BASE_URL="${APX_CLIENT_BASE_URL:-}"
 SKIP_DEPS=0
 CHECK_ONLY=0
 UNINSTALL=0
@@ -46,7 +50,11 @@ Usage: ./install.sh [options]
 
 Options:
   --yes          Run non-interactively and install safe missing dependencies
-  --no-start     Sync runtime files but do not install/start the LaunchAgent
+  --no-service   Sync runtime files but do not install/start a service
+  --no-start     Backward-compatible alias for --no-service
+  --service-backend=auto|launchd|systemd|nohup
+  --client-topology=local|docker-host|custom|none
+  --client-base-url=<url>  URL used with custom topology
   --skip-deps    Skip dependency installation
   --check-only   Print checks/actions without changing anything
   --uninstall    Delegate to 'apx uninstall' when available (service-only).
@@ -62,7 +70,7 @@ Options:
 This package keeps source files in:
   $STACK_ROOT (version $STACK_VERSION)
 
-The macOS LaunchAgent runs from launchd-safe runtime paths:
+The apx service runs from user-writable runtime paths:
   $RUNTIME_BIN
   $RUNTIME_CONFIG
   $RUNTIME_STATE
@@ -72,7 +80,13 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --yes) YES=1 ;;
-    --no-start) NO_START=1 ;;
+    --no-service|--no-start) NO_START=1 ;;
+    --service-backend) shift; SERVICE_BACKEND="${1:-}" ;;
+    --service-backend=*) SERVICE_BACKEND="${1#*=}" ;;
+    --client-topology) shift; CLIENT_TOPOLOGY="${1:-}" ;;
+    --client-topology=*) CLIENT_TOPOLOGY="${1#*=}" ;;
+    --client-base-url) shift; CLIENT_BASE_URL="${1:-}" ;;
+    --client-base-url=*) CLIENT_BASE_URL="${1#*=}" ;;
     --skip-deps) SKIP_DEPS=1 ;;
     --check-only) CHECK_ONLY=1 ;;
     --uninstall) UNINSTALL=1 ;;
@@ -83,6 +97,14 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+case "$SERVICE_BACKEND" in auto|launchd|systemd|nohup) ;; *) echo "invalid --service-backend: $SERVICE_BACKEND" >&2; exit 2 ;; esac
+case "$PACKAGE_MANAGER" in auto|apt|dnf|pacman) ;; *) echo "invalid APX_PACKAGE_MANAGER: $PACKAGE_MANAGER" >&2; exit 2 ;; esac
+case "$CLIENT_TOPOLOGY" in local|docker-host|custom|none) ;; *) echo "invalid client topology: $CLIENT_TOPOLOGY" >&2; exit 2 ;; esac
+if [[ "$CLIENT_TOPOLOGY" == "custom" && "$CLIENT_BASE_URL" != http://* && "$CLIENT_BASE_URL" != https://* ]]; then
+  echo "--client-base-url=http(s)://... is required for custom topology" >&2
+  exit 2
+fi
 
 log() { printf '[apx] %s\n' "$*"; }
 warn() { printf '[apx] warning: %s\n' "$*" >&2; }
@@ -120,20 +142,11 @@ confirm() {
   [[ "$answer" == "y" || "$answer" == "Y" || "$answer" == "yes" || "$answer" == "YES" ]]
 }
 
-require_macos() {
-  # macOS is only strictly required when we actually manage the LaunchAgent.
-  # Release-mode installs (apx.sh) on Linux skip service management (they set
-  # --no-start) so binaries, config, and dashboard still sync correctly; the
-  # user just doesn't get a supervisor. CI relies on this for its Linux smoke
-  # test. Users can bypass explicitly with APX_SKIP_MACOS_GATE=1.
-  if [[ "$(uname -s)" == "Darwin" ]]; then
-    return 0
-  fi
-  if [[ "$NO_START" == "1" ]] || [[ "${APX_SKIP_MACOS_GATE:-0}" == "1" ]]; then
-    warn "not running on macOS; LaunchAgent management is disabled (Linux best-effort)"
-    return 0
-  fi
-  die "this installer currently supports macOS LaunchAgents only. Pass --no-start to sync files without launchd."
+require_supported_os() {
+  case "$(uname -s)" in
+    Darwin|Linux) ;;
+    *) die "unsupported operating system: $(uname -s)" ;;
+  esac
 }
 
 require_sources() {
@@ -143,24 +156,33 @@ require_sources() {
   [[ -f "$SRC_CONFIG" ]] || die "missing source config: $SRC_CONFIG"
 }
 
-require_brew_for_deps() {
-  if have brew; then
-    return 0
-  fi
+run_as_root() {
+  if [[ "$(id -u)" == "0" ]]; then "$@"; elif have sudo; then sudo "$@"; else die "root privileges are required: $*"; fi
+}
 
-  cat >&2 <<'EOF'
-Homebrew is required to auto-install safe dependencies, but it is not installed.
-
-Install Homebrew first:
-  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-
-Then rerun:
-  ./install.sh --yes
-
-Or skip dependency installation:
-  ./install.sh --skip-deps
-EOF
-  exit 1
+install_platform_prereqs() {
+  case "$(uname -s)" in
+    Darwin)
+      have brew || die "Homebrew is required for automatic dependencies; install it or pass --skip-deps"
+      run_step "install macOS prerequisites" brew install pipx node
+      ;;
+    Linux)
+      local manager="$PACKAGE_MANAGER"
+      if [[ "$manager" == "auto" ]]; then
+        if have apt-get; then manager=apt; elif have dnf; then manager=dnf; elif have pacman; then manager=pacman; else manager=none; fi
+      fi
+      if [[ "$manager" == "apt" ]]; then
+        run_step "refresh apt metadata" run_as_root apt-get update
+        run_step "install Debian/Ubuntu prerequisites" run_as_root apt-get install -y git curl ca-certificates python3 python3-pip pipx nodejs npm lsof procps
+      elif [[ "$manager" == "dnf" ]]; then
+        run_step "install Fedora/RHEL prerequisites" run_as_root dnf install -y git curl ca-certificates python3 python3-pip pipx nodejs npm lsof procps-ng
+      elif [[ "$manager" == "pacman" ]]; then
+        run_step "install Arch prerequisites" run_as_root pacman -Sy --needed --noconfirm git curl ca-certificates python python-pip python-pipx nodejs npm lsof procps-ng
+      else
+        die "no supported package manager found (expected apt-get, dnf, or pacman); install git curl python3 pipx node npm lsof procps, or pass --skip-deps"
+      fi
+      ;;
+  esac
 }
 
 install_if_missing() {
@@ -234,14 +256,17 @@ install_deps() {
     return 0
   fi
 
-  require_brew_for_deps
+  if [[ "${APX_FORCE_INSTALL_PREREQS:-0}" == "1" ]] || ! have pipx || ! have node || ! have npm || ! have npx || ! have curl; then
+    install_platform_prereqs
+    [[ "$CHECK_ONLY" == "1" ]] && return 0
+  fi
   manifest_set APX_INSTALL_MANIFEST_VERSION 1
 
-  install_if_missing pipx "pipx" brew install pipx
+  have pipx || die "pipx is required after prerequisite installation"
   export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
   if ! have node || ! have npm || ! have npx; then
-    run_step "install Node.js/npm/npx" brew install node
+    install_platform_prereqs
   else
     log "Node.js/npm/npx already available"
   fi
@@ -273,7 +298,11 @@ install_deps() {
 
   if have headroom; then
     run_step "install Headroom helper tools" headroom tools install --tool difft --tool scc
-    manifest_set HEADROOM_TOOLS_CACHE_DIR "$HOME/Library/Caches/headroom/bin"
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      manifest_set HEADROOM_TOOLS_CACHE_DIR "$HOME/Library/Caches/headroom/bin"
+    else
+      manifest_set HEADROOM_TOOLS_CACHE_DIR "${XDG_CACHE_HOME:-$HOME/.cache}/headroom/bin"
+    fi
   else
     warn "headroom command is not on PATH yet; restart your shell or rerun after pipx ensurepath"
   fi
@@ -412,6 +441,20 @@ sync_runtime() {
   sync_config
 }
 
+configure_claude_client() {
+  if [[ "$CLIENT_TOPOLOGY" == "none" ]]; then
+    if [[ "$YES" == "1" || ! -t 0 ]]; then
+      log "Claude client topology not configured; run 'apx claude configure' or 'apx claude set ...'"
+      return 0
+    fi
+    run_step "configure Claude client topology" env APX_CONFIG="$RUNTIME_CONFIG" APX_STATE="$RUNTIME_STATE" "$RUNTIME_BIN" claude configure
+    return
+  fi
+  local value="$CLIENT_TOPOLOGY"
+  [[ "$CLIENT_TOPOLOGY" == "custom" ]] && value="$CLIENT_BASE_URL"
+  run_step "configure Claude client topology ($CLIENT_TOPOLOGY)" env APX_CONFIG="$RUNTIME_CONFIG" APX_STATE="$RUNTIME_STATE" "$RUNTIME_BIN" claude set "$value"
+}
+
 print_urls() {
   local bind_host="127.0.0.1"
   local gateway_port="8787"
@@ -486,11 +529,11 @@ validate_health() {
 
 install_service() {
   if [[ "$NO_START" == "1" ]]; then
-    log "skipping LaunchAgent install/start because --no-start was set"
+    log "skipping service install/start because --no-service was set"
     return 0
   fi
   local agent_root="${RUNTIME_APX_ROOT:-$STACK_ROOT}"
-  run_step "install/start LaunchAgent" env APX_ROOT="$agent_root" "$RUNTIME_BIN" install
+  run_step "install/start apx service" env APX_ROOT="$agent_root" APX_SERVICE_BACKEND="$SERVICE_BACKEND" "$RUNTIME_BIN" install
 }
 
 uninstall() {
@@ -510,7 +553,7 @@ uninstall() {
 }
 
 main() {
-  require_macos
+  require_supported_os
   require_sources
 
   log "apx installer version $STACK_VERSION"
@@ -528,6 +571,7 @@ main() {
 
   install_deps
   sync_runtime
+  configure_claude_client
   install_service
   validate_health
   print_urls
