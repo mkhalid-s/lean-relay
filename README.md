@@ -1,6 +1,9 @@
-# apx
+# LeanRelay
 
-A local macOS proxy stack for Claude Code with a stable gateway, switchable routing modes, and a unified dashboard.
+**Local context-efficiency platform for AI agents — operated through the `apx` CLI.**
+
+LeanRelay is a local macOS proxy stack for Claude Code with a stable gateway,
+switchable routing modes, and a unified dashboard.
 
 ```text
 Claude Code -> apx Gateway :8787 -> Headroom / pxpipe / Squeezr / Anthropic
@@ -8,11 +11,14 @@ Claude Code -> apx Gateway :8787 -> Headroom / pxpipe / Squeezr / Anthropic
 
 Claude Code always talks to the Gateway. You can switch modes without changing Claude's base URL.
 
-> The CLI, gateway, and squeezr helper are named `apx`, `apx-gateway`, and `apx-squeezr`. No legacy `ai-proxy-stack*` shims are installed.
+> **LeanRelay** is the project name. The CLI, gateway, and Squeezr helper are
+> `apx`, `apx-gateway`, and `apx-squeezr`. No legacy `ai-proxy-stack*` shims are
+> installed.
 
 ## Quick Install
 
-apx ships two install modes. Pick whichever matches how you work.
+LeanRelay ships as a self-contained `apx` release. Pick whichever install path
+matches how you work.
 
 ### Release mode (single-file installer, no git required)
 
@@ -419,7 +425,7 @@ apx logs headroom.proxy
 
 ## Open Source Notes
 
-This project is licensed under MIT. See `LICENSE`.
+This project is **LeanRelay**, licensed under MIT. See `LICENSE`.
 
 Third-party tools are not vendored. The installer may install or invoke Homebrew, pipx, Node.js/npm/npx, `headroom-ai`, `ast-grep-cli`, `pxpipe-proxy`, `squeezr-ai`, `difft`, and `scc`; their licenses and terms apply. See `NOTICE`.
 

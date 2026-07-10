@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # apx-version: @@VERSION@@
 #
-# Self-extracting installer for apx.
+# Self-extracting installer for LeanRelay (apx).
 #
 # Layout after install:
 #   ~/.local/share/apx/versions/vX.Y.Z/    extracted payload
@@ -27,7 +27,7 @@ die()  { printf '[apx:installer] error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-apx installer (embedded version: $APX_EMBEDDED_VERSION)
+apx installer for LeanRelay (embedded version: $APX_EMBEDDED_VERSION)
 
 Usage: bash apx.sh [options]
 

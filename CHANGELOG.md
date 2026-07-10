@@ -1,10 +1,15 @@
 # Changelog
 
-All notable changes to apx are documented here. The format follows
+All notable changes to LeanRelay (`apx`) are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Changed
+
+- Project branding is **LeanRelay**; `apx` remains the installed CLI and command
+  name (`apx-gateway`, `apx-squeezr` unchanged).
 
 ## [0.4.0] - 2026-07-09
 

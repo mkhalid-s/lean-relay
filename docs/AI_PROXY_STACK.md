@@ -1,8 +1,14 @@
-# apx
+# LeanRelay
 
-`apx` (formerly `ai-proxy-stack`) packages a local, switchable proxy stack for Claude Code. It provides one stable Gateway URL for Claude and routes traffic through Headroom, pxpipe, Squeezr, or directly to Anthropic depending on the selected mode. The gateway also serves a unified dashboard that aggregates health, request history, Headroom stats, and log tails from every component.
+**LeanRelay** is the project name for this local context-efficiency platform. The
+`apx` CLI (formerly packaged as `ai-proxy-stack`) provides one stable Gateway
+URL for Claude Code and routes traffic through Headroom, pxpipe, Squeezr, or
+directly to Anthropic depending on the selected mode. The gateway also serves a
+unified dashboard that aggregates health, request history, Headroom stats, and
+log tails from every component.
 
-> **Renamed:** the CLI is `apx`, the gateway binary is `apx-gateway`, and the Squeezr helper is `apx-squeezr`. The old `ai-proxy-stack*` binary names remain installed as deprecation shims that forward to the new commands.
+> **Commands:** `apx` (CLI), `apx-gateway` (gateway), `apx-squeezr` (Squeezr
+> helper). Legacy `ai-proxy-stack*` shims are not installed.
 
 ## Architecture
 
