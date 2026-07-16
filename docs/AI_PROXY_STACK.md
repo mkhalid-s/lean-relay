@@ -1,6 +1,6 @@
 # LeanRelay
 
-**Local context-efficiency platform for AI agents — operated through the `apx` CLI.**
+**Local context-efficiency platform for LLMs — operated through the `apx` CLI.**
 
 **LeanRelay** is the project name for this local context-efficiency platform. The
 `apx` CLI (formerly packaged as `ai-proxy-stack`) provides one stable Gateway
@@ -602,3 +602,9 @@ The project is MIT licensed. See `../LICENSE`.
 Third-party tools are not vendored. The installer may install or invoke external tools, including Homebrew, pipx, Node.js/npm/npx, `headroom-ai`, `ast-grep-cli`, `pxpipe-proxy`, `difft`, and `scc`. Their own licenses, terms, and network behavior apply. See `../NOTICE`.
 
 Runtime logs, PID files, provider event logs, and request/response data can contain sensitive metadata. They are ignored by `.gitignore` and should not be published.
+
+Capability and performance claims for Headroom, pxpipe, and Squeezr belong to
+their respective maintainers — verify them against each upstream repo/docs
+rather than this file. `PXPIPE_MODELS` defaults (`config/config.env`) are
+maintained by this repo, not by Anthropic; check Anthropic's current model
+list before relying on any model identifier configured here.

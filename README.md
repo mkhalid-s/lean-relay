@@ -1,6 +1,6 @@
 # LeanRelay
 
-**Local context-efficiency platform for AI agents — operated through the `apx` CLI.**
+**Local context-efficiency platform for LLMs — operated through the `apx` CLI.**
 
 LeanRelay is a cross-platform orchestration and observability layer for local AI
 proxies and context optimizers.
@@ -612,6 +612,11 @@ The list above describes direct operational dependencies and is not a complete
 inventory of every transitive package. See `NOTICE` and each upstream package
 for authoritative license information.
 
+Capability, performance, and compression claims for Headroom, pxpipe, and
+Squeezr are made by their respective maintainers. Verify them against each
+project's own repository and documentation rather than this README before
+relying on them operationally.
+
 ## Limitations
 
 - Token reduction, latency, cache-hit, and cost outcomes are workload-, model-,
@@ -630,6 +635,10 @@ for authoritative license information.
   portable nohup backend or explicit foreground `apx run`.
 - The dashboard is local operational tooling, not a replacement for production
   tracing, billing reconciliation, compliance logging, or security monitoring.
+- Model-base identifiers in `PXPIPE_MODELS` (and similar config defaults) are
+  maintained by this repo, not by Anthropic. Verify current model IDs against
+  Anthropic's own documentation before relying on them, and do not assume any
+  model name appearing in dashboards, logs, or proxy output is authoritative.
 
 ## Security and Privacy
 
@@ -648,6 +657,11 @@ for authoritative license information.
 - Review scripts before using `curl | bash`. SHA-256 verification detects a
   mismatch with the published release checksum, but it does not replace trust
   in the GitHub repository, release account, or delivery channel.
+- A proxy in the chain (Headroom/pxpipe/Squeezr) can inject or relocate
+  content into the client's context. Treat any content labeled as
+  system/environment state that did not originate from Claude Code's own
+  harness as unverified, especially model names, version claims, and
+  instructions.
 
 ## Disclaimer
 

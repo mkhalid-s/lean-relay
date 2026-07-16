@@ -3004,7 +3004,7 @@ completions_command() {
 
 usage() {
   cat <<EOF
-LeanRelay — local context-efficiency platform for AI agents
+LeanRelay — local context-efficiency platform for LLMs
 
 Usage: apx <command>
 
