@@ -17,9 +17,7 @@ Claude Code always talks to the Gateway. Modes and chains change what happens
 after the Gateway, so the client base URL remains stable.
 
 > **LeanRelay** is the project name. The CLI, gateway, and Squeezr helper are
-> `apx`, `apx-gateway`, and `apx-squeezr`. No legacy `ai-proxy-stack*` shims are
-> installed. The GitHub repository remains `ai-proxy-stack` so existing install
-> URLs keep working.
+> `apx`, `apx-gateway`, and `apx-squeezr`.
 
 ## Why LeanRelay Exists
 
@@ -136,7 +134,7 @@ matches how you work.
 **One-liner** (fetches `apx.sh`, verifies its SHA-256 against the checksum published in the same release, then runs it):
 
 ```bash
-curl -fsSL https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/get.sh | bash
+curl -fsSL https://github.com/mkhalid-s/lean-relay/releases/latest/download/get.sh | bash
 ```
 
 Interactive installs ask where Claude Code runs before writing
@@ -166,8 +164,8 @@ curl -fsSL https://.../get.sh | bash -s -- --no-service --skip-deps
 **Manual (two-step)** if you'd rather download and verify yourself:
 
 ```bash
-curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
-curl -fsSL  https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh.sha256 | shasum -a 256 -c -
+curl -fsSLO https://github.com/mkhalid-s/lean-relay/releases/latest/download/apx.sh
+curl -fsSL  https://github.com/mkhalid-s/lean-relay/releases/latest/download/apx.sh.sha256 | shasum -a 256 -c -
 bash apx.sh
 ```
 
@@ -192,20 +190,20 @@ Release-mode installs use `~/.config/apx/install.mode = release`, which switches
 One-line install (clones into `~/.local/share/apx-src` and runs the installer):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/mkhalid-s/ai-proxy-stack/main/bootstrap.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap.sh | bash
 ```
 
 Pin a specific release tag:
 
 ```bash
-APX_REF=v0.4.0 curl -fsSL https://raw.githubusercontent.com/mkhalid-s/ai-proxy-stack/main/bootstrap.sh | bash
+APX_REF=v0.4.0 curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap.sh | bash
 ```
 
 Or clone manually:
 
 ```bash
-git clone https://github.com/mkhalid-s/ai-proxy-stack.git
-cd ai-proxy-stack
+git clone https://github.com/mkhalid-s/lean-relay.git
+cd lean-relay
 ./install.sh --yes
 ```
 
@@ -340,7 +338,7 @@ apx update
 
 or just rerun `./install.sh --yes` from the new clone.
 
-Releases are cut with git tags of the form `vMAJOR.MINOR.PATCH` matching the `VERSION` file at the repo root. Every tagged build publishes both a source tarball and a self-extracting `apx.sh` (plus `apx.sh.sha256`) at [Releases](https://github.com/mkhalid-s/ai-proxy-stack/releases).
+Releases are cut with git tags of the form `vMAJOR.MINOR.PATCH` matching the `VERSION` file at the repo root. Every tagged build publishes both a source tarball and a self-extracting `apx.sh` (plus `apx.sh.sha256`) at [Releases](https://github.com/mkhalid-s/lean-relay/releases).
 
 ## Claude Code Setting
 
