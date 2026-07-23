@@ -255,7 +255,7 @@ start_gateway() {
     export APX_CHAIN="${APX_CHAIN:-}"
     export APX_STATE_DIR="$STATE_DIR" APX_LOG_DIR="$LOG_DIR" APX_CONFIG="$CONFIG_FILE"
     export APX_HEADROOM_URL="http://$BIND_HOST:$HEADROOM_PORT" APX_PXPIPE_URL="http://$BIND_HOST:$PXPIPE_PORT" APX_SQUEEZR_URL="http://$BIND_HOST:$SQUEEZR_PORT"
-    exec bash -lc "exec $GATEWAY_CMD"
+    exec bash -lc "export PATH=\"$PATH\"; exec $GATEWAY_CMD"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/gateway.pid"
   wait_until_ok Gateway gateway_ok
@@ -288,7 +288,7 @@ start_squeezr() {
     export SQUEEZR_PORT="$SQUEEZR_PORT" SQUEEZR_MITM_PORT="$SQUEEZR_MITM_PORT" SQUEEZR_DAEMON=1
     export SQUEEZR_TARGET_API_URL
     export ANTHROPIC_UPSTREAM="$SQUEEZR_TARGET_API_URL" ANTHROPIC_BASE_URL="$SQUEEZR_TARGET_API_URL"
-    exec bash -lc "exec $SQUEEZR_CMD $SQUEEZR_EXTRA_ARGS"
+    exec bash -lc "export PATH=\"$PATH\"; exec $SQUEEZR_CMD $SQUEEZR_EXTRA_ARGS"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/squeezr.pid"
   wait_until_ok Squeezr squeezr_ok
@@ -319,7 +319,7 @@ start_pxpipe() {
     cd "$WORKDIR"
     export_ca_bundle
     export PORT="$PXPIPE_PORT" PXPIPE_PORT="$PXPIPE_PORT" HOST="$BIND_HOST" PXPIPE_MODELS="$PXPIPE_MODELS" ANTHROPIC_UPSTREAM="$PXPIPE_TARGET_API_URL"
-    exec bash -lc "exec $PXPIPE_CMD $PXPIPE_EXTRA_ARGS"
+    exec bash -lc "export PATH=\"$PATH\"; exec $PXPIPE_CMD $PXPIPE_EXTRA_ARGS"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/pxpipe.pid"
   wait_until_ok pxpipe pxpipe_ok
@@ -363,7 +363,7 @@ start_headroom() {
     export ENABLE_TOOL_SEARCH="$HEADROOM_ENABLE_TOOL_SEARCH"
     export HEADROOM_CODE_AWARE_ENABLED="$HEADROOM_CODE_AWARE_ENABLED"
     export HEADROOM_TLS_STRICT="$HEADROOM_TLS_STRICT"
-    exec bash -lc "exec $HEADROOM_CMD $(headroom_args)"
+    exec bash -lc "export PATH=\"$PATH\"; exec $HEADROOM_CMD $(headroom_args)"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/headroom.pid"
   wait_until_ok Headroom headroom_ok
