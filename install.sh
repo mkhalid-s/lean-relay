@@ -109,7 +109,12 @@ fi
 log() { printf '[apx] %s\n' "$*"; }
 warn() { printf '[apx] warning: %s\n' "$*" >&2; }
 die() { printf '[apx] error: %s\n' "$*" >&2; exit 1; }
-have() { command -v "$1" >/dev/null 2>&1; }
+have() {
+  if [[ "$1" == "npx" && "${APX_TEST_NO_NPX:-0}" == "1" ]]; then
+    return 1
+  fi
+  command -v "$1" >/dev/null 2>&1
+}
 urls_ok() {
   local url
   for url in "$@"; do
@@ -256,20 +261,16 @@ install_deps() {
     return 0
   fi
 
-  if [[ "${APX_FORCE_INSTALL_PREREQS:-0}" == "1" ]] || ! have pipx || ! have node || ! have npm || ! have npx || ! have curl; then
+  export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+  if [[ "${APX_FORCE_INSTALL_PREREQS:-0}" == "1" ]] || ! have pipx || ! have node || ! have npm || ! have curl; then
     install_platform_prereqs
     [[ "$CHECK_ONLY" == "1" ]] && return 0
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
   fi
   manifest_set APX_INSTALL_MANIFEST_VERSION 1
 
   have pipx || die "pipx is required after prerequisite installation"
-  export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-
-  if ! have node || ! have npm || ! have npx; then
-    install_platform_prereqs
-  else
-    log "Node.js/npm/npx already available"
-  fi
 
   local headroom_preexisting=0
   if have headroom || pipx_has_package headroom-ai; then
@@ -439,6 +440,17 @@ sync_runtime() {
   fi
 
   sync_config
+
+  if [[ "$CHECK_ONLY" != "1" && -f "$RUNTIME_CONFIG" ]]; then
+    local tmp_cfg
+    tmp_cfg="$(mktemp)"
+    if have npx; then
+      sed 's|^PXPIPE_CMD=.*|PXPIPE_CMD="npx -y pxpipe-proxy@0.8.0"|' "$RUNTIME_CONFIG" > "$tmp_cfg" && mv "$tmp_cfg" "$RUNTIME_CONFIG"
+    else
+      # Use npm exec as a fallback (npm is guaranteed by install_deps)
+      sed 's|^PXPIPE_CMD=.*|PXPIPE_CMD="npm exec --yes pxpipe-proxy@0.8.0"|' "$RUNTIME_CONFIG" > "$tmp_cfg" && mv "$tmp_cfg" "$RUNTIME_CONFIG"
+    fi
+  fi
 }
 
 configure_claude_client() {
