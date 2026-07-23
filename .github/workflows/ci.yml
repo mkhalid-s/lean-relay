@@ -267,10 +267,15 @@ jobs:
                       raise AssertionError("unauthorized proxy POST unexpectedly succeeded")
                   except urllib.error.HTTPError as e:
                       assert e.code == 401, e
-                  opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
-                  with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/?token=secret-token", timeout=5) as r:
+                  cookie_processor = urllib.request.HTTPCookieProcessor()
+                  class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+                      def http_error_303(self, req, fp, code, msg, headers):
+                          return fp
+                  opener_no_redirect = urllib.request.build_opener(NoRedirectHandler, cookie_processor)
+                  with opener_no_redirect.open(f"http://127.0.0.1:{GATEWAY_PORT}/?token=secret-token", timeout=5) as r:
                       assert "apx_dashboard_token" in r.headers.get("set-cookie", "")
                       r.read()
+                  opener = urllib.request.build_opener(cookie_processor)
                   with opener.open(f"http://127.0.0.1:{GATEWAY_PORT}/api/capture", timeout=5) as r:
                       assert r.status == 200
                       r.read()
@@ -609,6 +614,9 @@ jobs:
 
       - name: Cross-platform lifecycle backend smoke
         run: bash tests/lifecycle.sh
+        env:
+          # Clear FAKE_HOME to avoid conflicts with lifecycle.sh's own temp dir
+          FAKE_HOME: ""
 
       - name: Pack apx.sh
         run: bash build/pack.sh

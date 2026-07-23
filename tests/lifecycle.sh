@@ -13,12 +13,17 @@ PORT="${APX_TEST_PORT:-18787}"
 cat > "$HOME/bin/fake-gateway" <<'PYGW'
 #!/usr/bin/env python3
 import os
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+try:
+    port = int(os.environ.get('GATEWAY_PORT', sys.argv[1] if len(sys.argv) > 1 else 18787))
+except (ValueError, IndexError):
+    port = 18787
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
     def log_message(self, *_): pass
-ThreadingHTTPServer(('127.0.0.1', int(os.environ['GATEWAY_PORT'])), H).serve_forever()
+ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
 PYGW
 chmod +x "$HOME/bin/fake-gateway"
 cat > "$HOME/.config/apx/config.env" <<EOF
@@ -44,7 +49,12 @@ export PATH="$HOME/bin:$PATH"
 "$APX" start >/dev/null
 curl -fsS "http://127.0.0.1:$PORT/livez" >/dev/null
 second="$("$APX" start 2>&1)"
-[[ "$second" == *"already running"* ]]
+# Check for either "already running" or "error: supervisor already running" message
+# Allow for different error message formats across versions
+if [[ "$second" != *"already running"* ]] && [[ "$second" != *"error: supervisor already running"* ]] && [[ "$second" != *"already running: supervisor pid"* ]]; then
+  echo "ERROR: Expected 'already running' message, got: $second" >&2
+  exit 1
+fi
 "$APX" stop >/dev/null
 ! curl -fsS "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1
 
