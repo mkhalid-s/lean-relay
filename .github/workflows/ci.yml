@@ -613,10 +613,9 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Cross-platform lifecycle backend smoke
-        run: bash tests/lifecycle.sh
-        env:
-          # Clear FAKE_HOME to avoid conflicts with lifecycle.sh's own temp dir
-          FAKE_HOME: ""
+        # lifecycle.sh creates its own temp HOME and unsets XDG_* so runner
+        # env (FAKE_HOME / XDG_CONFIG_HOME) cannot redirect unit paths.
+        run: unset FAKE_HOME; bash tests/lifecycle.sh
 
       - name: Pack apx.sh
         run: bash build/pack.sh

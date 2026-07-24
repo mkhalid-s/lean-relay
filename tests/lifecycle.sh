@@ -5,27 +5,62 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APX="$ROOT/bin/apx"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/apx-lifecycle.XXXXXX")"
 trap 'pkill -P $$ 2>/dev/null || true; rm -rf "$TMP"' EXIT
+
+# Isolate from runner XDG_* so unit/plist paths stay under the fake HOME.
+# Otherwise SYSTEMD_USER_DIR follows XDG_CONFIG_HOME (e.g. /home/runner/.config)
+# and assertions on $HOME/.config/systemd/... fail in CI.
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_RUNTIME_DIR XDG_CACHE_HOME
+
 HOME="$TMP/home"
 export HOME
 mkdir -p "$HOME/.config/apx" "$HOME/.local/state/apx" "$HOME/bin"
-PORT="${APX_TEST_PORT:-18787}"
+
+PYTHON3="$(command -v python3 || true)"
+if [[ -z "$PYTHON3" ]]; then
+  echo "ERROR: python3 is required for lifecycle tests" >&2
+  exit 1
+fi
+
+# Pick a free port so CI runners don't collide on a fixed 18787.
+PORT="${APX_TEST_PORT:-}"
+if [[ -z "$PORT" ]]; then
+  PORT="$("$PYTHON3" - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+)"
+fi
 
 cat > "$HOME/bin/fake-gateway" <<'PYGW'
-#!/usr/bin/env python3
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
 try:
-    port = int(os.environ.get('GATEWAY_PORT', sys.argv[1] if len(sys.argv) > 1 else 18787))
+    port = int(os.environ.get("GATEWAY_PORT", sys.argv[1] if len(sys.argv) > 1 else 18787))
 except (ValueError, IndexError):
     port = 18787
+
+
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')
-    def log_message(self, *_): pass
-ThreadingHTTPServer(('127.0.0.1', port), H).serve_forever()
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *_):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
 PYGW
-chmod +x "$HOME/bin/fake-gateway"
+
+# Invoke via absolute python3 so bash -lc / shebang PATH differences cannot hide the interpreter.
+GATEWAY_CMD="$PYTHON3 $HOME/bin/fake-gateway"
+
 cat > "$HOME/.config/apx/config.env" <<EOF
 BIND_HOST=127.0.0.1
 GATEWAY_PORT=$PORT
@@ -34,29 +69,56 @@ APX_CHAIN=""
 HEADROOM_ENABLED=0
 PXPIPE_ENABLED=0
 SQUEEZR_ENABLED=0
-GATEWAY_CMD="$HOME/bin/fake-gateway"
+GATEWAY_CMD="$GATEWAY_CMD"
 GATEWAY_TARGET_API_URL="https://api.anthropic.com"
 WORKDIR="$HOME"
 HEALTH_INTERVAL_SECONDS=1
 STARTUP_TIMEOUT_SECONDS=10
 APX_SERVICE_BACKEND=nohup
 EOF
+
 export APX_CONFIG="$HOME/.config/apx/config.env"
 export APX_STATE="$HOME/.local/state/apx"
 export APX_RUN_DIR="$TMP/run"
+# Force nohup via env override so Darwin CI cannot fall through to launchd
+# (plist points at ~/.local/bin/apx, which is not installed in this test).
+export APX_SERVICE_BACKEND=nohup
 export PATH="$HOME/bin:$PATH"
 
+wait_livez() {
+  local i
+  for i in $(seq 1 50); do
+    if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "ERROR: gateway did not become healthy on port $PORT" >&2
+  if [[ -f "$APX_STATE/logs/supervisor.log" ]]; then
+    echo "---- supervisor.log ----" >&2
+    cat "$APX_STATE/logs/supervisor.log" >&2 || true
+  fi
+  if [[ -f "$APX_STATE/logs/gateway.log" ]]; then
+    echo "---- gateway.log ----" >&2
+    cat "$APX_STATE/logs/gateway.log" >&2 || true
+  fi
+  return 1
+}
+
 "$APX" start >/dev/null
-curl -fsS "http://127.0.0.1:$PORT/livez" >/dev/null
+wait_livez
+
 second="$("$APX" start 2>&1)"
-# Check for either "already running" or "error: supervisor already running" message
-# Allow for different error message formats across versions
-if [[ "$second" != *"already running"* ]] && [[ "$second" != *"error: supervisor already running"* ]] && [[ "$second" != *"already running: supervisor pid"* ]]; then
+if [[ "$second" != *"already running"* ]]; then
   echo "ERROR: Expected 'already running' message, got: $second" >&2
   exit 1
 fi
+
 "$APX" stop >/dev/null
-! curl -fsS "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1
+if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
+  echo "ERROR: gateway still healthy after stop" >&2
+  exit 1
+fi
 
 sleep 30 & foreign=$!
 mkdir -p "$APX_RUN_DIR"
@@ -80,6 +142,7 @@ case "${1:-}" in print) exit 1 ;; esac
 exit 0
 SH
 chmod +x "$TMP/stubs/systemctl" "$TMP/stubs/launchctl"
+
 APX_PATH="$TMP/stubs:$PATH" APX_SERVICE_BACKEND=systemd "$APX" install >/dev/null
 [[ -f "$HOME/.config/systemd/user/io.github.apx.service" ]]
 grep -q 'enable --now io.github.apx.service' "$HOME/systemctl.log"
