@@ -6,6 +6,8 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-24
+
 ### Added
 
 - `build/release.sh` automates local release management: version/changelog promotion, validation, release commit, tag creation, optional push, and optional GitHub Actions watch.
