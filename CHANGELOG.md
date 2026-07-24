@@ -6,6 +6,23 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-24
+
+### Added
+
+- `apx port get|set` for changing Gateway, Headroom, pxpipe, Squeezr, and Squeezr MITM ports while re-deriving chain routes.
+
+### Changed
+
+- apx-managed Squeezr startup now pins the known-compatible `squeezr-ai` package, prewarms the executable npx path during install, and exports local client base URL variables expected by Squeezr self-test.
+- Squeezr chains are now constrained to terminal positions because current Squeezr releases do not expose a configurable upstream for forwarding into another apx service.
+
+### Fixed
+
+- Supervisor adoption now requires recognized service processes and passing health checks instead of blindly adopting any listener on a configured port.
+- Squeezr health checks now verify `identity: "squeezr"`, preventing unrelated HTTP services from being treated as healthy Squeezr instances.
+- Startup timeout and installer health failures now point users at service logs that include the actual child process errors.
+
 ## [0.5.0] - 2026-07-24
 
 ### Added
