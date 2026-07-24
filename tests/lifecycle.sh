@@ -77,7 +77,7 @@ GATEWAY_CMD="$GATEWAY_CMD"
 GATEWAY_TARGET_API_URL="https://api.anthropic.com"
 WORKDIR="$HOME"
 HEALTH_INTERVAL_SECONDS=1
-STARTUP_TIMEOUT_SECONDS=10
+STARTUP_TIMEOUT_SECONDS=60
 APX_SERVICE_BACKEND=nohup
 EOF
 
@@ -92,7 +92,9 @@ export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 wait_livez() {
   local _
   # Integer sleeps only — macOS /bin/sleep historically rejected fractions.
-  for _ in $(seq 1 15); do
+  # macOS runners have been observed to take 30-60s for the gateway to
+  # become healthy, so allow generous headroom here.
+  for _ in $(seq 1 90); do
     if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
       return 0
     fi
