@@ -338,7 +338,7 @@ apx update
 
 or just rerun `./install.sh --yes` from the new clone.
 
-Releases are cut with git tags of the form `vMAJOR.MINOR.PATCH` matching the `VERSION` file at the repo root. Every tagged build publishes both a source tarball and a self-extracting `apx.sh` (plus `apx.sh.sha256`) at [Releases](https://github.com/mkhalid-s/lean-relay/releases).
+Releases are cut with `build/release.sh X.Y.Z --push --watch`, which updates `VERSION`, promotes the changelog's Unreleased notes, commits `Release X.Y.Z`, tags `vX.Y.Z`, pushes, and waits for the GitHub Release workflow. Every tagged build publishes both a source tarball and a self-extracting `apx.sh` (plus `apx.sh.sha256`) at [Releases](https://github.com/mkhalid-s/lean-relay/releases).
 
 ## Claude Code Setting
 

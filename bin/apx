@@ -2893,7 +2893,9 @@ fetch_and_verify_apx_sh() {
 
 release_asset_url_for_tag() {
   local asset_url="$1" target_ref="$2" asset_name="${3:-apx.sh}"
-  asset_url="${asset_url//\\\//\/}"
+  # Some older config/env values escaped URL slashes as `\/`. Strip URL
+  # backslashes before matching so `apx update --to` can repair that channel.
+  asset_url="${asset_url//\\/}"
   if [[ "$asset_url" =~ ^https://github.com/([^/]+/[^/]+)/releases/(latest/download|download/[^/]+)/[^/]+$ ]]; then
     printf 'https://github.com/%s/releases/download/%s/%s\n' "${BASH_REMATCH[1]}" "$target_ref" "$asset_name"
     return 0

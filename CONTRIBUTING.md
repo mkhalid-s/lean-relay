@@ -28,21 +28,29 @@ Keep scripts portable:
 Versions are tracked in the top-level `VERSION` file (semver `MAJOR.MINOR.PATCH`).
 Existing installs read this at install time and expose it as `apx version`.
 
-To cut a release:
+Use the release helper from a clean `main` branch:
 
 ```bash
-# 1. Bump the version
-echo "0.2.0" > VERSION
-git commit -am "Release v0.2.0"
+# Prepare the VERSION/changelog release commit and vX.Y.Z tag locally.
+build/release.sh 0.5.3
 
-# 2. Tag it (tag must match VERSION with a leading "v")
-git tag v0.2.0
-git push origin main --tags
+# Publish and wait for the GitHub Release workflow.
+build/release.sh 0.5.3 --push --watch
 ```
 
+The helper verifies the personal release identity by default:
+
+- Git commit email: `mkhalid-s@users.noreply.github.com`
+- GitHub CLI account for `--push`: `mkhalid-s`
+
+Override intentionally with `APX_RELEASE_EXPECT_EMAIL` and
+`APX_RELEASE_GH_USER` only when cutting a release from another authorized
+personal account. The script commits `Release X.Y.Z` and creates the matching
+`vX.Y.Z` tag without adding co-author/footer lines.
+
 The `.github/workflows/release.yml` workflow verifies the tag matches
-`VERSION`, builds an `apx-<version>.tar.gz` tarball with a sha256 checksum,
-and publishes a GitHub Release.
+`VERSION`, runs lint/smoke checks, builds release artifacts with sha256
+checksums, and publishes a GitHub Release.
 
 Existing users pick up the new version by running `apx update`.
 

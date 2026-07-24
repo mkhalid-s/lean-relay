@@ -6,6 +6,14 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `build/release.sh` automates local release management: version/changelog promotion, validation, release commit, tag creation, optional push, and optional GitHub Actions watch.
+
+### Fixed
+
+- `apx update --to <version>` now strips legacy URL backslashes before matching GitHub Release asset URLs, fixing CI/user configurations that store channels like `https://...\/releases\/latest\/download/apx.sh`.
+
 ## [0.5.2] - 2026-07-24
 
 ### Changed
