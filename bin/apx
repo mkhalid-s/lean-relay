@@ -33,13 +33,14 @@ VERSIONS_DIR="$SHARE_DIR/versions"
 CURRENT_LINK="$SHARE_DIR/current"
 INSTALL_MODE_FILE="$CONFIG_DIR/install.mode"
 INSTALL_MANIFEST_FILE="$STATE_DIR/install-manifest.env"
-RELEASE_ASSET_URL="${APX_RELEASE_ASSET_URL:-https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh}"
+APX_RELEASE_REPO="${APX_RELEASE_REPO:-mkhalid-s/lean-relay}"
+RELEASE_ASSET_URL="${APX_RELEASE_ASSET_URL:-https://github.com/$APX_RELEASE_REPO/releases/latest/download/apx.sh}"
 RELEASE_ASSET_SHA_URL="${APX_RELEASE_ASSET_SHA_URL:-${RELEASE_ASSET_URL}.sha256}"
 RUN_DIR="${APX_RUN_DIR:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/apx}}"
 RUN_DIR="${RUN_DIR:-$STATE_DIR/run}"
 LOG_DIR="$STATE_DIR/logs"
 SUPERVISOR_LOCK_DIR="$RUN_DIR/supervisor.lock"
-UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/ai-proxy-stack.git}"
+UPDATE_REPO_URL="${APX_REPO_URL:-https://github.com/mkhalid-s/lean-relay.git}"
 UPDATE_REPO_BRANCH="${APX_REPO_BRANCH:-main}"
 PLIST_FILE="$HOME/Library/LaunchAgents/$LABEL.plist"
 SERVICE_BACKEND_FILE="$CONFIG_DIR/service.backend"
@@ -2525,7 +2526,7 @@ error: this command requires a release-mode install (apx.sh self-extracting inst
 Detected install mode: ${mode:-unknown}
 
 To switch to release mode:
-  curl -fsSLO https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/apx.sh
+  curl -fsSLO https://github.com/mkhalid-s/lean-relay/releases/latest/download/apx.sh
   bash apx.sh
 EOF
     return 1
@@ -2890,6 +2891,16 @@ fetch_and_verify_apx_sh() {
   printf '%s\n' "$sh"
 }
 
+release_asset_url_for_tag() {
+  local asset_url="$1" target_ref="$2" asset_name="${3:-apx.sh}"
+  asset_url="${asset_url//\\\//\/}"
+  if [[ "$asset_url" =~ ^https://github.com/([^/]+/[^/]+)/releases/(latest/download|download/[^/]+)/[^/]+$ ]]; then
+    printf 'https://github.com/%s/releases/download/%s/%s\n' "${BASH_REMATCH[1]}" "$target_ref" "$asset_name"
+    return 0
+  fi
+  return 1
+}
+
 do_update_release() {
   local target_ref="" force=0 dry_run=0
   while [[ $# -gt 0 ]]; do
@@ -2907,21 +2918,20 @@ do_update_release() {
   local url="$RELEASE_ASSET_URL"
   local sha_url="$RELEASE_ASSET_SHA_URL"
   if [[ -n "$target_ref" ]]; then
-    # target_ref is a tag like v0.2.0; rewrite /releases/latest/ to
-    # /releases/download/<tag>/. If the user overrode APX_RELEASE_ASSET_URL to
-    # something that doesn't contain /releases/latest/, the substitution is a
-    # silent no-op — meaning `apx update --to v0.2.0` would silently pull
-    # "latest" instead. Detect and refuse.
-    local new_url="${url//\/releases\/latest\//\/releases\/download\/${target_ref}\/}"
-    local new_sha_url="${sha_url//\/releases\/latest\//\/releases\/download\/${target_ref}\/}"
-    if [[ "$new_url" == "$url" || "$new_sha_url" == "$sha_url" ]]; then
+    # target_ref is a tag like v0.5.1. Build the GitHub Releases URL from the
+    # owner/repo instead of doing a partial string substitution. Replacing only
+    # "/releases/latest/" left the original "download/apx.sh" segment behind
+    # and produced ".../releases/download/<tag>/download/apx.sh".
+    local new_url new_sha_url
+    if ! new_url="$(release_asset_url_for_tag "$url" "$target_ref" apx.sh)" \
+      || ! new_sha_url="$(release_asset_url_for_tag "$sha_url" "$target_ref" apx.sh.sha256)"; then
       cat >&2 <<EOF
 error: --to $target_ref cannot be applied to the configured release URL:
   $url
 
-The URL does not contain /releases/latest/, so we do not know how to point it
-at a specific tag. Set APX_RELEASE_ASSET_URL and APX_RELEASE_ASSET_SHA_URL
-explicitly, or drop --to and use the default channel.
+The URL is not a GitHub Releases apx.sh asset URL, so we do not know how to
+point it at a specific tag. Set APX_RELEASE_ASSET_URL and
+APX_RELEASE_ASSET_SHA_URL explicitly, or drop --to and use the default channel.
 EOF
       return 2
     fi

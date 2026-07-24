@@ -7,20 +7,20 @@
 # git-clone-based dev install).
 #
 # Usage:
-#   curl -fsSL https://github.com/mkhalid-s/ai-proxy-stack/releases/latest/download/get.sh | bash
+#   curl -fsSL https://github.com/mkhalid-s/lean-relay/releases/latest/download/get.sh | bash
 #   curl -fsSL https://.../get.sh | APX_VERSION=v0.3.0 bash
 #   curl -fsSL https://.../get.sh | bash -s -- --no-service --skip-deps
 #
 # Environment variables:
 #   APX_VERSION   release tag to install (default: "latest")
-#   APX_REPO      GitHub owner/repo (default: mkhalid-s/ai-proxy-stack)
+#   APX_REPO      GitHub owner/repo (default: mkhalid-s/lean-relay)
 #
 # This script is intentionally tiny so a suspicious user can audit it end
 # to end before running. It never executes apx.sh unless the checksum
 # published alongside it in the same release matches.
 set -Eeuo pipefail
 
-REPO="${APX_REPO:-mkhalid-s/ai-proxy-stack}"
+REPO="${APX_REPO:-mkhalid-s/lean-relay}"
 VERSION="${APX_VERSION:-latest}"
 
 if [[ "$VERSION" == "latest" ]]; then

@@ -153,6 +153,58 @@ if "$APX" chain set squeezr,headroom --no-restart --no-claude-sync >/dev/null 2>
   exit 1
 fi
 
+mkdir -p "$HOME/.local/share/apx/versions/v0.4.0"
+ln -sfn versions/v0.4.0 "$HOME/.local/share/apx/current"
+printf '%s\n' '0.4.0' > "$APX_STATE/VERSION"
+mkdir -p "$TMP/update-stubs"
+cat > "$TMP/update-stubs/curl" <<'SH'
+#!/usr/bin/env bash
+out=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    --max-time) shift 2 ;;
+    -*) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$HOME/update.urls"
+case "$out" in
+  *apx.sh)
+    cat > "$out" <<'APXSH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--print-version" ]]; then
+  echo 0.5.0
+  exit 0
+fi
+echo "fake apx.sh should not run during dry-run" >&2
+exit 99
+APXSH
+    ;;
+  *apx.sh.sha256)
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$(dirname "$out")/apx.sh" | awk '{print $1"  apx.sh"}' > "$out"
+    else
+      shasum -a 256 "$(dirname "$out")/apx.sh" | awk '{print $1"  apx.sh"}' > "$out"
+    fi
+    ;;
+  *)
+    echo "unexpected curl output path: $out" >&2
+    exit 1
+    ;;
+esac
+SH
+chmod +x "$TMP/update-stubs/curl"
+APX_RELEASE_ASSET_URL='https://github.com/mkhalid-s/lean-relay\/releases\/latest\/download/apx.sh' \
+  APX_PATH="$TMP/update-stubs:$PATH" \
+  "$APX" update --to v0.5.0 --dry-run >/dev/null
+grep -qx 'https://github.com/mkhalid-s/lean-relay/releases/download/v0.5.0/apx.sh' "$HOME/update.urls"
+grep -qx 'https://github.com/mkhalid-s/lean-relay/releases/download/v0.5.0/apx.sh.sha256' "$HOME/update.urls"
+rm -f "$HOME/update.urls"
+rm -f "$HOME/.local/share/apx/current"
+rm -rf "$HOME/.local/share/apx/versions"
+
 SQ_FAKE_PORT="$($PYTHON3 - <<'PYPORT'
 import socket
 s = socket.socket()

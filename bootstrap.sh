@@ -2,12 +2,12 @@
 # One-shot dev installer for LeanRelay (`apx`).
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mkhalid-s/ai-proxy-stack/main/bootstrap.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap.sh | bash
 #   APX_REF=v0.1.0 curl -fsSL .../bootstrap.sh | bash
 #   APX_SRC_DIR=$HOME/code/apx curl -fsSL .../bootstrap.sh | bash
 #
 # Environment variables (legacy AI_PROXY_STACK_* names are also honored):
-#   APX_REPO      git URL to clone (default: mkhalid-s/ai-proxy-stack on GitHub)
+#   APX_REPO      git URL to clone (default: mkhalid-s/lean-relay on GitHub)
 #   APX_REF       git ref to check out (branch, tag, or SHA; default: main)
 #   APX_SRC_DIR   checkout path (default: $HOME/.local/share/apx-src)
 #   APX_YES       if set to 0, pass through interactive install (default: 1)
@@ -19,7 +19,7 @@
 
 set -Eeuo pipefail
 
-REPO="${APX_REPO:-${AI_PROXY_STACK_REPO:-https://github.com/mkhalid-s/ai-proxy-stack.git}}"
+REPO="${APX_REPO:-${AI_PROXY_STACK_REPO:-https://github.com/mkhalid-s/lean-relay.git}}"
 REF="${APX_REF:-${AI_PROXY_STACK_REF:-main}}"
 CLONE_DIR="${APX_SRC_DIR:-${AI_PROXY_STACK_DIR:-$HOME/.local/share/apx-src}}"
 YES_FLAG="${APX_YES:-${AI_PROXY_STACK_YES:-1}}"

@@ -6,6 +6,14 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Release and dev bootstrap defaults now point at the LeanRelay repository (`mkhalid-s/lean-relay`).
+
+### Fixed
+
+- `apx update --to <version>` now builds GitHub Release asset URLs directly instead of producing malformed `.../releases/download/<tag>/download/apx.sh` URLs, and tolerates legacy escaped-slash URL values.
+
 ## [0.5.1] - 2026-07-24
 
 ### Added
