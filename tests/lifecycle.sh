@@ -111,16 +111,16 @@ wait_livez() {
   return 1
 }
 
-APX_SERVICE_BACKEND=nohup "$APX" start >/dev/null
+"$APX" start >/dev/null
 wait_livez
 
-second="$(APX_SERVICE_BACKEND=nohup "$APX" start 2>&1)"
+second="$("$APX" start 2>&1)"
 if [[ "$second" != *"already running"* ]]; then
   echo "ERROR: Expected 'already running' message, got: $second" >&2
   exit 1
 fi
 
-APX_SERVICE_BACKEND=nohup "$APX" stop >/dev/null
+"$APX" stop >/dev/null
 if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
   echo "ERROR: gateway still healthy after stop" >&2
   exit 1
@@ -131,7 +131,7 @@ fi
 sleep 5 & foreign=$!
 mkdir -p "$APX_RUN_DIR"
 printf '%s\n' "$foreign" > "$APX_RUN_DIR/supervisor.pid"
-APX_SERVICE_BACKEND=nohup "$APX" stop >/dev/null
+"$APX" stop >/dev/null
 kill -0 "$foreign"
 kill "$foreign" 2>/dev/null || true
 wait "$foreign" 2>/dev/null || true
