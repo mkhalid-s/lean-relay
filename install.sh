@@ -23,6 +23,7 @@ RUNTIME_SHARE_DIR="$HOME/.local/share/apx"
 RUNTIME_DASHBOARD_HTML="$RUNTIME_SHARE_DIR/dashboard.html"
 
 STACK_VERSION="$( [ -f "$SRC_VERSION_FILE" ] && head -n 1 "$SRC_VERSION_FILE" | tr -d '[:space:]' || echo "unknown" )"
+SQUEEZR_PACKAGE_SPEC_DEFAULT="squeezr-ai@1.99.2"
 
 YES=0
 NO_START=0
@@ -134,6 +135,15 @@ run_step() {
   fi
   log "$desc"
   "$@"
+}
+
+prewarm_squeezr_npx() {
+  env \
+    NPM_CONFIG_AUDIT=false \
+    NPM_CONFIG_FUND=false \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    NPM_CONFIG_LOGLEVEL=error \
+    npm exec --yes --package "$SQUEEZR_PACKAGE_SPEC_DEFAULT" -- squeezr --help >/dev/null
 }
 
 confirm() {
@@ -317,9 +327,10 @@ install_deps() {
     run_step "prewarm pxpipe-proxy npm cache" npm cache add pxpipe-proxy@0.8.0
     manifest_set NPM_WARMED_PXPIPE_PROXY 1
     record_npm_cache_path pxpipe-proxy@0.8.0 NPM_PXPIPE_PROXY_CACHE_PATH "$npm_cache"
-    run_step "prewarm squeezr-ai npm cache" npm cache add squeezr-ai
+    run_step "prewarm squeezr-ai npm cache" npm cache add "$SQUEEZR_PACKAGE_SPEC_DEFAULT"
     manifest_set NPM_WARMED_SQUEEZR_AI 1
-    record_npm_cache_path squeezr-ai NPM_SQUEEZR_AI_CACHE_PATH "$npm_cache"
+    record_npm_cache_path "$SQUEEZR_PACKAGE_SPEC_DEFAULT" NPM_SQUEEZR_AI_CACHE_PATH "$npm_cache"
+    run_step "prewarm squeezr-ai npx executable" prewarm_squeezr_npx
   else
     warn "npm is not available; pxpipe-proxy and squeezr-ai will be fetched by npx on first start"
   fi
@@ -531,7 +542,7 @@ validate_health() {
   until urls_ok "${checks[@]}"; do
     if (( SECONDS >= deadline )); then
       "$RUNTIME_BIN" status || true
-      die "service did not become healthy within 60s; inspect logs with: apx logs supervisor"
+      die "service did not become healthy within 60s; inspect logs with: apx logs all"
     fi
     sleep 2
   done

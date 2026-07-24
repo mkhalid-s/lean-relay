@@ -212,6 +212,7 @@ HEADROOM_TARGET_API_URL="https://api.anthropic.com"
 
 GATEWAY_CMD="$HOME/.local/bin/apx-gateway"
 SQUEEZR_CMD="$HOME/.local/bin/apx-squeezr"
+SQUEEZR_PACKAGE_SPEC="squeezr-ai@1.99.2"
 PXPIPE_CMD="npx -y pxpipe-proxy@0.8.0"
 PXPIPE_MODELS="claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5"
 HEADROOM_CMD="headroom proxy"
@@ -224,6 +225,17 @@ TIKTOKEN_CACHE_DIR="${HOME}/.cache/tiktoken"
 ```
 
 Do not edit the runtime config by hand for normal mode switches. Prefer `apx mode ...`.
+
+For local port conflicts after install, use `apx port` instead of editing derived routes by hand:
+
+```bash
+apx port get
+apx port set pxpipe 47822
+```
+
+`apx port set pxpipe ...` updates `PXPIPE_PORT`, re-derives current chain targets such as `HEADROOM_TARGET_API_URL`, and restarts the configured service unless `--no-restart` is passed.
+
+Current Squeezr releases must be the final local service in an apx chain. Use `squeezr` or `headroom,squeezr`, not `squeezr,headroom`.
 
 ### Squeezr Experiment
 
@@ -241,7 +253,7 @@ Expected route:
 Claude Code -> Gateway :8787 -> Squeezr :18780 -> Anthropic
 ```
 
-The stack exports `SQUEEZR_PORT=18780` and `SQUEEZR_MITM_PORT=18781` when starting Squeezr, so it does not use Squeezr's default `8080` port. Return to plain pass-through with:
+The stack exports `SQUEEZR_PORT=18780`, `SQUEEZR_MITM_PORT=18781`, and the local Squeezr client base URL variables when starting Squeezr, so it does not use Squeezr's default `8080` port and its self-test reflects the apx-managed topology. The installer prewarms the pinned `SQUEEZR_PACKAGE_SPEC` npx executable path so first service start is not blocked on npm package resolution. Return to plain pass-through with:
 
 ```bash
 apx mode direct
@@ -439,6 +451,13 @@ Gateway health failed     -> gateway process/target route issue
 Headroom health failed    -> Headroom process did not start or crashed
 pxpipe health failed      -> pxpipe process did not start or port is in use
 Squeezr health failed     -> Squeezr process did not start or port is in use
+```
+
+If another process owns pxpipe's default port, move pxpipe and refresh routing:
+
+```bash
+apx port set pxpipe 47822
+apx logs pxpipe
 ```
 
 Quick isolation:

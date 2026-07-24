@@ -390,7 +390,7 @@ apx disable                     # gateway off; ANTHROPIC_BASE_URL removed
 # Freeform ordering / power user:
 apx chain get
 apx chain set headroom,pxpipe
-apx chain set squeezr,headroom,pxpipe
+apx chain set headroom,squeezr
 apx chain clear                 # equivalent to `apx mode direct`
 apx chain ls                    # list known services
 apx chain preset ls             # list preset chains
@@ -409,6 +409,23 @@ disable           Stops services and removes ANTHROPIC_BASE_URL from Claude sett
 ```
 
 `full` is kept as a deprecated alias of `headroom-pxpipe` for backward compat.
+
+## Local Ports
+
+Use `apx port` to move a local service off a conflicting port after install. The command updates the config, re-derives chain routing, and restarts the service by default:
+
+```bash
+apx port get
+apx port get pxpipe
+apx port set pxpipe 47822
+apx port set pxpipe 47822 --no-restart
+```
+
+This writes `PXPIPE_PORT` in `~/.config/apx/config.env` and refreshes derived targets such as `HEADROOM_TARGET_API_URL` when the current chain routes through pxpipe. Prefer the CLI over hand-editing the config so chained modes do not keep pointing at the old port.
+
+Other configurable local ports are `gateway`, `headroom`, `squeezr`, and `squeezr-mitm`.
+
+Note: current Squeezr releases must be the final local service in an apx chain because Squeezr does not expose a configurable upstream for forwarding to another apx service. Valid Squeezr chains include `squeezr` and `headroom,squeezr`; invalid examples include `squeezr,headroom`.
 
 ## Upstream Target
 
@@ -442,7 +459,7 @@ apx disable                 # stop everything and remove Claude base URL
 
 ## First Squeezr Experiment
 
-Squeezr is managed by the same LaunchAgent supervisor as the other components. The stack uses `18780` instead of Squeezr's default `8080` to avoid common local port conflicts.
+Squeezr is managed by the same LaunchAgent supervisor as the other components. The stack uses `18780` instead of Squeezr's default `8080` to avoid common local port conflicts, and pins `SQUEEZR_PACKAGE_SPEC` for reproducible apx-managed startup.
 
 ```bash
 apx mode squeezr

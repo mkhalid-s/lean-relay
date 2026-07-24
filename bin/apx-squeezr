@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+squeezr_package_spec="${SQUEEZR_PACKAGE_SPEC:-squeezr-ai@1.99.2}"
+export NPM_CONFIG_AUDIT="${NPM_CONFIG_AUDIT:-false}"
+export NPM_CONFIG_FUND="${NPM_CONFIG_FUND:-false}"
+export NPM_CONFIG_UPDATE_NOTIFIER="${NPM_CONFIG_UPDATE_NOTIFIER:-false}"
+export NPM_CONFIG_LOGLEVEL="${NPM_CONFIG_LOGLEVEL:-error}"
+
 dist_index="$(
-  npx -y --package squeezr-ai -- sh -c '
+  npx -y --package "$squeezr_package_spec" -- sh -c '
     bin="$(command -v squeezr)"
     SQUEEZR_BIN="$bin" node <<'"'"'NODE'"'"'
 const { createRequire } = require("module");

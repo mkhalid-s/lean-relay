@@ -128,6 +128,57 @@ if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
   exit 1
 fi
 
+PX_ALT_PORT="$($PYTHON3 - <<'PYPORT'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PYPORT
+)"
+"$APX" chain set headroom,pxpipe --no-restart --no-claude-sync >/dev/null
+"$APX" port set pxpipe "$PX_ALT_PORT" --no-restart --no-claude-sync >/dev/null
+if [[ "$("$APX" port get pxpipe)" != "PXPIPE_PORT=$PX_ALT_PORT" ]]; then
+  echo "ERROR: pxpipe port get did not report updated port" >&2
+  exit 1
+fi
+grep -q "^PXPIPE_PORT=$PX_ALT_PORT$" "$APX_CONFIG"
+grep -q "^HEADROOM_TARGET_API_URL=\"http://127.0.0.1:$PX_ALT_PORT\"$" "$APX_CONFIG"
+if "$APX" port set pxpipe "$PORT" --no-restart --no-claude-sync >/dev/null 2>&1; then
+  echo "ERROR: pxpipe port set accepted a port already configured for Gateway" >&2
+  exit 1
+fi
+if "$APX" chain set squeezr,headroom --no-restart --no-claude-sync >/dev/null 2>&1; then
+  echo "ERROR: chain set accepted squeezr before another local service" >&2
+  exit 1
+fi
+
+SQ_FAKE_PORT="$($PYTHON3 - <<'PYPORT'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PYPORT
+)"
+GATEWAY_PORT="$SQ_FAKE_PORT" "$PYTHON3" "$HOME/bin/fake-gateway" & sq_fake=$!
+for _ in $(seq 1 10); do
+  if curl -fsS --max-time 1 "http://127.0.0.1:$SQ_FAKE_PORT/squeezr/health" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+"$APX" port set squeezr "$SQ_FAKE_PORT" --no-restart --no-claude-sync >/dev/null
+"$APX" chain set squeezr --no-restart --no-claude-sync >/dev/null
+status_out="$($APX status)"
+if ! grep -q 'Squeezr:.*health=fail' <<<"$status_out"; then
+  echo "ERROR: Squeezr health accepted HTTP 200 without identity=squeezr" >&2
+  echo "$status_out" >&2
+  exit 1
+fi
+kill "$sq_fake" 2>/dev/null || true
+wait "$sq_fake" 2>/dev/null || true
+
 # Foreign pid must not be killed by stop; keep this short so a failed kill
 # cannot stall CI for half a minute.
 sleep 5 & foreign=$!

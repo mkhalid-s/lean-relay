@@ -80,6 +80,7 @@ load_config() {
   : "${GATEWAY_CMD:=$HOME/.local/bin/apx-gateway}"
   : "${PXPIPE_CMD:=npx -y pxpipe-proxy@0.8.0}"
   : "${SQUEEZR_CMD:=$HOME/.local/bin/apx-squeezr}"
+  : "${SQUEEZR_PACKAGE_SPEC:=squeezr-ai@1.99.2}"
   : "${PXPIPE_MODELS:=claude-fable-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-5,claude-sonnet-4-6,gpt-5.6,gpt-5.5}"
   : "${HEADROOM_CMD:=headroom proxy}"
   : "${PXPIPE_TARGET_API_URL:=https://api.anthropic.com}"
@@ -189,18 +190,47 @@ export_ca_bundle() {
 gateway_ok() { url_ok "http://$BIND_HOST:$GATEWAY_PORT/livez"; }
 pxpipe_ok() { url_ok "http://$BIND_HOST:$PXPIPE_PORT/"; }
 headroom_ok() { url_ok "http://$BIND_HOST:$HEADROOM_PORT/livez"; }
-squeezr_ok() { url_ok "http://$BIND_HOST:$SQUEEZR_PORT/squeezr/health"; }
+squeezr_ok() {
+  curl -fsS --max-time 3 "http://$BIND_HOST:$SQUEEZR_PORT/squeezr/health" 2>/dev/null \
+    | grep -q '"identity"[[:space:]]*:[[:space:]]*"squeezr"'
+}
+
+service_log_target() {
+  case "$1" in
+    Gateway|gateway) echo "gateway" ;;
+    Headroom|headroom) echo "headroom" ;;
+    Squeezr|squeezr) echo "squeezr" ;;
+    pxpipe) echo "pxpipe" ;;
+    *) echo "all" ;;
+  esac
+}
 
 wait_until_ok() {
   local name="$1" check_fn="$2" deadline=$((SECONDS + STARTUP_TIMEOUT_SECONDS))
   until "$check_fn"; do
     if (( SECONDS >= deadline )); then
-      log "$name did not become healthy within ${STARTUP_TIMEOUT_SECONDS}s"
+      log "$name did not become healthy within ${STARTUP_TIMEOUT_SECONDS}s; inspect service logs with: apx logs $(service_log_target "$name")"
       return 1
     fi
     sleep 1
   done
   log "$name is healthy"
+}
+
+adopt_existing_listener() {
+  local name="$1" port="$2" adopted_pid_file="$3" check_fn="$4" pattern="$5" pid="$6" cmd
+  cmd="$(proc_cmd "$pid")"
+  if [[ ! "$cmd" =~ $pattern ]]; then
+    log "$name port $port is already in use by pid $pid but command is not recognized as $name: $cmd"
+    return 1
+  fi
+  if "$check_fn"; then
+    echo "$pid" > "$adopted_pid_file"
+    log "$name already listening on $port; adopting external pid $pid"
+    return 0
+  fi
+  log "$name port $port is already in use by pid $pid but health check failed; not adopting"
+  return 1
 }
 
 safe_kill_port_owner() {
@@ -235,8 +265,7 @@ start_gateway() {
     if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "gateway" "$GATEWAY_PORT" 'apx-gateway|python.*apx-gateway' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
-      echo "$existing" > "$RUN_DIR/gateway.adopted.pid"
-      log "Gateway already listening on $GATEWAY_PORT; adopting external pid $existing"
+      adopt_existing_listener Gateway "$GATEWAY_PORT" "$RUN_DIR/gateway.adopted.pid" gateway_ok 'apx-gateway|python.*apx-gateway' "$existing" || return 1
       return 0
     else
       log "Gateway port $GATEWAY_PORT is already in use by pid $existing"
@@ -273,8 +302,7 @@ start_squeezr() {
     if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "squeezr" "$SQUEEZR_PORT" 'squeezr|node .*squeezr|npx .*squeezr' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
-      echo "$existing" > "$RUN_DIR/squeezr.adopted.pid"
-      log "Squeezr already listening on $SQUEEZR_PORT; adopting external pid $existing"
+      adopt_existing_listener Squeezr "$SQUEEZR_PORT" "$RUN_DIR/squeezr.adopted.pid" squeezr_ok 'squeezr|node .*squeezr|npx .*squeezr' "$existing" || return 1
       return 0
     else
       log "Squeezr port $SQUEEZR_PORT is already in use by pid $existing"
@@ -286,8 +314,9 @@ start_squeezr() {
     cd "$WORKDIR"
     export_ca_bundle
     export SQUEEZR_PORT="$SQUEEZR_PORT" SQUEEZR_MITM_PORT="$SQUEEZR_MITM_PORT" SQUEEZR_DAEMON=1
-    export SQUEEZR_TARGET_API_URL
-    export ANTHROPIC_UPSTREAM="$SQUEEZR_TARGET_API_URL" ANTHROPIC_BASE_URL="$SQUEEZR_TARGET_API_URL"
+    export SQUEEZR_PACKAGE_SPEC SQUEEZR_TARGET_API_URL
+    export ANTHROPIC_BASE_URL="http://$BIND_HOST:$SQUEEZR_PORT"
+    export openai_base_url="http://$BIND_HOST:$SQUEEZR_PORT" GEMINI_API_BASE_URL="http://$BIND_HOST:$SQUEEZR_PORT"
     exec bash -lc "export PATH=\"$PATH\"; exec $SQUEEZR_CMD $SQUEEZR_EXTRA_ARGS"
   ) >> "$log_file" 2>&1 &
   echo $! > "$RUN_DIR/squeezr.pid"
@@ -304,10 +333,9 @@ start_pxpipe() {
   existing="$(port_pid "$PXPIPE_PORT")"
   if [[ -n "$existing" ]]; then
     if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
-      safe_kill_port_owner "pxpipe" "$PXPIPE_PORT" 'pxpipe|node .*/pxpipe' || return 1
+      safe_kill_port_owner "pxpipe" "$PXPIPE_PORT" 'pxpipe|node .*pxpipe|npx .*pxpipe|npm .*pxpipe' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
-      echo "$existing" > "$RUN_DIR/pxpipe.adopted.pid"
-      log "pxpipe already listening on $PXPIPE_PORT; adopting external pid $existing"
+      adopt_existing_listener pxpipe "$PXPIPE_PORT" "$RUN_DIR/pxpipe.adopted.pid" pxpipe_ok 'pxpipe|node .*pxpipe|npx .*pxpipe|npm .*pxpipe' "$existing" || return 1
       return 0
     else
       log "pxpipe port $PXPIPE_PORT is already in use by pid $existing"
@@ -346,8 +374,7 @@ start_headroom() {
     if [[ "${APX_TAKEOVER:-0}" == "1" ]]; then
       safe_kill_port_owner "headroom" "$HEADROOM_PORT" 'headroom|Python' || return 1
     elif [[ "$ADOPT_EXISTING" == "1" ]]; then
-      echo "$existing" > "$RUN_DIR/headroom.adopted.pid"
-      log "Headroom already listening on $HEADROOM_PORT; adopting external pid $existing"
+      adopt_existing_listener Headroom "$HEADROOM_PORT" "$RUN_DIR/headroom.adopted.pid" headroom_ok 'headroom|Python' "$existing" || return 1
       return 0
     else
       log "Headroom port $HEADROOM_PORT is already in use by pid $existing"
@@ -1464,6 +1491,11 @@ apply_chain() {
       done
       seen_parts+=("$part")
     done
+    if [[ "$chain" == *squeezr,* ]]; then
+      echo "error: squeezr must be the final local service in APX_CHAIN" >&2
+      echo "current Squeezr releases do not expose a configurable upstream for forwarding to another apx service" >&2
+      return 2
+    fi
   fi
 
   set_config_var APX_CHAIN "\"$chain\""
@@ -1830,6 +1862,173 @@ chain_cli() {
       ;;
     -h|--help|help) chain_usage ;;
     *) chain_usage >&2; return 2 ;;
+  esac
+}
+
+port_usage() {
+  cat <<EOF
+usage: apx port <subcommand>
+
+  get                       Show configured service ports and derived routing
+  get <service>             Show one configured service port
+  set <service> <port>      Set a service port and re-derive current chain routes
+  ls                        List services with configurable ports
+
+Services: gateway, headroom, pxpipe, squeezr, squeezr-mitm
+
+Options for set:
+  --no-restart              Update config only; do not restart the service
+  --no-claude-sync          Do not update Claude settings after gateway port changes
+
+Examples:
+  apx port set pxpipe 47822
+  apx port set pxpipe 47822 --no-restart
+EOF
+}
+
+port_config_key() {
+  case "$1" in
+    gateway|gw|apx) echo GATEWAY_PORT ;;
+    headroom) echo HEADROOM_PORT ;;
+    pxpipe|pxpipe-proxy) echo PXPIPE_PORT ;;
+    squeezr) echo SQUEEZR_PORT ;;
+    squeezr-mitm|squeezr_mitm|mitm) echo SQUEEZR_MITM_PORT ;;
+    *) return 1 ;;
+  esac
+}
+
+port_label_for_key() {
+  case "$1" in
+    GATEWAY_PORT) echo Gateway ;;
+    HEADROOM_PORT) echo Headroom ;;
+    PXPIPE_PORT) echo pxpipe ;;
+    SQUEEZR_PORT) echo Squeezr ;;
+    SQUEEZR_MITM_PORT) echo Squeezr-MITM ;;
+    *) echo "$1" ;;
+  esac
+}
+
+validate_port_number() {
+  local port="$1"
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "error: port must be a number from 1 to 65535: $port" >&2
+    return 2
+  fi
+  if (( port < 1 || port > 65535 )); then
+    echo "error: port out of range: $port" >&2
+    return 2
+  fi
+}
+
+ensure_port_not_configured_elsewhere() {
+  local key="$1" port="$2" other value
+  for other in GATEWAY_PORT HEADROOM_PORT PXPIPE_PORT SQUEEZR_PORT SQUEEZR_MITM_PORT; do
+    [[ "$other" == "$key" ]] && continue
+    value="${!other:-}"
+    if [[ -n "$value" && "$value" == "$port" ]]; then
+      echo "error: port $port is already configured for $(port_label_for_key "$other") ($other)" >&2
+      return 2
+    fi
+  done
+}
+
+refresh_routes_for_current_chain() {
+  local chain="${APX_CHAIN:-}" gateway_enabled="$GATEWAY_ENABLED"
+  apply_chain "$chain" "$gateway_enabled"
+  load_config
+}
+
+sync_claude_for_gateway_port() {
+  case "${APX_CLIENT_TOPOLOGY:-none}" in
+    local)
+      set_config_var APX_CLIENT_BASE_URL "\"http://127.0.0.1:$GATEWAY_PORT\""
+      ;;
+    docker-host)
+      set_config_var APX_CLIENT_BASE_URL "\"http://host.docker.internal:$GATEWAY_PORT\""
+      ;;
+    custom)
+      echo "Claude settings not updated: custom APX_CLIENT_BASE_URL is configured."
+      echo "Run: apx claude set <url>"
+      return 0
+      ;;
+    none|"")
+      return 0
+      ;;
+  esac
+  load_config
+  sync_claude_settings
+}
+
+port_show() {
+  local service="${1:-}" key
+  load_config
+  if [[ -n "$service" ]]; then
+    if ! key="$(port_config_key "$service")"; then
+      port_usage >&2
+      return 2
+    fi
+    echo "$key=${!key}"
+    return 0
+  fi
+  for key in GATEWAY_PORT HEADROOM_PORT PXPIPE_PORT SQUEEZR_PORT SQUEEZR_MITM_PORT; do
+    printf '%-17s %s\n' "$key:" "${!key}"
+  done
+  echo "chain: $(chain_description)"
+}
+
+port_set() {
+  local service="$1" port="$2" restart="$3" sync_claude="$4" key old label
+  if [[ -z "$service" || -z "$port" ]]; then
+    port_usage >&2
+    return 2
+  fi
+  if ! key="$(port_config_key "$service")"; then
+    port_usage >&2
+    return 2
+  fi
+  validate_port_number "$port" || return $?
+  ensure_port_not_configured_elsewhere "$key" "$port" || return $?
+  old="${!key}"
+  label="$(port_label_for_key "$key")"
+  set_config_var "$key" "$port"
+  load_config
+  refresh_routes_for_current_chain
+  echo "$label port set: $old -> ${!key}"
+  echo "chain: $(chain_description)"
+  if [[ "$key" == "GATEWAY_PORT" && "$sync_claude" == "1" ]]; then
+    sync_claude_for_gateway_port
+  fi
+  if [[ "$restart" == "1" ]]; then
+    APX_TAKEOVER=1 install_service
+    sleep 5
+    status
+  else
+    echo "not restarted; run: apx install"
+  fi
+}
+
+port_cli() {
+  local sub="${1:-get}"
+  shift || true
+  local restart="1" sync_claude="1"
+  local -a positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --no-restart) restart="0" ;;
+      --no-claude-sync) sync_claude="0" ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+  load_config
+  case "$sub" in
+    ""|get|show|status) port_show "${positional[0]:-}" ;;
+    set) port_set "${positional[0]:-}" "${positional[1]:-}" "$restart" "$sync_claude" ;;
+    ls|list)
+      printf '%s\n' gateway headroom pxpipe squeezr squeezr-mitm
+      ;;
+    -h|--help|help) port_usage ;;
+    *) port_usage >&2; return 2 ;;
   esac
 }
 
@@ -2792,10 +2991,12 @@ EOF
 
 print_completions() {
   local shell="${1:-}"
-  local cmds="start stop disable restart run status mode chain target claude doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
+  local cmds="start stop disable restart run status mode chain target port claude doctor install uninstall supervisor logs urls dashboard version check-updates update versions use rollback cleanup completions help"
   local modes="current headroom-pxpipe pxpipe-headroom headroom squeezr headroom-squeezr pxpipe direct off full"
   local chain_subs="get set clear ls preset help"
   local target_subs="get set reset help"
+  local port_subs="get set ls help"
+  local port_services="gateway headroom pxpipe squeezr squeezr-mitm"
   local claude_subs="get set sync clear help"
   local services="headroom pxpipe squeezr"
   local log_targets="all supervisor gateway pxpipe squeezr headroom headroom.stdout headroom.proxy launchd.out launchd.err"
@@ -2819,6 +3020,7 @@ _apx_completions() {
     mode)     COMPREPLY=( \$(compgen -W "$modes" -- "\$cur") ) ;;
     chain)    COMPREPLY=( \$(compgen -W "$chain_subs $services" -- "\$cur") ) ;;
     target)   COMPREPLY=( \$(compgen -W "$target_subs --no-restart" -- "\$cur") ) ;;
+    port)     COMPREPLY=( \$(compgen -W "$port_subs $port_services --no-restart --no-claude-sync" -- "\$cur") ) ;;
     claude)   COMPREPLY=( \$(compgen -W "$claude_subs local docker-host" -- "\$cur") ) ;;
     logs)     COMPREPLY=( \$(compgen -W "$log_targets" -- "\$cur") ) ;;
     completions) COMPREPLY=( \$(compgen -W "bash zsh fish install uninstall" -- "\$cur") ) ;;
@@ -2842,6 +3044,8 @@ ZSH
       printf '  modes=(%s)\n' "$modes"
       printf '  chain_subs=(%s)\n' "$chain_subs"
       printf '  target_subs=(%s)\n' "$target_subs"
+      printf '  port_subs=(%s)\n' "$port_subs"
+      printf '  port_services=(%s)\n' "$port_services"
       printf '  claude_subs=(%s)\n' "$claude_subs"
       printf '  services=(%s)\n' "$services"
       printf '  log_targets=(%s)\n' "$log_targets"
@@ -2854,6 +3058,7 @@ ZSH
     mode) _describe -t modes 'apx mode' modes ;;
     chain) _describe -t chain 'apx chain' chain_subs && _describe -t services 'services' services ;;
     target) _describe -t target 'apx target' target_subs ;;
+    port) _describe -t port 'apx port' port_subs && _describe -t port-services 'services' port_services ;;
     claude) _describe -t claude 'apx claude' claude_subs ;;
     logs) _describe -t logs 'apx log target' log_targets ;;
     completions) _values 'action' 'bash' 'zsh' 'fish' 'install' 'uninstall' ;;
@@ -2882,6 +3087,9 @@ FISH
       for t in $target_subs; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from target" -a "%s"\n' "$t"
       done
+      for p in $port_subs $port_services; do
+        printf 'complete -c apx -n "__fish_seen_subcommand_from port" -a "%s"\n' "$p"
+      done
       for t in $claude_subs; do
         printf 'complete -c apx -n "__fish_seen_subcommand_from claude" -a "%s"\n' "$t"
       done
@@ -2894,6 +3102,7 @@ FISH
       cat <<'FISH'
 complete -c apx -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install uninstall"
 complete -c apx -n "__fish_seen_subcommand_from target" -l no-restart
+complete -c apx -n "__fish_seen_subcommand_from port" -l no-restart -l no-claude-sync
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -l purge -l dry-run -l yes
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -s y -l help
 complete -c apx -n "__fish_seen_subcommand_from uninstall" -a "--purge=all --purge=binaries --purge=share --purge=state --purge=config --purge=claude --purge=completions --purge=source --purge=deps --purge=caches --purge=all,deps,caches"
@@ -3033,6 +3242,7 @@ Commands:
   mode [preset]        Show/set mode preset and sync Claude settings
   chain <sub>          Get/set the routing chain (get|set|clear|ls|preset)
   target <sub>         Get/set upstream API endpoint (get|set|reset)
+  port <sub>           Get/set local service ports
   claude <sub>         Configure Claude client URL (local|docker-host|custom)
   doctor               Show status plus dependency diagnostics
   install              Install/start the selected service backend
@@ -3072,6 +3282,10 @@ For custom upstream-compatible APIs:
   apx target set https://api.anthropic.com
   apx target set https://your-compatible-endpoint.example.com --no-restart
 
+For port conflicts:
+  apx port get
+  apx port set pxpipe 47822
+
 Options:
   --no-restart         Do not restart the apx service after mode/chain change
   --no-claude-sync     Do not update ~/.claude/settings.json
@@ -3093,6 +3307,7 @@ case "$cmd" in
   mode) set_mode "${@:-current}" ;;
   chain) chain_cli "$@" ;;
   target) target_cli "$@" ;;
+  port) port_cli "$@" ;;
   claude) claude_command "$@" ;;
   doctor) doctor ;;
   install) install_service ;;
