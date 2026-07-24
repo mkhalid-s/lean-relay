@@ -6,6 +6,8 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-24
+
 ### Added
 
 - Cross-platform service backends: launchd on macOS, systemd-user on Linux when

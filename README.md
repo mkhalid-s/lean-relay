@@ -155,7 +155,7 @@ curl -fsSL https://.../get.sh | APX_CLIENT_TOPOLOGY=none bash
 
 ```bash
 # pin a version
-curl -fsSL https://.../get.sh | APX_VERSION=v0.4.0 bash
+curl -fsSL https://.../get.sh | APX_VERSION=v0.5.0 bash
 
 # forward flags to apx.sh (e.g. do not start the LaunchAgent)
 curl -fsSL https://.../get.sh | bash -s -- --no-service --skip-deps
@@ -196,7 +196,7 @@ curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap
 Pin a specific release tag:
 
 ```bash
-APX_REF=v0.4.0 curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap.sh | bash
+APX_REF=v0.5.0 curl -fsSL https://raw.githubusercontent.com/mkhalid-s/lean-relay/main/bootstrap.sh | bash
 ```
 
 Or clone manually:
@@ -303,7 +303,7 @@ Common commands (work in both modes):
 apx check-updates             # compare installed vs origin/main
 apx update                    # update in place using the appropriate channel
 apx update --dry-run          # release mode: fetch + verify; dev mode: preview git changes
-apx update --to v0.4.0        # release mode: install a specific release tag
+apx update --to v0.5.0        # release mode: install a specific release tag
 apx update --to-latest        # release mode: latest release (default)
 apx update --force            # reinstall even if already at latest
 apx version                   # show installed version, mode, and channel
@@ -313,7 +313,7 @@ Release-mode users get atomic version management:
 
 ```bash
 apx versions                  # list installed versions (current marked *)
-apx use v0.4.0                # switch to a previously-installed version (atomic)
+apx use v0.5.0                # switch to a previously-installed version (atomic)
 apx rollback                  # switch to the previous version
 apx cleanup --keep 2          # prune older versions, keep current + one previous
 apx cleanup --keep 2 --dry-run
