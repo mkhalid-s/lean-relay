@@ -6,6 +6,8 @@ All notable changes to LeanRelay (`apx`) are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-24
+
 ### Changed
 
 - Release and dev bootstrap defaults now point at the LeanRelay repository (`mkhalid-s/lean-relay`).
