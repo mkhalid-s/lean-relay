@@ -13,7 +13,11 @@ unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_RUNTIME_DIR XDG_CACHE_HOM
 
 HOME="$TMP/home"
 export HOME
-mkdir -p "$HOME/.config/apx" "$HOME/.local/state/apx" "$HOME/bin"
+mkdir -p "$HOME/.config/apx" "$HOME/.local/state/apx" "$HOME/bin" "$HOME/.local/bin"
+
+# LaunchAgent ProgramArguments always points at ~/.local/bin/apx. Without this
+# symlink, a Darwin fallback to launchd hangs inside `launchctl kickstart`.
+ln -sf "$APX" "$HOME/.local/bin/apx"
 
 PYTHON3="$(command -v python3 || true)"
 if [[ -z "$PYTHON3" ]]; then
@@ -83,17 +87,19 @@ export APX_RUN_DIR="$TMP/run"
 # Force nohup via env override so Darwin CI cannot fall through to launchd
 # (plist points at ~/.local/bin/apx, which is not installed in this test).
 export APX_SERVICE_BACKEND=nohup
-export PATH="$HOME/bin:$PATH"
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
 
 wait_livez() {
-  local i
-  for i in $(seq 1 50); do
+  local _
+  # Integer sleeps only — macOS /bin/sleep historically rejected fractions.
+  for _ in $(seq 1 15); do
     if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
       return 0
     fi
-    sleep 0.1
+    sleep 1
   done
   echo "ERROR: gateway did not become healthy on port $PORT" >&2
+  echo "service backend: $("$APX" status 2>/dev/null | grep -i 'service backend' || true)" >&2
   if [[ -f "$APX_STATE/logs/supervisor.log" ]]; then
     echo "---- supervisor.log ----" >&2
     cat "$APX_STATE/logs/supervisor.log" >&2 || true
@@ -105,25 +111,27 @@ wait_livez() {
   return 1
 }
 
-"$APX" start >/dev/null
+APX_SERVICE_BACKEND=nohup "$APX" start >/dev/null
 wait_livez
 
-second="$("$APX" start 2>&1)"
+second="$(APX_SERVICE_BACKEND=nohup "$APX" start 2>&1)"
 if [[ "$second" != *"already running"* ]]; then
   echo "ERROR: Expected 'already running' message, got: $second" >&2
   exit 1
 fi
 
-"$APX" stop >/dev/null
+APX_SERVICE_BACKEND=nohup "$APX" stop >/dev/null
 if curl -fsS --max-time 1 "http://127.0.0.1:$PORT/livez" >/dev/null 2>&1; then
   echo "ERROR: gateway still healthy after stop" >&2
   exit 1
 fi
 
-sleep 30 & foreign=$!
+# Foreign pid must not be killed by stop; keep this short so a failed kill
+# cannot stall CI for half a minute.
+sleep 5 & foreign=$!
 mkdir -p "$APX_RUN_DIR"
 printf '%s\n' "$foreign" > "$APX_RUN_DIR/supervisor.pid"
-"$APX" stop >/dev/null
+APX_SERVICE_BACKEND=nohup "$APX" stop >/dev/null
 kill -0 "$foreign"
 kill "$foreign" 2>/dev/null || true
 wait "$foreign" 2>/dev/null || true
@@ -153,7 +161,13 @@ if [[ "$(uname -s)" == Darwin ]]; then
   APX_PATH="$TMP/stubs:$PATH" APX_SERVICE_BACKEND=launchd "$APX" install >/dev/null
   [[ -f "$HOME/Library/LaunchAgents/io.github.apx.plist" ]]
   plutil -lint "$HOME/Library/LaunchAgents/io.github.apx.plist" >/dev/null
+  APX_PATH="$TMP/stubs:$PATH" APX_SERVICE_BACKEND=launchd "$APX" uninstall >/dev/null
+  [[ ! -f "$HOME/Library/LaunchAgents/io.github.apx.plist" ]]
 fi
+
+# Ensure later config edits do not try to talk to a leftover launchd/systemd backend.
+export APX_SERVICE_BACKEND=nohup
+rm -f "$HOME/.config/apx/service.backend"
 
 mkdir -p "$HOME/.claude"
 printf '{"env":{"KEEP":"1"}}\n' > "$HOME/.claude/settings.json"

@@ -525,6 +525,21 @@ write_plist() {
 EOF
 }
 
+launchd_kickstart() {
+  # kickstart can block for a long time when ProgramArguments points at a
+  # missing binary (common in tests / partial installs). Bound the wait.
+  local ks _
+  launchctl kickstart -k "$(launchd_domain)/$LABEL" >/dev/null 2>&1 &
+  ks=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pid_alive "$ks" || return 0
+    sleep 1
+  done
+  kill "$ks" 2>/dev/null || true
+  wait "$ks" 2>/dev/null || true
+  return 0
+}
+
 launchd_install_service() {
   load_config
   ensure_runtime_dirs
@@ -535,7 +550,7 @@ launchd_install_service() {
   stop_children
   launchctl bootstrap "$(launchd_domain)" "$PLIST_FILE"
   launchctl enable "$(launchd_domain)/$LABEL" >/dev/null 2>&1 || true
-  launchctl kickstart -k "$(launchd_domain)/$LABEL" >/dev/null 2>&1 || true
+  launchd_kickstart || true
   echo "installed and started: $PLIST_FILE"
 }
 
